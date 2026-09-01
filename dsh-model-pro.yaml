@@ -1,0 +1,7 @@
+# Оверлей dsh: пересадить агентное кресло на v4-pro (умолчание харнесса
+# — flash). config заменяется ЦЕЛИКОМ, поэтому provider обязателен —
+# без него загрузчик падает ValidationError (проверено живьём).
+- id: agent-default-model
+  config:
+    provider: deepseek-official
+    model: deepseek-v4-pro

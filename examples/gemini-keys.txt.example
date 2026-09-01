@@ -1,0 +1,4 @@
+# ~/.gemini/keys.txt — по одному ключу Generative Language API на строку.
+# Адаптер gemini-http ротирует их по кругу; exit 3 = исчерпаны все.
+AIza...first
+AIza...second

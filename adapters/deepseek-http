@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+"""deepseek-http — голос DeepSeek за столом, прямым HTTP.
+
+ЗАЧЕМ БЕЗ CLI. Официальный `dsh` — агентная оболочка целиком, конкурент
+Claude Code: он тянет свой цикл, свои инструменты и свою сессию. Столу
+нужен не агент, а один вопрос и один ответ той моделью, которой голос
+подписан. Плюс урок Джемини (2026-08-16): его CLI молча подменял модель,
+и увидеть это можно было только в JSON-статистике. Между столом и
+моделью не должно быть прослойки, которая вправе решать за нас.
+
+Неофициальные CLI (`@sluisr/deepseek-cli`, `deepseek-tui`,
+`@trenchwork/erosolar`) не рассматривались вовсе: все три ведут частные
+лица, а каждому из них пришлось бы отдать ключ от предоплаченного
+баланса.
+
+Контракт с choir.py — тот же, что у gemini-http:
+    stdout   — только текст ответа;
+    stderr   — диагностика (модель, токены, стоимость, ретраи);
+    exit 0   — ответ получен;
+    exit 3   — кончился баланс или квота (честный отказ);
+    exit 1/2 — прочие ошибки.
+
+Ключ: ~/.deepseek/key (одна строка, права 600). История вызовов —
+~/.deepseek/choir-http/, по образцу Джемини: `choir.py recover` достаёт
+потерянный ответ по sha256 промпта, а у HTTP-вызова своей истории нет.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime
+from pathlib import Path
+
+HOME = Path.home()
+KEY_FILE = HOME / ".deepseek" / "key"
+HIST_DIR = HOME / ".deepseek" / "choir-http"
+BASE = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+DEFAULT_MODEL = "deepseek-v4-pro"
+# Цены на 2026-08 (за 1M токенов), для строки диагностики.
+PRICE_IN_MISS, PRICE_IN_HIT, PRICE_OUT = 0.435, 0.0036, 0.87
+RETRIES = 3
+
+
+def log(msg: str) -> None:
+    print(msg, file=sys.stderr, flush=True)
+
+
+def read_key() -> str:
+    env = os.environ.get("DEEPSEEK_API_KEY")
+    if env:
+        return env.strip()
+    if not KEY_FILE.exists():
+        log(f"нет ключа: положите его в {KEY_FILE} (одна строка, chmod 600)")
+        sys.exit(2)
+    k = KEY_FILE.read_text().strip()
+    if not k:
+        log(f"файл ключа {KEY_FILE} пуст")
+        sys.exit(2)
+    return k
+
+
+def call(prompt: str, model: str, key: str, timeout: int,
+         effort: str | None = None) -> dict:
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": False,
+    }
+    if effort:
+        # Ручка проверена лесенкой 2026-08-22 (один вопрос, по 3 повтора):
+        # low ~520 / medium ~1060 / high ~1390 reasoning-токенов — крутит.
+        payload["reasoning_effort"] = effort
+    body = json.dumps(payload).encode()
+    req = urllib.request.Request(
+        f"{BASE}/chat/completions", data=body,
+        headers={"Authorization": f"Bearer {key}",
+                 "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode())
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--prompt-file")
+    ap.add_argument("-p", "--prompt")
+    ap.add_argument("--model", default=os.environ.get("DEEPSEEK_MODEL", DEFAULT_MODEL))
+    ap.add_argument("--timeout", type=int, default=900)
+    ap.add_argument("--effort", default=os.environ.get("DEEPSEEK_EFFORT", "max"),
+                    choices=("low", "medium", "high", "max", "none"),
+                    help="reasoning_effort; none — не слать параметр")
+    ap.add_argument("--version", action="store_true")
+    ap.add_argument("--models", action="store_true", help="что видит ключ")
+    a = ap.parse_args()
+
+    if a.version:
+        print("deepseek-http 1.0")
+        return 0
+
+    key = read_key()
+
+    if a.models:
+        req = urllib.request.Request(f"{BASE}/models",
+                                     headers={"Authorization": f"Bearer {key}"})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            for m in json.loads(r.read().decode()).get("data", []):
+                print(m.get("id"))
+        return 0
+
+    if a.prompt_file:
+        prompt = Path(a.prompt_file).read_text()
+    elif a.prompt:
+        prompt = a.prompt
+    else:
+        prompt = sys.stdin.read()
+    if not prompt.strip():
+        log("пустой промпт")
+        return 2
+
+    last = None
+    for attempt in range(1, RETRIES + 1):
+        try:
+            t0 = time.time()
+            data = call(prompt, a.model, key, a.timeout,
+                        None if a.effort == "none" else a.effort)
+            break
+        except urllib.error.HTTPError as e:
+            raw = e.read().decode(errors="replace")[:300]
+            last = f"HTTP {e.code}: {raw}"
+            # 402 — кончились деньги, 429 — упёрлись в лимит: и то и другое
+            # честный отказ, а не поломка. Дирижёр отметит голос как quota.
+            if e.code in (402, 429):
+                log(f"квота/баланс: {last}")
+                return 3
+            log(f"попытка {attempt}/{RETRIES}: {last}")
+        except Exception as e:                                   # noqa: BLE001
+            last = f"{type(e).__name__}: {e}"
+            log(f"попытка {attempt}/{RETRIES}: {last}")
+        if attempt < RETRIES:
+            time.sleep(2 * attempt)
+    else:
+        log(f"не ответил после {RETRIES} попыток: {last}")
+        return 1
+
+    text = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
+    if not text.strip():
+        log("пустой ответ модели")
+        return 1
+
+    u = data.get("usage") or {}
+    hit = u.get("prompt_cache_hit_tokens", 0)
+    miss = u.get("prompt_cache_miss_tokens", u.get("prompt_tokens", 0))
+    out = u.get("completion_tokens", 0)
+    cost = (miss * PRICE_IN_MISS + hit * PRICE_IN_HIT + out * PRICE_OUT) / 1e6
+    log(f"модель {data.get('model', a.model)} · {time.time()-t0:.1f} с · "
+        f"вход {miss}+{hit} кэш, выход {out} · ≈${cost:.4f}")
+
+    # История — для choir.py recover: у HTTP-вызова своей нет, а ответ
+    # уже оплачен, терять его при аварии дирижёра нельзя.
+    try:
+        HIST_DIR.mkdir(parents=True, exist_ok=True)
+        sha = hashlib.sha256(prompt.encode()).hexdigest()
+        rec = dict(ts=datetime.now().isoformat(timespec="seconds"),
+                   prompt_sha256=sha, model=data.get("model", a.model),
+                   usage=u, cost_usd=round(cost, 6), text=text)
+        with (HIST_DIR / f"{sha[:16]}.json").open("w") as f:
+            json.dump(rec, f, ensure_ascii=False, indent=1)
+    except OSError as e:
+        log(f"история не записана: {e}")
+
+    print(text)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

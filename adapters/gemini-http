@@ -1,0 +1,505 @@
+#!/usr/bin/env python3
+"""gemini-http — голос Джемини за столом, минуя Gemini CLI.
+
+ЗАЧЕМ ЭТО ЕСТЬ. Gemini CLI 0.55.1 подменяет модель молча: просишь
+`-m gemini-3.7-flash`, а отвечает `gemini-3.5-flash` — внутренний
+роутер знает только те модели, что зашиты в его бандл, остальные
+тихо откатывает. Ни ошибки, ни предупреждения; увидеть подмену можно
+только в `--output-format json` в поле stats.models. Проверено
+2026-08-16 тремя способами: флаг -m, переменная GEMINI_MODEL, вызов
+через gemini-rot — во всех трёх ответил 3.5.
+
+При этом сам ключ видит 53 модели, включая gemini-3.7-flash и
+gemini-3.6-flash, и они отвечают. То есть от стола свежую модель
+отделял не доступ, а клиент. Вдобавок этот клиент Google уже похоронил:
+Code Assist для физлиц закрыт 18.06.2026, вход по Google-аккаунту в
+Gemini CLI больше не работает (IneligibleTierError), а преемник
+Antigravity недоступен в нашем регионе. Оставаться на нём — держать
+голос стола на умирающей и врущей о себе прослойке.
+
+Отсюда: прямой HTTP к Generative Language API. Модель выбираем мы и
+знаем её точно; в ответ пишется, чем именно отвечали.
+
+Контракт с choir.py намеренно тот же, что у gemini-rot, — чтобы
+дирижёр не менялся глубже одной записи в таблице голосов:
+    stdout      — только текст ответа, ничего больше;
+    stderr      — диагностика (номер ключа, модель, ретраи);
+    exit 0      — ответ получен;
+    exit 3      — ключи исчерпаны ПО КВОТЕ (честный отказ, статус
+                  `quota`); лежащий шлюз — это exit 1, а не 3: иначе в
+                  журнале 503 читается как «у голоса кончилась квота»;
+    exit 1/2    — прочие ошибки.
+
+Ротация ключей — та же, что у gemini-rot: ~/.gemini/keys.txt по кругу,
+позиция в ~/.gemini/.rot_last_http (отдельная от CLI-ротации, чтобы два
+инструмента не сбивали счётчик друг другу).
+
+История ПИШЕТСЯ САМИМ АДАПТЕРОМ в ~/.gemini/choir-http/. Это не
+роскошь: `choir.py recover` достаёт потерянный ответ из истории CLI,
+сверяя промпт по sha256, а у HTTP-вызова никакой истории не бывает.
+Без этого файла авария дирижёра означала бы безвозвратно потерянный
+ответ — при том что модель на него уже ответила и деньги потрачены.
+
+Использование:
+    gemini-http --prompt-file ВОПРОС.md
+    gemini-http -p "текст" --model gemini-3.6-flash
+    gemini-http --prompt-file q.md --session arch-v2   # продолжить нить
+    gemini-http --models                                # что доступно ключу
+"""
+from __future__ import annotations
+
+import argparse
+import re
+import hashlib
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+VERSION = "gemini-http 1.0"
+DEFAULT_MODEL = "gemini-3.7-flash"
+API = "https://generativelanguage.googleapis.com/v1beta"
+
+HOME = Path.home()
+KEYS_FILE = Path(os.environ.get("GEMINI_KEYS_FILE", HOME / ".gemini" / "keys.txt"))
+STATE = HOME / ".gemini" / ".rot_last_http"
+HIST = HOME / ".gemini" / "choir-http"
+SESSIONS = HIST / "sessions"
+
+# Сетевые сбои (5xx, обрыв) — не повод жечь следующий ключ: ключ живой,
+# плохо шлюзу. Квота — наоборот, повод сменить ключ немедленно.
+NET_RETRIES = 3
+NET_BACKOFF_S = 4
+
+
+def log(msg: str) -> None:
+    print(f"gemini-http: {msg}", file=sys.stderr)
+
+
+def load_keys() -> list[str]:
+    """Ключи из keys.txt. Комментарии и пустые строки — мимо; тот же
+    формат, что читает gemini-rot, файл намеренно общий."""
+    if not KEYS_FILE.is_file():
+        log(f"нет файла ключей {KEYS_FILE}")
+        sys.exit(2)
+    keys = []
+    for line in KEYS_FILE.read_text(encoding="utf-8").splitlines():
+        s = line.strip().strip('"').replace(" ", "")
+        if s and not s.startswith("#") and len(s) >= 30:
+            keys.append(s)
+    if not keys:
+        log(f"в {KEYS_FILE} нет ключей")
+        sys.exit(2)
+    return keys
+
+
+def start_index(n: int) -> int:
+    try:
+        return int(STATE.read_text().strip()) % n
+    except Exception:                                  # noqa: BLE001
+        return 0
+
+
+def remember_index(i: int) -> None:
+    try:
+        STATE.write_text(str(i))
+    except Exception:                                  # noqa: BLE001
+        pass
+
+
+def post(url: str, payload: dict, timeout: int) -> tuple[int, dict]:
+    """POST JSON. Возвращает (http-код, разобранное тело).
+
+    Тело ошибки нам нужно ЦЕЛИКОМ: по нему отличается «кончилась квота
+    этого ключа» от «модель не существует», а это разные решения —
+    сменить ключ или упасть честно."""
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data,
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", errors="replace")
+        try:
+            return e.code, json.loads(raw)
+        except Exception:                              # noqa: BLE001
+            return e.code, {"error": {"message": raw[:500]}}
+
+
+def extract_text(resp: dict) -> str:
+    """Текст ответа из candidates.
+
+    Части с thought=True — внутренние рассуждения модели, в ответ стола
+    они не идут: правило 16 (краткость как условие работы стола), да и
+    участники должны читать позицию, а не поток сознания."""
+    out = []
+    for cand in resp.get("candidates", []):
+        for part in (cand.get("content") or {}).get("parts", []):
+            if part.get("thought"):
+                continue
+            if isinstance(part.get("text"), str):
+                out.append(part["text"])
+    return "".join(out).strip()
+
+
+def finish_note(resp: dict) -> str:
+    """Причина остановки, если она не штатная. Обрыв по лимиту токенов
+    молча отдаёт огрызок ответа — а огрызок, записанный в архив как
+    полноценная реплика, ровно та тихая порча, из-за которой ответ
+    Кодекса берут из файла, а не из stdout."""
+    for cand in resp.get("candidates", []):
+        fr = cand.get("finishReason")
+        if fr and fr not in ("STOP", "MAX_TOKENS"):
+            return fr
+        if fr == "MAX_TOKENS":
+            return "MAX_TOKENS"
+    return ""
+
+
+def session_path(sid: str) -> Path:
+    safe = "".join(c for c in sid if c.isalnum() or c in "-_")[:64]
+    return SESSIONS / f"{safe}.json"
+
+
+def load_session(sid: str) -> list[dict]:
+    p = session_path(sid)
+    if not p.is_file():
+        return []
+    try:
+        return json.loads(p.read_text(encoding="utf-8")).get("contents", [])
+    except Exception:                                  # noqa: BLE001
+        log(f"сессия {sid} повреждена, начинаю новую")
+        return []
+
+
+def save_session(sid: str, contents: list[dict], model: str) -> None:
+    SESSIONS.mkdir(parents=True, exist_ok=True)
+    session_path(sid).write_text(json.dumps(
+        {"session": sid, "model": model, "updated": datetime.now(timezone.utc)
+         .isoformat(timespec="seconds"), "contents": contents},
+        ensure_ascii=False, indent=1), encoding="utf-8")
+
+
+def write_history(prompt: str, answer: str, model: str, key_idx: int,
+                  usage: dict, elapsed: float, session: str | None) -> Path:
+    """Транскрипт вызова — для `choir.py recover`.
+
+    Формат намеренно простой jsonl с полями role/text: recover сверяет
+    промпт по sha256 СТРОГО, поэтому важно записать его ровно таким,
+    каким он ушёл в модель, без нормализации."""
+    HIST.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    sha = hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:16]
+    p = HIST / f"{stamp}-{sha}.jsonl"
+    with p.open("w", encoding="utf-8") as f:
+        for rec in (
+            {"role": "user", "text": prompt, "model": model,
+             "session": session, "ts": datetime.now(timezone.utc)
+             .isoformat(timespec="seconds")},
+            {"role": "assistant", "text": answer, "model": model,
+             "key_index": key_idx, "usage": usage,
+             "elapsed_s": round(elapsed, 1)},
+        ):
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    return p
+
+
+def list_models(keys: list[str]) -> int:
+    for i, k in enumerate(keys):
+        url = f"{API}/models?key={k}&pageSize=200"
+        try:
+            with urllib.request.urlopen(url, timeout=60) as r:
+                d = json.loads(r.read().decode("utf-8"))
+        except Exception as e:                         # noqa: BLE001
+            log(f"ключ #{i}: {type(e).__name__}")
+            continue
+        names = sorted(m["name"].split("/")[-1] for m in d.get("models", []))
+        print(f"ключ #{i}: {len(names)} моделей")
+        for n in names:
+            if "gemini-3" in n:
+                print("  ", n)
+        return 0
+    return 1
+
+
+def ask(prompt: str, model: str, timeout: int, session: str | None,
+        temperature: float | None, tools: bool = False,
+        thinking: str = "high", more_models: bool = False) -> tuple[int, str]:
+    """Один вопрос ОДНОЙ моделью. Возвращает (код, причина).
+
+    Причина нужна каскаду в main: «шлюз лежит» и «ключи по квоте» —
+    поводы позвать другую модель, а «кривой запрос» и «дедлайн» —
+    нет. Раньше всё это возвращалось одним кодом 1, и отличить их
+    снаружи было нельзя.
+    """
+    keys = load_keys()
+    n = len(keys)
+    start = start_index(n)
+
+    contents = load_session(session) if session else []
+    if session and contents:
+        log(f"сессия {session}: продолжаю нить, {len(contents)} реплик в истории")
+    contents = contents + [{"role": "user", "parts": [{"text": prompt}]}]
+
+    payload: dict = {"contents": contents}
+    # Наказ arr 2026-08-18: голоса стола зовутся в самом сильном варианте.
+    # Для семейства Gemini 3 это thinkingLevel=high (динамический
+    # бюджет размышления на максимуме). Про-модель 3.1 на всех четырёх
+    # ключах упёрлась в квоту 429 — 3.7-flash с high-thinking сильнее,
+    # чем pro без ключей.
+    # thinkingLevel из флага --thinking: окно стола даёт Автору выбор
+    # усилия для всех голосов, у Джемини это ровно thinkingLevel.
+    # Умолчание прежнее — high (наказ arr 2026-08-18 про самый сильный
+    # вариант никуда не делся; low выбирают явно и ради скорости).
+    payload["generationConfig"] = {"thinkingConfig":
+                                   {"thinkingLevel": thinking}}
+    if temperature is not None:
+        payload["generationConfig"]["temperature"] = temperature
+    if tools:
+        # url_context — единственный способ дать этому голосу посмотреть
+        # страницу: адаптер ходит в API напрямую, браузера у него нет.
+        # Работает только для публичных страниц: приватная ссылка за
+        # логином не откроется и здесь, у модели нет ничьей сессии.
+        payload["tools"] = [{"url_context": {}}]
+
+    t0 = time.monotonic()
+    # --timeout — ОБЩИЙ дедлайн вызова, а не потолок одного HTTP-запроса.
+    # Прежняя семантика (на запрос) давала бюджет ключи × повторы ×
+    # timeout ≈ полчаса: родительский сторож убивал процесс раньше, без
+    # stderr, и в ленте комнаты оставалось «(пусто) не уложился…» — так
+    # пропала причина исходного инцидента, 503 у шлюза (нашли grok,
+    # codex и субагент-ревьюер, 2026-08-25). Теперь адаптер сам выходит
+    # ДО внешнего потолка и называет последнюю ошибку.
+    deadline = t0 + max(5, timeout)
+
+    def left() -> float:
+        return deadline - time.monotonic()
+
+    last_err = ""
+    last_why = ""
+    gw_keys = 0                 # ключей, отбитых шлюзом или сетью
+    quota_keys = 0              # ключей, отбитых по квоте (429)
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", model):
+        # Кривое имя роняло запрос UnicodeEncodeError'ом на четвёртой
+        # попытке подряд — и выглядело как «шлюз лежит» (поймано на
+        # проверке каскада 2026-09-01). Имя проверяем ДО ключей.
+        log(f"имя модели «{model}» не похоже на модель")
+        return 1, "nomodel"
+    for step in range(n):
+        idx = (start + step) % n
+        url = f"{API}/models/{model}:generateContent?key={keys[idx]}"
+
+        for attempt in range(NET_RETRIES):
+            if left() < 5:
+                log(f"дедлайн {timeout} с исчерпан; последняя ошибка: "
+                    f"{last_err or 'нет'}")
+                return 1, "deadline"
+            try:
+                code, resp = post(url, payload, max(5, min(90, left())))
+            except Exception as e:                     # noqa: BLE001
+                last_err = f"{type(e).__name__}: {e}"
+                last_why = "gateway"
+                # Ранний уход обязан работать и здесь: сетевой отказ
+                # (таймаут чтения, разрыв) — та же беда канала, что и
+                # 5xx, а прежде считались только HTTP-коды, и на
+                # таймаутах перебирались все ключи — 12 запросов вместо
+                # 4, первичная модель съедала дедлайн, запасная не
+                # запускалась вовсе (нашёл codex, проверил подменой).
+                if more_models and gw_keys >= 1:
+                    log(f"канал не отвечает на {model} второй ключ подряд "
+                        f"— остальные не жгу, ухожу на запасную")
+                    return 1, "gateway"
+                if attempt + 1 < NET_RETRIES and left() > NET_BACKOFF_S + 5:
+                    log(f"ключ #{idx}: {last_err}, повтор через {NET_BACKOFF_S} с")
+                    time.sleep(NET_BACKOFF_S)
+                    continue
+                gw_keys += 1
+                break
+
+            if code == 200:
+                text = extract_text(resp)
+                if not text:
+                    # Пустой ответ при коде 200 — обычно фильтр
+                    # безопасности. Молчание тут неотличимо от «промолчал»,
+                    # поэтому называем причину явно.
+                    fr = finish_note(resp) or "пусто без причины"
+                    log(f"ключ #{idx}: ответ пуст ({fr})")
+                    last_err = f"пустой ответ, finishReason={fr}"
+                    # Пустой ответ при 200 — обычно фильтр безопасности,
+                    # а он от ключа не зависит: перебор давал тот же
+                    # запрос четыре раза, тратя время и квоту (нашёл
+                    # codex). Другая МОДЕЛЬ фильтром сработать может и
+                    # не так — поэтому каскаду эта причина подходит, а
+                    # ротации ключей нет.
+                    return 1, "empty"
+                note = finish_note(resp)
+                if note == "MAX_TOKENS":
+                    log("ВНИМАНИЕ: ответ обрезан по лимиту токенов (MAX_TOKENS)")
+                usage = resp.get("usageMetadata", {})
+                elapsed = time.monotonic() - t0
+                remember_index(idx)
+                if session:
+                    save_session(session, contents + [
+                        {"role": "model", "parts": [{"text": text}]}], model)
+                hp = write_history(prompt, text, model, idx, usage, elapsed, session)
+                log(f"ключ #{idx}, модель {model}, "
+                    f"{usage.get('totalTokenCount', '?')} токенов, "
+                    f"{elapsed:.1f} с, история: {hp}")
+                print(text)
+                return 0, ""
+
+            msg = (resp.get("error") or {}).get("message", "")[:200]
+            status = (resp.get("error") or {}).get("status", "")
+
+            if code == 429 or status == "RESOURCE_EXHAUSTED":
+                log(f"ключ #{idx} исчерпан по квоте, пробую следующий")
+                last_err = f"429 {msg}"
+                last_why = "quota"
+                quota_keys += 1
+                break                                  # к следующему ключу
+
+            if code in (500, 502, 503, 504):
+                last_err = f"{code} {msg}"
+                last_why = "gateway"
+                # «This model is currently experiencing high demand» —
+                # беда МОДЕЛИ, а не ключа: перебирать все четыре ключа
+                # по три ретрая значит вчетверо дольше получать тот же
+                # ответ и съесть время раунда (нашёл grok). Поэтому при
+                # наличии запасной модели уходим к ней после ВТОРОГО
+                # ключа с 5xx: два ключа — достаточная проверка, что
+                # дело не в одном ключе.
+                if more_models and gw_keys >= 1:
+                    # «на втором ключе С 5xx», не «подряд»: счётчик
+                    # копит именно шлюзовые отказы и не сбрасывается
+                    # 429-ответом между ними (уточнил kimi — прежняя
+                    # формулировка обещала соседство, которого нет).
+                    log(f"шлюз кладёт {model} на втором ключе с 5xx — "
+                        f"остальные ключи не жгу, ухожу на запасную")
+                    return 1, "gateway"
+                if attempt + 1 < NET_RETRIES and left() > NET_BACKOFF_S + 5:
+                    log(f"ключ #{idx}: {code} у шлюза, повтор через {NET_BACKOFF_S} с")
+                    time.sleep(NET_BACKOFF_S)
+                    continue
+                gw_keys += 1
+                break
+
+            # 400/403/404 — ошибка запроса, а не ключа: перебор остальных
+            # ключей ничего не изменит, только потратит время раунда.
+            log(f"ключ #{idx}: {code} {status} {msg}")
+            # 404 — «такой модели нет у этого ключа»: другой моделью
+            # каскад ещё может выкрутиться, остальное безнадёжно.
+            return 1, ("nomodel" if code == 404 else "request")
+
+    if left() < 5:
+        # Дедлайн — не квота: код 3 родитель читает как «исчерпаны все
+        # ключи», и лежащий шлюз превращался в ложное сообщение о квоте
+        # (нашёл grok).
+        log(f"дедлайн {timeout} с исчерпан; последняя ошибка: {last_err or 'нет'}")
+        return 1, "deadline"
+    # Сводка по КЛЮЧАМ, а не одна последняя ошибка: «по квоте 3, шлюзом
+    # 1» и «по квоте 4» — разные события, а в ленту уходит хвост этого
+    # же stderr, и по нему потом разбирают, кто виноват.
+    log(f"ВСЕ {n} ключей отбиты (по квоте {quota_keys}, шлюзом или сетью "
+        f"{gw_keys}). Последняя ошибка: {last_err}")
+    # Код 3 родитель читает как «квота»: live.py пишет в ленту
+    # «исчерпаны все ключи», и лежащий шлюз получал ярлык квоты —
+    # ложное свойство участника вместо отказа сервиса (нашёл grok; тем
+    # же лечили молчаливые ретраи Кими). Шлюз — это код 1 и причина
+    # рядом.
+    # Квота — только когда ВСЕ ключи ответили 429. Решать по ПОСЛЕДНЕЙ
+    # причине было нельзя: один 5xx на первом ключе и три 429 следом
+    # давали exit 3, а обратный порядок тех же отказов — exit 1;
+    # классификация зависела от того, с какого ключа начали ротацию
+    # (нашёл codex).
+    if quota_keys == n:
+        return 3, "quota"
+    return 1, (last_why or "gateway")
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(add_help=True, description=VERSION)
+    ap.add_argument("-p", "--prompt", help="промпт строкой")
+    ap.add_argument("--prompt-file", help="промпт файлом (предпочтительно: "
+                                          "не рвётся на кавычках и апострофах)")
+    ap.add_argument("-m", "--model", default=DEFAULT_MODEL,
+                    help="модель или СПИСОК через запятую: при лежащем "
+                         "шлюзе (503) и при исчерпанных ключах адаптер "
+                         "перейдёт к следующей и скажет об этом вслух")
+    ap.add_argument("--session", help="идентификатор нити: контекст "
+                                      "предыдущих реплик уйдёт вместе с вопросом")
+    ap.add_argument("--temperature", type=float, default=None)
+    ap.add_argument("--urls", action="store_true",
+                    help="дать модели инструмент чтения ссылок "
+                         "(только публичные страницы)")
+    ap.add_argument("--timeout", type=int, default=600)
+    ap.add_argument("--thinking", default="high",
+                    choices=("low", "medium", "high"),
+                    help="thinkingLevel Gemini API (medium may not be "
+                         "accepted by all models — passed through as is)")
+    ap.add_argument("--models", action="store_true",
+                    help="показать модели, доступные ключу")
+    ap.add_argument("--version", action="store_true")
+    a = ap.parse_args()
+
+    if a.version:
+        print(f"{VERSION} ({DEFAULT_MODEL})")
+        return 0
+    if a.models:
+        return list_models(load_keys())
+
+    if a.prompt_file:
+        prompt = Path(a.prompt_file).read_text(encoding="utf-8")
+    elif a.prompt:
+        prompt = a.prompt
+    elif not sys.stdin.isatty():
+        prompt = sys.stdin.read()
+    else:
+        ap.error("нужен --prompt, --prompt-file или промпт на stdin")
+    if not prompt.strip():
+        log("пустой промпт")
+        return 2
+
+    # КАСКАД ПО МОДЕЛЯМ. Перебор КЛЮЧЕЙ бессилен против «This model is
+    # currently experiencing high demand»: виноват не ключ, а модель, и
+    # четыре ключа по очереди просто вчетверо дольше получают тот же
+    # 503 (замер 2026-09-01: 3.5-flash лежала, 3.7 и 3.6 отвечали).
+    #
+    # ПОДМЕНА ГРОМКАЯ И ТОЛЬКО ПО ПРОСЬБЕ. Молча ответить другой
+    # моделью — ровно то, за что из дома выгнали Gemini CLI: «голос,
+    # отвечающий не той моделью, которой подписан, ломает правило 1»
+    # (CLAUDE.md). Поэтому список задаёт зовущий, каждая замена
+    # называется в stderr, а итоговая строка «ключ #N, модель X»
+    # говорит, кто ответил на самом деле.
+    models = [m.strip() for m in a.model.split(",") if m.strip()]
+    if not models:
+        log("--model: пустой список")
+        return 2
+    deadline = time.monotonic() + max(5, a.timeout)
+    rc, why = 1, ""
+    for i, m in enumerate(models):
+        left = int(deadline - time.monotonic())
+        if i and left < 15:
+            log(f"на запасную модель {m} не осталось времени "
+                f"(дедлайн {a.timeout} с)")
+            break
+        rc, why = ask(prompt, m, max(15, left), a.session, a.temperature,
+                      a.urls, thinking=a.thinking,
+                      more_models=(i + 1 < len(models)))
+        if rc == 0 or i + 1 == len(models):
+            break
+        if why not in ("gateway", "quota", "nomodel", "empty"):
+            break                       # кривой запрос или дедлайн —
+                                        # другая модель не поможет
+        log(f"⇄ модель {m} не ответила ({why}) → пробую {models[i + 1]}. "
+            f"Это ТОТ ЖЕ голос, но ДРУГАЯ модель — учитывайте при "
+            f"сравнении ответов")
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())
