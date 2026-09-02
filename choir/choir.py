@@ -986,6 +986,57 @@ def role_preamble(name: str) -> str:
             f"строкой «РОЛЬ: …» в своём ответе.\n\n")
 
 
+class _FifoReader:
+    """Пьёт ответ голоса из именованного канала, не давая ему осесть
+    на диске (слепота механикой — раунд патент-v2). O_RDWR удерживает
+    канал открытым с нашей стороны: смерть CLI до open не вешает
+    чтение, а после finish() свой конец закрывается и остатки
+    дочитываются без гонки."""
+
+    def __init__(self, path):
+        self.path = path
+        self.fd = os.open(str(path), os.O_RDWR | os.O_NONBLOCK)
+        self.chunks: list[bytes] = []
+        self.done = False
+        self._t = threading.Thread(target=self._drain, daemon=True)
+        self._stop = threading.Event()
+
+    def start(self):
+        self._t.start()
+
+    def _drain(self):
+        import select
+        while not self._stop.is_set():
+            r, _, _ = select.select([self.fd], [], [], 0.2)
+            if r:
+                try:
+                    b = os.read(self.fd, 65536)
+                except OSError:
+                    break
+                if b:
+                    self.chunks.append(b)
+
+    def finish(self) -> str:
+        if self.done:
+            return b"".join(self.chunks).decode("utf-8", errors="replace")
+        self.done = True
+        self._stop.set()
+        self._t.join(timeout=3)
+        # дочитать хвост, оставшийся в канале после остановки нити
+        try:
+            while True:
+                b = os.read(self.fd, 65536)
+                if not b:
+                    break
+                self.chunks.append(b)
+        except BlockingIOError:
+            pass          # наш O_RDWR держит канал: «пусто» = EAGAIN,
+        except OSError:   # не EOF — хвост к этому месту уже дочитан
+            pass
+        os.close(self.fd)
+        return b"".join(self.chunks).decode("utf-8", errors="replace")
+
+
 def ask_one(name: str, prompt: str, round_id: str, phase: str,
             parent: str | None, visibility: str, use_role: bool = True) -> dict:
     """Спросить один голос. Возвращает запись для room.jsonl.
@@ -1031,7 +1082,26 @@ def ask_one(name: str, prompt: str, round_id: str, phase: str,
     pfile = QUARANTINE / f"{stem}.prompt"
     afile = QUARANTINE / f"{stem}.answer"
     pfile.write_text(prompt, encoding="utf-8")
+    # (создание fifo — ниже, внутри try: mkfifo/open, упавшие здесь,
+    # иначе пробрасывались мимо контракта «отказ записывается», а
+    # reader с fd висели навсегда — нашли codex и deepseek)
+    # ОТВЕТ — ЧЕРЕЗ FIFO, НЕ ЧЕРЕЗ ФАЙЛ. Дыру подтвердил стол раундом
+    # патент-v2 (нашёл codex, сводя prior-art наших же механик): у
+    # голоса с answer_file чистый ответ слепой фазы лежал обычным
+    # файлом в карантине всё время его вызова — «слепота отсутствием
+    # данных» (правило 8.5) нарушалась самим дирижёром. Именованный
+    # канал оставляет на диске ИМЯ, но не содержимое: байты уходят
+    # читающему потоку дирижёра и нигде не хранятся (проверено живым
+    # прогоном Кодекса в fifo: на диске 0 байт, ответ дошёл).
+    # Свой write-конец держим открытым (O_RDWR), чтобы reader не
+    # блокировался, если CLI умрёт, не открыв канал.
+    areader = None
     try:
+        if v.get("answer_file"):
+            afile.unlink(missing_ok=True)     # от прежнего трупа имени
+            os.mkfifo(afile)
+            areader = _FifoReader(afile)
+            areader.start()
         # Разворот вопроса — самая тяжёлая фаза: ведущий не отвечает, а
         # обходит репозиторий, чтобы собрать контекст. Кодекс выпал на ней
         # трижды подряд (раунды lang-v1, design-v1, scene-v1), хотя на
@@ -1137,8 +1207,8 @@ def ask_one(name: str, prompt: str, round_id: str, phase: str,
         # Ответ — из файла, если CLI умеет его туда положить (см. Codex);
         # из потока событий, если голос переведён на stream-json (Клод);
         # иначе — просто stdout.
-        if v.get("answer_file") and afile.exists():
-            out = afile.read_text(encoding="utf-8").strip()
+        if areader is not None:
+            out = areader.finish().strip()
         elif v.get("extract"):
             out = v["extract"](run["stdout"]).strip()
         else:
@@ -1218,6 +1288,11 @@ def ask_one(name: str, prompt: str, round_id: str, phase: str,
         rec |= {"status": "error", "text": "", "returncode": None,
                 "detail": f"{type(e).__name__}: {e}"}
     finally:
+        if areader is not None and not areader.done:
+            try:
+                areader.finish()          # сбойный путь: не терять fd/нить
+            except Exception:             # noqa: BLE001
+                pass
         pfile.unlink(missing_ok=True)
         afile.unlink(missing_ok=True)
     rec["elapsed_s"] = round(time.monotonic() - t0, 1)

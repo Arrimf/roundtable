@@ -3530,7 +3530,7 @@ margin-top:.3rem;padding-top:.3rem;max-height:9rem;overflow-y:auto}
 </div></div></div>
 <div id="side">
   <div class="grip grip-v" id="grip-side" title="Ширина правой панели. Тяните; положение запоминается. Двойной щелчок — вернуть по умолчанию."></div>
-  <h3>Голоса · кому уйдёт</h3>
+  <h3 id="vhead3">Голоса · кому уйдёт</h3>
   <div id="scopebar" title="ОДИН переключатель на весь список (наказ Автора 2026-08-31: «чтобы видно было»). Он выбирает, ЧЬЮ пару модель+усилие показывают и меняют ячейки ниже — у каждого голоса их две, независимые.
 💬 комната: живой разговор, запускает live.py — «Сказать», «Слепой ход», «Быстрый вопрос».
 🎼 раунды: протокол стола, запускает choir.py — «Раунд стола» (жребий, затравка, слепая фаза, витки, свод).
@@ -3760,8 +3760,10 @@ const seen=new Set();
 // строкам: тумблер в каждой строке терялся среди ячеек, и по виду
 // панели нельзя было сказать, чью пару ты сейчас правишь.
 let SCOPE='room';
-try{const v=localStorage.getItem('rt-scope');
-  if(v==='rounds'||v==='exec')SCOPE=v}catch(_){}
+// 🔧 из прошлой сессии НЕ поднимаем: Автор перезапустил окно и увидел
+// «кнопки чата пропали совсем» — стартуем в 💬 (или 🎼, если так было),
+// кодер — только по клику (2026-09-02).
+try{const v=localStorage.getItem('rt-scope');if(v==='rounds')SCOPE=v}catch(_){}
 // Что сервер объявил про себя. Оба поля молодые, и «не объявил» здесь
 // НЕ значит «не умеет» — значит «окно не знает». Разница важна: пока
 // не знаем, окно выбирает осторожный путь (см. sendQuick), а не
@@ -4540,6 +4542,13 @@ function setScope(v){
   // раундовые кнопки уходят — Автор: «внизу куча кнопочек,
   // перегружено» (раунд вкладки-v1: перенос — единогласно).
   try{
+    document.getElementById('vhead3').textContent=
+      v==='exec'?'Голоса · кресла (🔧 coder)'
+      :v==='rounds'?'Голоса · раунды (🎼)':'Голоса · кому уйдёт';
+    document.getElementById('msg').placeholder=
+      v==='exec'?'Задание исполнителю (кнопка Правка); поле «акт» ниже — для гейта'
+      :v==='rounds'?'Вопрос раунда одной строкой (кнопка «Раунд стола»)'
+      :'Реплика в комнату (@имя — адресно; Enter — отправить, Alt+Enter — перенос)';
     document.getElementById('coderblk').hidden=(v!=='exec');
     document.getElementById('sendrow').hidden=(v==='exec');
     document.getElementById('roundrow').hidden=(v==='exec');
@@ -4623,9 +4632,14 @@ function applyVoices(list,fresh){
     const sc=SCOPE;
     const rd=m.rounds||{};
     const ex=m.exec||null;   // кресло исполнителя (вкладка 🔧 coder)
-    const showM=sc==='room'?(m.model||''):sc==='exec'?((ex||{}).model||'')
+    // Слова вместо прочерка: «у большинства вендоров прочерки» Автор
+    // прочёл как поломку, а это честное «рычага нет» (2026-09-02).
+    const showM=sc==='room'?(m.model||''):sc==='exec'
+      ?((ex&&ex.can_model)?(ex.model||''):(ex?'нет рычага':'нет кресла'))
       :(rd.model||'');
-    const showE=sc==='room'?(m.effort||''):sc==='exec'?((ex||{}).effort||'')
+    const showE=sc==='room'?(m.effort||''):sc==='exec'
+      ?((ex&&ex.can_effort)?(efl.length?(ex.effort||''):'ступени не объявлены')
+        :(ex?'нет рычага':'нет кресла'))
       :(rd.effort||'');
     const srcM=sc==='room'?m.model_source:sc==='exec'
       ?(ex?(ex.model?'задано в окне (кресло)':'умолчание кресла — '+

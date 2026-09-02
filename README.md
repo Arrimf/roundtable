@@ -37,8 +37,10 @@ keeps the agenda honest and verifiable by anyone.
 commit-reveal drand lottery picks the leader *before* the beacon's
 signature exists (the choice cannot be fitted to the question); the
 leader expands the question into a seed; every voice answers **blind**
-(answers are held in the conductor's memory and revealed at once —
-blindness by absence of data, not by a promise not to look); up to
+(answers are held in the conductor's memory and revealed at once; the
+one CLI that insists on writing its answer to a path is given a named
+pipe, so the bytes never rest on disk — blindness by absence of data,
+not by a promise not to look); up to
 three rebuttal rounds; a summary that must name where the voices
 *disagreed* — disagreement is the product, not a defect.
 
@@ -110,10 +112,21 @@ bash test/gate_test.sh         # 47 review/merge-gate scenarios
 bash smoke.sh                  # 16-step window smoke
 ```
 
-## License
+## License and patents
 
-MIT © 2026 Arr. The table asked itself whether there was anything here
-to patent — the round's summary lives in the project journal.
+MIT © 2026 Arr.
+
+The table held a full blind round on its own license (патент-v2,
+2026-09-02, all six voices, no channel failures). Unanimous: these
+mechanisms are not patentable — commit-reveal lotteries, Delphi-style
+blind panels, public randomness beacons and lease/lock protocols are
+decades-old prior art — and no patent will be sought by the authors.
+This repository is published deliberately as **prior art**: dated,
+implemented, and verifiable. On the license itself the vote was 5:1
+for MIT (one voice argued Apache-2.0's patent clause; four others
+noted it only binds contributors, which does not answer the actual
+threat — a third-party filing — against which the working defense is
+exactly this early public release).
 
 ---
 
