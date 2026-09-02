@@ -37,16 +37,19 @@ codex). Маркер <act>.<epoch>.close.json пишет исполнитель,
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import shlex
 import subprocess
 import sys
+import threading
 import uuid
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import catalog                                           # noqa: E402
 import leases                                            # noqa: E402
 
 # Комната ищется: env → каталог choir/ рядом с этим файлом (раскладка
@@ -118,6 +121,151 @@ def _exec_over(voice: str, key: str) -> str:
     return str(v) if v else ""
 
 
+# ЯВНЫЕ УМОЛЧАНИЯ КРЕСЕЛ (наказ Автора 2026-09-02: «умолчание — не
+# понятно какая модель и какое усилие — давай прописывать явно»). До
+# этого кресло без настройки шло «как CLI решит», окно честно ставило
+# прочерк — а читалось это как поломка. Теперь у каждого рычага есть
+# значение, и оно либо УХОДИТ ФЛАГОМ в argv (claude, kimi, deepseek —
+# скрытый дефолт CLI нам не хозяин: у Клода он берётся из личного
+# ~/.claude/settings.json Автора, у dsh — из профиля харнесса), либо
+# названо ТЕМ, кто его хранит: пустая строка значит «умолчание хранит
+# канал» — codex в ~/.codex/config.toml, grok в кэше моделей своего CLI
+# (первая модель списка и её reasoning_effort); окно их читает и
+# показывает с подписью источника.
+#
+# Клод в кресле — opus/high, как в комнате (live.py), а не fable/max
+# раундов: у Fable отдельное недельное окно, и оно уже упиралось в 100 %
+# (замер 2026-08-25) — кресло, молча садящееся на исчерпанную квоту,
+# падало бы целым актом. Переключить — вкладка 🔧 окна.
+# Один класс символов имени на окно, кресло и каталог — ИМПОРТОМ, не
+# копией: три копии разошлись бы молча (правило 7 в миниатюре).
+MODEL_RE = catalog.MODEL_RE
+
+
+def _kimi_default_model() -> str:
+    """default_model из ~/.kimi-code/config.toml — С провайдером (он
+    выбирает ключ линии); имя без провайдера получает moonshotai;
+    нет файла — то же имя, что было литералом. Читается ПРИ КАЖДОЙ
+    сборке argv, не на импорте: конфиг правят, окно живёт сутками, и
+    замороженное умолчание расходилось бы с тем, что показывают
+    комната и раунды (нашли grok, субагент)."""
+    v = ""
+    try:
+        import tomllib
+        with (Path.home() / ".kimi-code" / "config.toml").open("rb") as f:
+            v = str(tomllib.load(f).get("default_model") or "").strip()
+    except Exception:                               # noqa: BLE001
+        v = ""
+    if not v:
+        return "moonshotai/kimi-k3"
+    return v if "/" in v else "moonshotai/" + v
+
+
+# Явные значения кресел; пустая строка = «умолчание хранит канал»,
+# kimi — динамически из конфига (см. exec_default).
+EXEC_DEFAULTS: dict[str, dict[str, str]] = {
+    "codex": {"model": "", "effort": ""},
+    "claude": {"model": "opus", "effort": "high"},
+    "grok": {"model": "", "effort": ""},
+    "kimi": {"model": ""},
+    "deepseek": {"model": "deepseek-v4-flash"},
+}
+# Умолчания, РАЗРЕШЁННЫЕ ОКНОМ из чужих хранилищ (кэш моделей grok:
+# первая модель и её reasoning_effort). Окно кладёт их сюда, а лямбды
+# ниже шлют ФЛАГАМИ: то, что панель показывает как «умолчание», обязано
+# быть тем, что ушло CLI, — не догадкой о серверном дефолте (нашли
+# codex и claude: кресло grok молчало про --effort, а окно показывало
+# «high (умолчание)»).
+EXEC_RESOLVED: dict = {}
+# Какие рычаги у кресла ЕСТЬ — то есть за какими стоит флаг в argv ниже.
+# Окно принимает настройку только по этому списку (правило 8.5: рычаг,
+# за которым ничего не стоит, — поле, которое врёт). У kimi усилия нет
+# в самом CLI (только -m); у dsh нет ручки усилия вовсе.
+EXEC_LEVERS: dict[str, tuple[str, ...]] = {
+    "codex": ("model", "effort"),
+    "claude": ("model", "effort"),
+    "grok": ("model", "effort"),
+    "kimi": ("model",),
+    "deepseek": ("model",),
+}
+EXEC_DEFAULT_SRC: dict[str, str] = {
+    "codex": "~/.codex/config.toml (model, model_reasoning_effort) — "
+             "кресло флагов не шлёт, CLI читает свой конфиг",
+    "claude": "edits.EXEC_DEFAULTS: флаги --model/--effort уходят в argv "
+              "всегда",
+    "grok": "кэш моделей CLI (~/.grok/models_cache.json): первая модель и "
+            "её reasoning_effort; окно разрешает их и кресло шлёт флагами "
+            "--model/--effort всегда, когда кэш есть",
+    "kimi": "default_model из ~/.kimi-code/config.toml (читается при "
+            "каждом акте), флаг -m всегда; усилия у kimi CLI нет",
+    "deepseek": "edits.EXEC_DEFAULTS → патч-слой dsh (agent-default-model) "
+                "всегда; усилия у dsh нет",
+}
+DSH_PATCH_DIR = Path(os.environ.get("CHOIR_DSH_PATCH_DIR")
+                     or Path.home() / ".cache" / "choir" / "dsh-patches")
+
+
+def exec_default(voice: str, key: str) -> str:
+    """Явное умолчание кресла; kimi — из конфига при каждом вызове."""
+    if voice == "kimi" and key == "model":
+        return _kimi_default_model()
+    return (EXEC_DEFAULTS.get(voice) or {}).get(key, "")
+
+
+def exec_value(voice: str, key: str) -> str:
+    """Настройка окна → разрешённое окном умолчание → явное умолчание;
+    пусто — хранит канал."""
+    return (_exec_over(voice, key)
+            or str((EXEC_RESOLVED.get(voice) or {}).get(key) or "")
+            or exec_default(voice, key))
+
+
+_PATCH_LOCK = threading.Lock()
+
+
+def dsh_patch(model: str) -> Path:
+    """Оверлей dsh на ЛЮБУЮ модель канала, а не только pro: прежний
+    статический dsh-model-pro.yaml знал одно имя, и селектор окна врал
+    бы для всех остальных. Имя проверено тем же классом символов, что
+    в окне, и стоит в двойных кавычках — yaml не разберёт его иначе,
+    чем строкой. Файл пишется атомарно и перезаписывается лишь при
+    расхождении: два акта подряд не гоняют диск."""
+    if not MODEL_RE.match(model or ""):
+        raise ValueError(f"имя модели dsh не прошло проверку: {model!r}")
+    # Имя файла — по ХЕШУ полного имени: замена символов давала одно имя
+    # для `a/b` и `a_b`, и поздний акт переписывал yaml раннего под
+    # чужую модель (нашли codex, grok). Запись под замком и tmp по
+    # потоку: два кресла подряд в одном процессе окна.
+    digest = hashlib.sha1(model.encode("utf-8")).hexdigest()[:16]
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", model)[:40]
+    p = DSH_PATCH_DIR / f"model-{safe}-{digest}.yaml"
+    body = ("- id: agent-default-model\n  config:\n"
+            "    provider: deepseek-official\n"
+            f"    model: \"{model}\"\n")
+    with _PATCH_LOCK:
+        try:
+            if p.read_text(encoding="utf-8") == body:
+                return p
+        except OSError:
+            pass
+        DSH_PATCH_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_name(p.name + f".{os.getpid()}.{threading.get_ident()}.tmp")
+        tmp.write_text(body, encoding="utf-8")
+        tmp.replace(p)
+    return p
+
+
+def _kimi_model_arg() -> str:
+    """Имя для `kimi -m`: короткое имя окна получает провайдера из
+    default_model конфига (не литерал moonshotai — провайдер выбирает
+    КЛЮЧ линии, и второй линии он другой)."""
+    m = exec_value("kimi", "model")
+    if "/" in m:
+        return m
+    prov = _kimi_default_model().split("/")[0] or "moonshotai"
+    return f"{prov}/{m}"
+
+
 EDIT_VOICES = {
     "codex": lambda task, base_git: [
         "codex", "exec", "-s", "workspace-write",
@@ -138,8 +286,11 @@ EDIT_VOICES = {
     "claude": lambda task, base_git: [
         "claude", "-p",
         "--allowedTools", "Write,Edit,Bash(git:*)",
-        *(["--model", _exec_over("claude", "model")]
-          if _exec_over("claude", "model") else []),
+        # Оба флага ВСЕГДА (явное умолчание, см. EXEC_DEFAULTS): без них
+        # кресло брало модель из личного settings.json Автора, и окно
+        # не могло сказать, чем пойдёт правка.
+        "--model", exec_value("claude", "model"),
+        "--effort", exec_value("claude", "effort"),
         "--", task,
     ],
     "kimi": lambda task, base_git: [
@@ -147,27 +298,30 @@ EDIT_VOICES = {
         # провайдер дописывается, как в live.py: селектор окна даёт
         # «kimi-k3», а CLI ждёт «moonshotai/kimi-k3» — голое имя ломало
         # запуск (нашли codex и grok)
-        "-m", ((lambda m: m if "/" in m else "moonshotai/" + m)
-               (_exec_over("kimi", "model") or "moonshotai/kimi-k3")),
+        "-m", _kimi_model_arg(),   # провайдер = ключ линии
         "-p",
         "ЗАДАНИЕ СТОЛА. " + task,
     ],
     "grok": lambda task, base_git: [
         "script", "-qec",
         "grok -p " + shlex.quote("ЗАДАНИЕ СТОЛА. " + task) + " --no-plan"
-        + (" --effort " + shlex.quote(_exec_over("grok", "effort"))
-           if _exec_over("grok", "effort") else ""),
+        # --model был только у комнаты; кресло молча шло серверным
+        # дефолтом, и окно писало «нет рычага» (Автор, 2026-09-02).
+        + (" --model " + shlex.quote(exec_value("grok", "model"))
+           if exec_value("grok", "model") else "")
+        + (" --effort " + shlex.quote(exec_value("grok", "effort"))
+           if exec_value("grok", "effort") else ""),
         "/dev/null",
     ],
     # Модель dsh КРУТИТСЯ патч-слоем (нашлось по вопросу Автора «а
     # почему Дипсик с прочерками»): умолчание харнесса — v4-flash,
-    # оверлей dsh-model-pro.yaml пересаживает на v4-pro (проверено
-    # живьём: агент сам называет модель). Усилия у dsh нет по-прежнему.
+    # оверлей agent-default-model пересаживает на любую модель канала
+    # (проверено живьём с v4-pro: агент сам называет модель). Патч
+    # уходит ВСЕГДА — явное умолчание, не «что решит профиль». Усилия
+    # у dsh нет по-прежнему.
     "deepseek": lambda task, base_git: [
         "dsh", "--profile", "headless",
-        *(["--patch", str(Path(__file__).resolve().parent
-                          / "dsh-model-pro.yaml")]
-          if "pro" in (_exec_over("deepseek", "model") or "") else []),
+        "--patch", str(dsh_patch(exec_value("deepseek", "model"))),
         "ЗАДАНИЕ СТОЛА. " + task,
     ],
 }
@@ -281,7 +435,13 @@ def open_edit(project: Path, task: str, voice: str,
         _undo()
         raise EditRefused(f"git-common-dir не взят: {err}")
 
-    cmd = EDIT_VOICES[voice](task, base_git.strip())
+    try:
+        cmd = EDIT_VOICES[voice](task, base_git.strip())
+    except (ValueError, OSError) as e:
+        # argv не собрался (кривое имя модели, диск под патч dsh) — до
+        # интента; worktree уже есть, и без отката он остался бы сиротой.
+        _undo()
+        raise EditRefused(f"argv кресла {voice} не собрался: {e}")
     # seat — ЧЕМ исполняется голос (бинарь кресла): у deepseek в кресле
     # dsh-харнесс, а не HTTP-голос стола, и без метки читатель ленты их
     # не различит (нашли deepseek и kimi). cmd в событии полный, seat —

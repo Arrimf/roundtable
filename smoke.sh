@@ -84,7 +84,10 @@ fi
 
 # ── шаг 1: старт сервера ─────────────────────────────────────────────
 step 1 "старт сервера (ROUNDTABLE_PORT=$PORT)"
-( cd "$RT_DIR" && ROUNDTABLE_PORT="$PORT" nohup python3 roundtable.py \
+# Каталог моделей — БЕЗ разведки и в свой файл: смок не должен ходить
+# в сеть с живыми учётками и переписывать кэш Автора (ревизия 2026-09-02).
+( cd "$RT_DIR" && ROUNDTABLE_PORT="$PORT" CHOIR_RT_NO_DISCOVERY=1 \
+  CHOIR_RT_MODELS="$WORK/rt-models.json" nohup python3 roundtable.py \
       >"$WORK/server.log" 2>&1 & echo $! >"$WORK/pid" )
 SPID="$(cat "$WORK/pid")"
 up=""

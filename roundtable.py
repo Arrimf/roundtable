@@ -53,6 +53,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import catalog                           # модели и ступени: разведка + кэш
 import edits                             # правки: worktree + вердикт
 import leases                            # аренды кресла исполнителя
 import merge_gate                        # этап 3: ревизия дифа + приёмка
@@ -475,109 +476,27 @@ KIMI_CFG = Path.home() / ".kimi-code" / "config.toml"
 DS_BASE = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 DS_KEY = Path.home() / ".deepseek" / "key"
 
-# Лестницы усилий берём у choir.py, а не переписываем: вторая копия
-# однажды разойдётся молча — тем же образом из правила 7 выпал Грок
-# (и по той же причине VOICES выше берутся у live.py). Импорт под
-# защитой: окно не должно падать оттого, что у соседнего модуля
-# насморк, — тогда работает запасная таблица, и это видно в поле
-# efforts_source.
+# Списки моделей и лестницы усилий живут в catalog.py: РАЗВЕДКА по
+# самим каналам (API по токену CLI, кэши CLI, --models адаптеров) плюс
+# кэш на диске и кнопка ⟳ в окне (наказ Автора 2026-09-02: «появилась
+# новая модель — предусмотрим кнопочку обновить список»). Прежние
+# списки буквами в VOICE_CTL устаревали в день написания: у Клода не
+# было Fable 5.1. choir импортируется ради УМОЛЧАНИЙ РАУНДОВ —
+# CLAUDE_MODEL/EFFORT и eff() — того, чем choir.py пойдёт без настройки;
+# окно эти значения показывает, а не переписывает.
 try:
     import choir                                    # noqa: E402
-    EFFORTS = {k: list(v) for k, v in choir.EFFORT_LADDER.items()}
-    EFFORTS_SRC = "choir.EFFORT_LADDER"
-except Exception:                                   # noqa: BLE001
-    # Запасная копия. Держится ровно потому, что без неё POST /voices
-    # отверг бы вообще любой уровень — а это хуже, чем устаревшая копия
-    # с честной подписью источника.
-    EFFORTS = {"claude": ["low", "medium", "high", "xhigh", "max"],
-               "codex": ["low", "medium", "high", "xhigh"],
-               "grok": ["low", "medium", "high"],
-               "kimi": [], "gemini": []}
-    EFFORTS_SRC = "запасная копия в roundtable.py (choir не импортировался)"
-
-# У кого лестница НЕ оттуда — называем свой источник. deepseek в
-# choir.EFFORT_LADDER отсутствует вовсе, его список приходит из choices
-# самого адаптера; подписывать его чужим источником значит врать ровно
-# в том поле, которое заведено против догадок (нашёл ревьюер 2026-08-26).
-def _grok_cache() -> dict:
-    """Разобранный ~/.grok/models_cache.json или {} — кэш пишет сам CLI,
-    и наша копия имён разошлась бы с живым сервером молча (тот же довод,
-    по которому VOICES берутся у live.py).
-
-    Except широкий и с проверками типов НАМЕРЕННО: это читается на
-    ИМПОРТЕ окна, и валидный json неожиданной формы (models списком)
-    ронял бы окно целиком ещё до первой страницы (нашли deepseek и
-    grok независимо).
-    """
-    try:
-        mc = json.loads((Path.home() / ".grok" / "models_cache.json")
-                        .read_text(encoding="utf-8"))
-        models = mc.get("models") if isinstance(mc, dict) else None
-        if isinstance(models, dict) and models:
-            return models
-    except (OSError, ValueError, TypeError, AttributeError):
-        pass
-    return {}
+    CHOIR_OK = True
+except Exception as _choir_err:                     # noqa: BLE001
+    choir = None                                    # type: ignore
+    CHOIR_OK = False
+    print(f"⚠ choir.py не импортировался ({_choir_err}): умолчания раундов "
+          f"показаны по памяти", file=sys.stderr)
 
 
-def _grok_model_efforts() -> dict[str, list[str]]:
-    """Усилия ПО МОДЕЛЯМ: union по всем моделям пропускал пару
-    grok-4.5+xhigh, которую CLI роняет с 'unknown effort level' —
-    проверка пары обязана знать, у какой модели что есть (нашли все
-    четверо ревьюеров)."""
-    out: dict[str, list[str]] = {}
-    order = ["low", "medium", "high", "xhigh", "max"]
-    for mid, m in _grok_cache().items():
-        effs = []
-        try:
-            for e in (m.get("info") or {}).get("reasoning_efforts") or []:
-                v = e.get("value")
-                if v and v not in effs:
-                    effs.append(v)
-        except (TypeError, AttributeError):
-            continue
-        if effs:
-            out[str(mid)] = sorted(
-                effs, key=lambda x: order.index(x) if x in order else 99)
-    return out
-
-
-_GROK_BY_MODEL = _grok_model_efforts()
-GROK_CACHE_OK = bool(_GROK_BY_MODEL)
-
-
-def _grok_models() -> list[str]:
-    if GROK_CACHE_OK:
-        return sorted(_GROK_BY_MODEL.keys(), reverse=True)
-    return ["grok-4.6", "grok-4.5"]
-
-
-def _grok_efforts() -> list[str]:
-    if GROK_CACHE_OK:
-        seen: list[str] = []
-        for effs in _GROK_BY_MODEL.values():
-            for v in effs:
-                if v not in seen:
-                    seen.append(v)
-        order = ["low", "medium", "high", "xhigh", "max"]
-        return sorted(seen, key=lambda x: order.index(x)
-                      if x in order else 99)
-    # Фолбэк БЕЗ xhigh: он есть не у всех моделей, а пары проверить
-    # нечем — кэша нет.
-    return ["low", "medium", "high"]
-
-
-
-EFFORTS_SRC_BY = {"deepseek": "deepseek-http: choices у --effort",
-                  "grok": ("~/.grok/models_cache.json: reasoning_efforts "
-                           "(пишет сам CLI с сервера)" if GROK_CACHE_OK else
-                           "кэш моделей НЕ прочитался — запасной список "
-                           "по памяти, без xhigh"),
-                  "gemini": "thinkingLevel Gemini API через gemini-http "
-                            "--thinking. По medium стол разошёлся "
-                            "(codex и grok: поддержан обеими моделями; "
-                            "kimi: даст 400) — оставлен по большинству и "
-                            "докам, опыт снимет спор, когда шлюз оживёт"}
+def _efforts(name: str, model: str | None = None) -> list[str]:
+    """Допустимые ступени — по модели, где канал их различает."""
+    return catalog.efforts(name, model)
 
 
 def _bin_path(name: str) -> Path | None:
@@ -618,14 +537,6 @@ def _toml_get(path: Path, key: str) -> str | None:
         return None
 
 
-# У deepseek лестницы в choir.EFFORT_LADDER нет вовсе (голос добавлен
-# позже), зато ручка у адаптера есть — берём допустимые уровни из его
-# же argparse-choices, чтобы окно не выдумало свой список.
-_ds_choices = _src_default(
-    "deepseek-http", r'"--effort".*?choices=\(([^)]*)\)')
-EFFORTS["deepseek"] = ([s.strip().strip('"\'') for s in _ds_choices.split(",")
-                        if s.strip()] if _ds_choices else [])
-
 # ЧТО РЕАЛЬНО МОЖНО ПОМЕНЯТЬ НА ЛЕТУ (разведка по коду, 2026-08-25).
 # Переменные окружения во всей цепочке читают ровно два места:
 #   live.py:176–177      CHOIR_CLAUDE_MODEL / CHOIR_CLAUDE_EFFORT
@@ -644,9 +555,8 @@ VOICE_CTL: dict[str, dict] = {
         "rounds_default": "умолчание choir.py: fable/max (наказ arr 24.08)",
         "model_env": "CHOIR_CLAUDE_MODEL",
         "effort_env": "CHOIR_CLAUDE_EFFORT",
-        # Алиасы из `claude --help`; полное имя вида claude-fable-5 тоже
-        # принимается — поэтому рядом стоит model_re.
-        "models": ["fable", "opus", "sonnet", "haiku"],
+        # Список — у catalog (алиасы CLI + api.anthropic.com/v1/models);
+        # имя вне списка принимается по форме model_re.
         "model_re": r"claude-[\w.-]{1,48}",
         # ПОСЛЕ закрытия утечки (07aaa42) эта пара правит ТОЛЬКО
         # комнату: наследный фолбэк в choir.py снят, раундами Клода
@@ -661,7 +571,6 @@ VOICE_CTL: dict[str, dict] = {
         "rounds_default": "умолчание адаптера: deepseek-v4-pro/max",
         "model_env": "DEEPSEEK_MODEL",
         "effort_env": "DEEPSEEK_EFFORT",
-        "models": ["deepseek-v4-pro", "deepseek-v4-flash"],
         "model_re": r"deepseek-[\w.-]{1,48}",
         # Раундам deepseek-http теперь получает ЯВНЫЕ флаги (choir.py),
         # и они сильнее env — комнатная пара в раунды не утекает.
@@ -679,7 +588,6 @@ VOICE_CTL: dict[str, dict] = {
         "rounds_default": "умолчание: модель из ~/.codex/config.toml, усилие high (ступень ниже потолка)",
         "model_env": "CHOIR_CODEX_MODEL",
         "effort_env": "CHOIR_CODEX_EFFORT",
-        "models": ["gpt-5.6-sol"],
         "model_re": r"gpt-[\w.-]{1,48}",
         "applies_to": ["live.py"],
         "scope": "живая комната (live.py: -m и -c model_reasoning_effort "
@@ -690,7 +598,6 @@ VOICE_CTL: dict[str, dict] = {
         "rounds_default": "умолчание: модель — серверный дефолт xAI, усилие medium",
         "model_env": "CHOIR_GROK_MODEL",
         "effort_env": "CHOIR_GROK_EFFORT",
-        "models": _grok_models(),
         "model_re": r"grok-[\w.-]{1,48}",
         "applies_to": ["live.py"],
         "scope": "живая комната (live.py: --model и --effort). Пустая "
@@ -701,7 +608,6 @@ VOICE_CTL: dict[str, dict] = {
     "kimi": {
         "rounds_default": "умолчание: модель линии из ~/.kimi-code/config.toml",
         "model_env": "CHOIR_KIMI_MODEL",
-        "models": ["kimi-k3"],
         "model_re": r"kimi-[\w.-]{1,40}",
         "applies_to": ["live.py"],
         "scope": "живая комната; имя БЕЗ провайдера (kimi-k3, не "
@@ -714,7 +620,6 @@ VOICE_CTL: dict[str, dict] = {
         "rounds_default": "умолчание choir.py: gemini-3.7-flash/high",
         "model_env": "CHOIR_GEMINI_MODEL",
         "effort_env": "CHOIR_GEMINI_EFFORT",
-        "models": ["gemini-3.7-flash", "gemini-3.1-pro"],
         "model_re": r"gemini-[\w.-]{1,48}",
         "applies_to": ["live.py"],
         "scope": "живая комната (live.py → gemini-http "
@@ -722,16 +627,11 @@ VOICE_CTL: dict[str, dict] = {
     },
 }
 
-# У Грока лестница из его же кэша моделей (у choir.EFFORT_LADDER потолок
-# high — это про grok-4.5); у Джемини усилий в choir нет вовсе.
-EFFORTS["grok"] = _grok_efforts()
-EFFORTS["gemini"] = ["low", "medium", "high"]
-
 # Имя модели уходит в env, оттуда — аргументом CLI. Оболочки в этом
 # пути нет (subprocess со списком), но у Грока команда собирается
 # строкой для `script -qec`, и привычка пропускать в argv что попало
 # однажды встретится с ней. Пускаем только безобидный класс символов.
-MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,63}$")
+MODEL_RE = catalog.MODEL_RE          # одна копия на окно, кресло и каталог
 
 # Настройка ПЕРЕЖИВАЕТ перезапуск окна (наказ Автора 2026-08-27:
 # «последнее установленное — по умолчанию»). Прежний довод «файл был бы
@@ -764,6 +664,16 @@ def _sync_exec_overrides() -> None:
             if isinstance(ex, dict) and ex:
                 fresh[n] = dict(ex)
     edits.EXEC_OVERRIDES = fresh
+    # Умолчания grok, РАЗРЕШЁННЫЕ из кэша его CLI: модель — первая в
+    # кэше, усилие — reasoning_effort ДЕЙСТВУЮЩЕЙ модели (заданной в
+    # окне или той же первой). Кресло шлёт их флагами — панель и argv
+    # совпадают буква в букву (нашли codex, claude, субагент).
+    resolved: dict = {}
+    gm = (fresh.get("grok") or {}).get("model") or catalog.default_model("grok")
+    if gm:
+        resolved["grok"] = {"model": gm,
+                            "effort": catalog.default_effort("grok", gm) or ""}
+    edits.EXEC_RESOLVED = resolved
 CFG_LOCK = threading.Lock()
 # env-переопределение — ДЛЯ ТЕСТОВ: изоляция комнатой (ROUNDTABLE_CHOIR)
 # не покрывала кэш настроек, и тестовый сервер писал в живой файл
@@ -822,31 +732,75 @@ def _load_voice_cfg() -> None:
             if "pool" in pair and not isinstance(pair["pool"], bool):
                 drop(name, sc, "pool", "не bool")
                 pair.pop("pool", None)
-            m = pair.get("model")
-            if m is not None and (not isinstance(m, str)
-                                  or not MODEL_RE.match(m)):
-                drop(name, sc, "model", "не строка или кривая форма")
-                pair.pop("model", None)
-            e = pair.get("effort")
-            allowed = EFFORTS.get(name) or []
-            if e is not None and (not isinstance(e, str)
-                                  or e not in allowed):
-                drop(name, sc, "effort",
-                     f"не из списка {allowed or '(рычага нет)'}")
-                pair.pop("effort", None)
-            if (name == "grok" and GROK_CACHE_OK
-                    and pair.get("model") in _GROK_BY_MODEL
-                    and pair.get("effort")
-                    and pair["effort"] not in _GROK_BY_MODEL[pair["model"]]):
-                drop(name, sc, "effort",
-                     f"пара с {pair['model']} недопустима")
-                pair.pop("effort", None)
+            for what, why in _pair_problems(name, sc, pair):
+                drop(name, sc, what, why)
+                pair.pop(what, None)
             if pair:
                 ent[sc] = pair
             else:
                 ent.pop(sc, None)
         if ent:
             VOICE_CFG[name] = ent
+
+
+def _pair_problems(name: str, sc: str, pair: dict) -> list[tuple[str, str]]:
+    """Что в паре {model, effort} области sc НЕ прошло бы POST /voices —
+    ОДНА проверка на чтение файла и на запрос (ревизия 2026-09-02:
+    файл проверялся мягче запроса, и пара, которую окно не даст
+    выставить, переживала перезапуск и уходила CLI на платном ходу).
+
+    Ступень сверяется с лестницей ДЕЙСТВУЮЩЕЙ модели: заданной в паре,
+    иначе умолчания области. Пока каталог сидит на запасе (разведки не
+    было), лестница неполна — тогда ступень по форме принимается с
+    предупреждением, а не выбрасывается: сохранённый xhigh у grok-4.6
+    иначе исчезал до первого ⟳ (нашли claude, субагент)."""
+    out: list[tuple[str, str]] = []
+    ctl = VOICE_CTL.get(name) or {}
+    m, e = pair.get("model"), pair.get("effort")
+    if sc == "exec":
+        levers = edits.EXEC_LEVERS.get(name, ())
+        if name not in edits.EDIT_VOICES:
+            return [(k, "кресла нет — только ревьюер") for k in
+                    ("model", "effort", "pool") if k in pair]
+        if m is not None and "model" not in levers:
+            out.append(("model", "у кресла нет рычага модели"))
+            m = None
+        if e is not None and "effort" not in levers:
+            out.append(("effort", "у кресла нет рычага усилия"))
+            e = None
+    else:
+        if m is not None and not ctl.get("model_env"):
+            out.append(("model", "модель из окна не меняется"))
+            m = None
+        if e is not None and not ctl.get("effort_env"):
+            out.append(("effort", "усилие из окна не меняется"))
+            e = None
+    if m is not None and (not isinstance(m, str) or not MODEL_RE.match(m)
+                          or not (m in catalog.models(name)
+                                  or (ctl.get("model_re") and re.fullmatch(
+                                      ctl["model_re"], m)))):
+        out.append(("model", "не строка, кривая форма или не той семьи"))
+        m = None
+    if e is not None:
+        if not isinstance(e, str) or not catalog.EFFORT_RE.match(e):
+            out.append(("effort", "не строка или кривая форма"))
+        else:
+            try:
+                dm = (_defaults_for(name, sc) or {}).get("model")
+            except Exception:                       # noqa: BLE001
+                dm = None
+            pm = m or dm
+            allowed = _efforts(name, pm)
+            if e not in allowed:
+                if catalog.entry(name).get("fetched_at") or not allowed:
+                    out.append(("effort", f"не из списка "
+                                          f"{allowed or '(рычага нет)'}"
+                                          + (f" модели {pm}" if pm else "")))
+                else:
+                    print(f"⚠ {name}/{sc}/effort={e}: каталог без разведки "
+                          f"(запасная лестница {allowed}) — принято по "
+                          f"форме, проверьте после ⟳", file=sys.stderr)
+    return out
 
 
 def _save_voice_cfg(name: str, vscope: str) -> None:
@@ -873,8 +827,12 @@ def _save_voice_cfg(name: str, vscope: str) -> None:
             except (OSError, ValueError):
                 disk = {}
             ent = disk.setdefault(name, {})
+            # Плоский файл первой редакции — тот, где нет НИ ОДНОЙ
+            # области. Проверка «нет room и rounds» считала плоской и
+            # запись с одним exec — и стирала настройку кресла при
+            # первом же сохранении комнаты (поймано тестом 2026-09-02).
             if not isinstance(ent, dict) or (
-                    ent and "room" not in ent and "rounds" not in ent):
+                    ent and not any(sc in ent for sc in SCOPES)):
                 ent = {}
                 disk[name] = ent
             pair = (VOICE_CFG.get(name) or {}).get(vscope) or {}
@@ -979,9 +937,16 @@ def _argv_probe(name: str) -> list[str]:
     start = v.get("start")
     if not callable(start):
         return []
+    args = ("PROBE", Path("/dev/null"), Path("/dev/null"), "probe", None)
     try:
-        argv = [str(t) for t in start("PROBE", Path("/dev/null"),
-                                      Path("/dev/null"), "probe", None)]
+        argv = [str(t) for t in start(*args)]
+    except TypeError:
+        # У kimi лямбда с шестым параметром (канал): зонд на пять
+        # аргументов молча давал пустой argv (нашёл claude).
+        try:
+            argv = [str(t) for t in start(*args, None)]
+        except Exception:                           # noqa: BLE001
+            return []
     except Exception:                               # noqa: BLE001
         return []
     out: list[str] = []
@@ -1006,98 +971,278 @@ def _flag(argv: list[str], *flags: str) -> str | None:
     return None
 
 
+def _codex_cfg_pair() -> tuple[str | None, str | None]:
+    return (_toml_get(CODEX_CFG, "model"),
+            _toml_get(CODEX_CFG, "model_reasoning_effort"))
+
+
+_CHOIR_SRC: str | None = None
+
+
+def _choir_literal(voice: str, kind: str) -> str | None:
+    """Умолчание раунда, записанное литералом в лямбде choir.py —
+    `_renv("deepseek", "MODEL", "deepseek-v4-pro")`. Читается из
+    ИСХОДНИКА, а не переписывается: копия в окне протухла бы молча
+    (тот же довод, по которому VOICES берутся у live.py)."""
+    global _CHOIR_SRC
+    if _CHOIR_SRC is None:
+        try:
+            _CHOIR_SRC = (CHOIR / "choir.py").read_text(encoding="utf-8")
+        except OSError:
+            _CHOIR_SRC = ""
+    m = re.search(r'_renv\("%s",\s*"%s",\s*"([^"]+)"\)' % (voice, kind),
+                  _CHOIR_SRC)
+    return m.group(1) if m else None
+
+
+# ЯВНЫЕ УМОЛЧАНИЯ ПО ВКЛАДКАМ (наказ Автора 2026-09-02: «умолчание —
+# не понятно какая модель и какое усилие — давай прописывать явно»).
+# Три функции ниже отвечают на один вопрос — ЧЕМ голос пойдёт, если в
+# окне ничего не трогать, — для трёх разных запускающих кодов: live.py
+# (комната), choir.py (раунды), edits.py (кресло). Каждое значение
+# подписано хранителем; «неизвестно» остаётся только там, где его и
+# правда никто не хранит.
+def _room_defaults(name: str) -> dict:
+    argv = _argv_probe(name)
+    model = _flag(argv, "--model", "-m")
+    effort = _flag(argv, "--effort", "--reasoning-effort", "--thinking")
+    msrc = esrc = "флаг в командной строке live.py"
+    if name == "codex":
+        cm, ce = _codex_cfg_pair()
+        if not model:
+            model, msrc = cm, f"{CODEX_CFG} (live.py флага не шлёт)"
+        if not effort:
+            effort, esrc = ce, f"{CODEX_CFG} (live.py флага не шлёт)"
+    elif name == "kimi":
+        # -m в argv несёт модель ЛИНИИ = default_model конфига (с
+        # провайдером); окно показывает имя без провайдера.
+        model = (model or catalog.default_model("kimi")
+                 or _toml_get(KIMI_CFG, "default_model")
+                 or "").split("/")[-1] or None
+        msrc = (f"флаг -m live.py = default_model из {KIMI_CFG} (модель "
+                f"линии)" if model else f"{KIMI_CFG} не прочитался")
+        effort, esrc = None, "у kimi CLI нет флага усилия"
+    elif name == "deepseek":
+        if not model:
+            model = _src_default("deepseek-http",
+                                 r'DEFAULT_MODEL\s*=\s*"([^"]+)"')
+            msrc = "deepseek-http: DEFAULT_MODEL адаптера"
+        if not effort:
+            effort = _src_default("deepseek-http",
+                                  r'"DEEPSEEK_EFFORT",\s*"(\w+)"')
+            esrc = "deepseek-http: умолчание --effort адаптера"
+    elif name == "grok":
+        if not model:
+            model = catalog.default_model("grok")
+            msrc = ("серверный дефолт xAI — первая модель кэша CLI "
+                    "(сверено по сессии стола 2026-09-02)")
+    elif name == "gemini":
+        esrc = "live.py → gemini-http --thinking"
+        if model and "," in model:
+            # --model несёт КАСКАД «основная,запасные» (gemini-http
+            # перебирает их при лежащем шлюзе): значение — основная,
+            # запасные названы в подписи, а не склеены в имя.
+            first, _, rest = model.partition(",")
+            model = first.strip()
+            msrc += f"; запасные при 5xx: {rest.strip()}"
+    # Флага в argv нет и хранитель не назван — говорим это, а не «флаг
+    # в командной строке» над пустым значением (нашёл kimi).
+    if model is None and msrc.startswith("флаг в командной строке"):
+        msrc = "флага нет — умолчание хранит сам CLI"
+    if effort is None and esrc.startswith("флаг в командной строке"):
+        esrc = "флага нет — умолчание хранит сам CLI"
+    return {"model": model, "effort": effort,
+            "src": f"модель: {msrc}; усилие: {esrc}",
+            "can_model": bool((VOICE_CTL.get(name) or {}).get("model_env")),
+            "can_effort": bool((VOICE_CTL.get(name) or {}).get("effort_env")),
+            "why_effort": ("" if (VOICE_CTL.get(name) or {}).get("effort_env")
+                           else f"у {name} CLI нет флага усилия — рычага "
+                                "нет ни в одной вкладке")}
+
+
+def _rounds_defaults(name: str) -> dict:
+    ctl = VOICE_CTL.get(name) or {}
+    base = {"can_model": bool(ctl.get("model_env")),
+            "can_effort": bool(ctl.get("effort_env")),
+            "why_effort": ("" if ctl.get("effort_env")
+                           else f"у {name} CLI нет флага усилия")}
+    if not CHOIR_OK:
+        by_mem = {"claude": ("fable", "max"), "codex": (None, "high"),
+                  "grok": (None, "medium"), "kimi": (None, None),
+                  "deepseek": ("deepseek-v4-pro", "max"),
+                  "gemini": ("gemini-3.7-flash", "high")}
+        m, e = by_mem.get(name, (None, None))
+        return dict(base, model=m, effort=e,
+                    src="choir.py не импортировался — по памяти окна")
+    rv = choir._renv
+    if name == "claude":
+        m, e = choir.CLAUDE_MODEL, choir.CLAUDE_EFFORT
+        src = "choir.py: CLAUDE_MODEL/CLAUDE_EFFORT (наказ arr 24.08: fable/max)"
+    elif name == "codex":
+        cm, ce = _codex_cfg_pair()
+        m = rv("codex", "MODEL") or cm
+        e = rv("codex", "EFFORT") or choir.eff("codex")
+        src = (f"модель: {CODEX_CFG} (choir.py -m не шлёт); усилие: "
+               "choir.eff() — ступень ниже потолка лестницы choir.py")
+    elif name == "grok":
+        m = rv("grok", "MODEL") or catalog.default_model("grok")
+        e = rv("grok", "EFFORT") or choir.eff("grok")
+        src = ("модель: серверный дефолт xAI (первая в кэше CLI); усилие: "
+               "choir.eff() — ступень ниже потолка")
+    elif name == "kimi":
+        m = (rv("kimi", "MODEL") or catalog.default_model("kimi")
+             or _toml_get(KIMI_CFG, "default_model") or "").split("/")[-1] or None
+        e = None
+        src = f"default_model из {KIMI_CFG} (модель линии); усилия у CLI нет"
+    elif name in ("deepseek", "gemini"):
+        # Литерал читается из ИСХОДНИКА choir.py; не нашёлся — так и
+        # подписываем, а не выдаём копию за прочитанное (нашёл kimi).
+        mem = {"deepseek": ("deepseek-v4-pro", "max"),
+               "gemini": ("gemini-3.7-flash", "high")}[name]
+        lm, le = _choir_literal(name, "MODEL"), _choir_literal(name, "EFFORT")
+        m = rv(name, "MODEL", lm or mem[0])
+        e = rv(name, "EFFORT", le or mem[1])
+        src = (f"литералы choir.py: _renv(\"{name}\", …)" if lm and le
+               else "литерал в choir.py НЕ НАЙДЕН — показано по памяти окна")
+    else:
+        m, e, src = None, None, "голос choir.py неизвестен"
+    return dict(base, model=m, effort=e, src=src)
+
+
+def _exec_defaults(name: str) -> dict | None:
+    if name not in edits.EDIT_VOICES:
+        return None
+    levers = edits.EXEC_LEVERS.get(name, ())
+    model = edits.exec_default(name, "model") or None
+    effort = edits.exec_default(name, "effort") or None
+    if name == "codex":
+        cm, ce = _codex_cfg_pair()
+        model, effort = model or cm, effort or ce
+    elif name == "grok":
+        model = model or catalog.default_model("grok")
+        effort = effort or catalog.default_effort("grok", model)
+    elif name == "kimi":
+        model = (model or "").split("/")[-1] or None
+    why_e = ""
+    if "effort" not in levers:
+        why_e = ("у kimi CLI нет флага усилия" if name == "kimi"
+                 else "у dsh нет ручки усилия (в комнате и раундах она "
+                      "есть — у адаптера deepseek-http)")
+    return {"model": model, "effort": effort,
+            "src": edits.EXEC_DEFAULT_SRC.get(name, "edits.EXEC_DEFAULTS"),
+            "can_model": "model" in levers, "can_effort": "effort" in levers,
+            "why_effort": why_e}
+
+
+def _defaults_for(name: str, scope: str) -> dict | None:
+    if scope == "room":
+        return _room_defaults(name)
+    if scope == "rounds":
+        return _rounds_defaults(name)
+    return _exec_defaults(name)
+
+
 def voice_report(name: str, limit: dict) -> dict:
     """Карточка голоса: чем он отвечает сейчас и что о его лимите
     известно. Источник каждого значения называется рядом — «opus»
-    без подписи «откуда» через месяц неотличимо от догадки."""
+    без подписи «откуда» через месяц неотличимо от догадки.
+
+    tabs — ТРИ ВКЛАДКИ с одинаковым наполнением (наказ Автора
+    2026-09-02): у каждой свои действующее значение, заданное в окне,
+    явное умолчание с хранителем, и рычаги — где за ними механика.
+    exec=None — кресла нет (gemini файлов не видит)."""
     ctl = VOICE_CTL.get(name) or {}
-    argv = _argv_probe(name)
-    model = _flag(argv, "--model", "-m")
-    # --thinking — усилие Джемини: без него панель показывала ПУСТОЕ
-    # усилие с подписью «зашито в gemini-http», хотя вызов шёл с
-    # --thinking high — поле и источник врали разом; мёртвый regex по
-    # исходнику адаптера снят вместе с самим литералом (нашли codex,
-    # grok и субагент, у субагента — замером voice_report).
-    effort = _flag(argv, "--effort", "--reasoning-effort", "--thinking")
-    msrc = "флаг в командной строке live.py"
-    esrc = "флаг в командной строке live.py"
-
-    if name == "codex":
-        # Флаги появляются в argv только при настройке из окна; без неё
-        # codex по-прежнему берёт модель и усилие из своего конфига.
-        model = model or _toml_get(CODEX_CFG, "model")
-        effort = effort or _toml_get(CODEX_CFG, "model_reasoning_effort")
-        if not _flag(argv, "-m"):
-            msrc = f"{CODEX_CFG} (окно модель не задавало)"
-        if not _flag(argv, "-c"):
-            esrc = f"{CODEX_CFG} (окно усилие не задавало)"
-    elif name == "kimi":
-        model = model or _toml_get(KIMI_CFG, "default_model")
-        msrc = (msrc if model and _flag(argv, "-m", "--model")
-                else f"{KIMI_CFG}: default_model")
-        esrc = "у CLI нет флага усилия; уровень — клиентская настройка"
-    elif name == "gemini":
-        esrc = "live.py → gemini-http --thinking (thinkingLevel API)"
-    elif name == "deepseek":
-        model = model or _src_default(
-            "deepseek-http", r'DEFAULT_MODEL\s*=\s*"([^"]+)"')
-        effort = effort or _src_default(
-            "deepseek-http", r'"DEEPSEEK_EFFORT",\s*"(\w+)"')
-        msrc = "deepseek-http: DEEPSEEK_MODEL, иначе DEFAULT_MODEL"
-        esrc = "deepseek-http: DEEPSEEK_EFFORT, иначе умолчание адаптера"
-    elif name == "grok":
-        if not model:
-            # Флага нет = окно модель не задавало: отвечает дефолт xAI.
-            msrc = "флага нет — отвечает серверный дефолт xAI"
-
     with CFG_LOCK:
         cfg = {sc: dict((VOICE_CFG.get(name) or {}).get(sc) or {})
                for sc in SCOPES}
-    # (exec-блок собирается ниже из cfg["exec"])
-    room = cfg["room"]
-    if room.get("model"):
-        model = room["model"]
-        msrc = f"задано в окне: {ctl.get('model_env')}={model}"
-    if room.get("effort"):
-        effort = room["effort"]
-        esrc = f"задано в окне: {ctl.get('effort_env')}={effort}"
-    # Раунды («дирижёр»): настройка из окна либо умолчание choir.py —
-    # второе описано строкой в VOICE_CTL, живого зонда для choir нет.
-    rd = cfg["rounds"]
-    rounds_card = {
-        "model": rd.get("model"),
-        "effort": rd.get("effort"),
-        "source": ("задано в окне (CHOIR_ROUND_*)" if rd else
-                   ctl.get("rounds_default", "умолчание choir.py")),
-    }
-
+    tabs: dict[str, dict | None] = {}
+    for sc in SCOPES:
+        try:
+            d = _defaults_for(name, sc)
+        except Exception as e:                  # noqa: BLE001
+            # Одна кривая карточка не роняет /voices целиком: окно
+            # покажет причину в ячейке, остальные голоса живут.
+            print(f"/voices {name}/{sc}: {e}", file=sys.stderr)
+            tabs[sc] = {"error": f"карточка не собралась: "
+                                 f"{type(e).__name__}: {e}"[:200]}
+            continue
+        if d is None:
+            tabs[sc] = None
+            continue
+        set_ = cfg[sc]
+        model = set_.get("model") or d["model"]
+        if sc == "exec" and name == "grok" and not set_.get("effort"):
+            # Усилие кэша — у ДЕЙСТВУЮЩЕЙ модели, не у умолчания: у
+            # заданной в окне grok-4.5 своё reasoning_effort (субагент).
+            d = dict(d, effort=catalog.default_effort("grok", model)
+                     or d["effort"])
+        effort = set_.get("effort") or d["effort"]
+        ladder = _efforts(name, model)
+        t = {"model": model, "effort": effort,
+             "set_model": set_.get("model"), "set_effort": set_.get("effort"),
+             "default_model": d["model"], "default_effort": d["effort"],
+             "default_src": d["src"],
+             "can_model": bool(d["can_model"]),
+             # can_effort при пустой лестнице ручкой не является: POST
+             # сверит значение со списком и отклонит любое.
+             "can_effort": bool(d["can_effort"]) and bool(ladder),
+             "why_model": "" if d["can_model"] else "из окна не меняется",
+             "why_effort": (d.get("why_effort") or ""
+                            if not (d["can_effort"] and not ladder)
+                            else "ступени не объявлены — рычаг есть, "
+                                 "списка нет"),
+             "efforts": ladder}
+        if sc == "exec":
+            t.update(pool=set_.get("pool", name not in edits.EDIT_COSTLY),
+                     costly=name in edits.EDIT_COSTLY,
+                     seat={"deepseek": "dsh"}.get(name, name))
+        tabs[sc] = t
+    room, rd, ex = tabs["room"], tabs["rounds"], tabs["exec"]
+    for k in ("room", "rounds"):
+        if "error" in (tabs[k] or {}):
+            tabs[k] = None
+    room = tabs["room"] or {"model": None, "effort": None, "set_model": None,
+                            "set_effort": None, "default_src": "карточка не "
+                            "собралась"}
+    rd = tabs["rounds"] or dict(room)
+    if ex is not None and "error" in ex:
+        ex = None
+    ent = catalog.entry(name)
     card = {
         "name": name,
-        # None, а не «неизвестно» строкой: пустое значение обязано быть
-        # отличимо от значения по имени «неизвестно».
-        "model": model, "model_source": msrc,
-        "effort": effort, "effort_source": esrc,
-        "efforts": EFFORTS.get(name, []),
-        "efforts_source": EFFORTS_SRC_BY.get(name, EFFORTS_SRC),
-        "models": ctl.get("models", []),
+        # Плоские поля — КОМНАТА (старые читатели карточки); None, а не
+        # «неизвестно» строкой: пустое значение обязано быть отличимо
+        # от значения по имени «неизвестно».
+        "model": room["model"],
+        "model_source": (f"задано в окне: {ctl.get('model_env')}="
+                         f"{room['set_model']}" if room["set_model"]
+                         else room["default_src"]),
+        "effort": room["effort"],
+        "effort_source": (f"задано в окне: {ctl.get('effort_env')}="
+                          f"{room['set_effort']}" if room["set_effort"]
+                          else room["default_src"]),
+        "efforts": _efforts(name),
+        "efforts_by_model": ent.get("efforts_by_model") or None,
+        "efforts_source": catalog.source(name),
+        "models": catalog.models(name),
+        "models_source": catalog.source(name),
+        "models_fetched_at": ent.get("fetched_at"),
+        "models_error": ent.get("error"),
+        "unaliased": ent.get("unaliased") or [],
         "can_set_model": bool(ctl.get("model_env")),
         "can_set_effort": bool(ctl.get("effort_env")),
         "set_in_window": (cfg if any(cfg.get(sc) for sc in SCOPES)
                           else None),
-        "rounds": rounds_card,
-        # Кресло (вкладка 🔧): рычаги только там, где за ними механика
-        # (правило 8.5): у dsh их нет вовсе, у claude — только модель,
-        # у kimi — только модель, у grok — только усилие.
-        "exec": ({
-            "model": (cfg.get("exec") or {}).get("model"),
-            "effort": (cfg.get("exec") or {}).get("effort"),
-            "pool": (cfg.get("exec") or {}).get("pool",
-                     name not in edits.EDIT_COSTLY),
-            "costly": name in edits.EDIT_COSTLY,
-            "can_model": name in ("codex", "claude", "kimi", "deepseek"),
-            "can_effort": name in ("codex", "grok"),
-            "seat": {"deepseek": "dsh"}.get(name, name),
-        } if name in edits.EDIT_VOICES else None),
+        "rounds": {"model": rd["set_model"], "effort": rd["set_effort"],
+                   "source": ("задано в окне (CHOIR_ROUND_*)"
+                              if (rd["set_model"] or rd["set_effort"])
+                              else rd["default_src"])},
+        "exec": ({"model": ex["set_model"], "effort": ex["set_effort"],
+                  "pool": ex["pool"], "costly": ex["costly"],
+                  "can_model": ex["can_model"],
+                  "can_effort": ex["can_effort"], "seat": ex["seat"]}
+                 if ex else None),
+        "tabs": tabs,
         "applies_to": ctl.get("applies_to", []),
         "scope": ctl.get("scope", ""),
         "locked_why": ctl.get("locked", ""),
@@ -1111,7 +1256,6 @@ def voice_report(name: str, limit: dict) -> dict:
     if isinstance(gauges, list) and gauges:
         card["limits"] = gauges
     return card
-
 
 # ── лимиты: только то, что провайдер сказал сам ──────────────────────
 # Четыре состояния, и они РАЗНЫЕ:
@@ -2240,7 +2384,9 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        if self.path == "/":
+        # Строка запроса не меняет маршрут: `/?tab=exec` — та же страница
+        # (вкладку выбирает JS), а не «нет такого пути».
+        if self.path.partition("?")[0] == "/":
             # Значение подставляем ПРИ ОТДАЧЕ, а не в исходнике страницы:
             # PAGE — константа модуля, а путь известен только после
             # разбора аргументов. html-экранирование обязательно: в имени
@@ -2522,6 +2668,21 @@ class Handler(BaseHTTPRequestHandler):
             if not 1 <= rebuts <= 3:
                 return self._json(400, {"error": "витков 1..3 (правило 12: "
                                         "потолок — три витка)"})
+            # Состав раунда — галочки вкладки 🎼 (у каждой вкладки свои,
+            # наказ Автора 2026-09-02). Пустой список ≠ «поле не задано»
+            # (тот же довод, что у /act); меньше двух — не раунд: жребий
+            # ведущего из одного и слепая фаза без чужих ответов — не
+            # протокол, а монолог.
+            raw_rv = req.get("voices")
+            rvoices = sorted({v for v in (raw_rv or []) if v in VOICES})
+            if raw_rv is not None and not rvoices:
+                return self._json(400, {"error": "не выбран ни один голос "
+                                        "раунда — отметьте хотя бы двух"})
+            if rvoices and len(rvoices) < 2:
+                # Уникальных: ["claude","claude"] — один голос, а не два.
+                return self._json(400, {"error": "раунд — минимум два "
+                                        "разных голоса (жребий ведущего и "
+                                        "слепая фаза из одного бессмысленны)"})
             qfile = CHOIR / f"ВОПРОС-{name}.md"
             # Не переписываем молча: в room.jsonl уже лежит pick с
             # question_sha от старого текста, и файл разошёлся бы с
@@ -2547,7 +2708,8 @@ class Handler(BaseHTTPRequestHandler):
                 # Аргументы списком, без bash -c: имя уже проверено, но
                 # лишний слой кавычек — лишний способ ошибиться.
                 cmd = [sys.executable, "choir.py", "run", "--round", name,
-                       "--seed", qfile.name, "--rebuts", str(rebuts)]
+                       "--seed", qfile.name, "--rebuts", str(rebuts),
+                       *(["--voices", ",".join(rvoices)] if rvoices else [])]
                 label = f"round: {name} [авто, витков: {rebuts}]"
                 note = (f"АВТОПРОГОН: такт идёт сам — pick → expand → ask → "
                         f"rebut ×{rebuts} → summarize, без остановки на "
@@ -2558,10 +2720,14 @@ class Handler(BaseHTTPRequestHandler):
                 rn = shlex.quote(name)
                 seed = shlex.quote(qfile.name)
                 zt = shlex.quote(f"ЗАТРАВКА-{name}.md")  # его создаст expand
+                # --voices у pick и ask (expand его не знает: ведущий
+                # уже выбран жребием среди названных).
+                vs = (" --voices " + shlex.quote(",".join(rvoices))
+                      if rvoices else "")
                 cmd = ["bash", "-c",
-                       f"{py} choir.py pick --round {rn} --seed {seed} && "
+                       f"{py} choir.py pick --round {rn} --seed {seed}{vs} && "
                        f"{py} choir.py expand --round {rn} --seed {seed} && "
-                       f"{py} choir.py ask --round {rn} --seed {zt}"]
+                       f"{py} choir.py ask --round {rn} --seed {zt}{vs}"]
                 label = f"round: {name}"
                 note = ("ПО ШАГАМ: pick → expand → ask; после слепой фазы "
                         "такт останавливается — rebut и summarize "
@@ -2574,13 +2740,15 @@ class Handler(BaseHTTPRequestHandler):
             fields = {"round": name, "auto": auto}
             if auto:
                 fields["rebuts"] = rebuts
+            if rvoices:
+                fields["voices"] = rvoices
             # Краткость — та же опция, что и в комнате: choir.py читает
             # CHOIR_BRIEF при импорте и подставляет жёсткие рамки в
             # затравку и свод. Умолчание — полный вывод.
             brief = bool(req.get("brief"))
             if brief:
                 fields["brief"] = True
-            act = spawn(cmd, label, VOICES, cwd=CHOIR,
+            act = spawn(cmd, label, rvoices or VOICES, cwd=CHOIR,
                         meta={"round": name, "auto": auto},
                         note=note, fields=fields,
                         env_extra={"CHOIR_BRIEF": "1"} if brief else None)
@@ -2624,6 +2792,20 @@ class Handler(BaseHTTPRequestHandler):
                                      f"(акт {e0.get('act')}, по ленте)"})
             except Exception as e0:             # noqa: BLE001
                 print(f"/edit: проверка ленты: {e0}", file=sys.stderr)
+            picked_note = ""
+            if voice == "random":
+                # ДО резерва: пустой пул с уже взятым резервом оставлял
+                # проект «занятым» до перезапуска окна (нашёл codex), а
+                # пустой пул теперь штатен — галочки вкладки 🔧.
+                pool = edits.random_pool()
+                if not pool:
+                    return self._json(409, {"error": "пул random пуст — "
+                                            "все кресла сняты галочками; "
+                                            "выберите исполнителя явно"})
+                voice = secrets.choice(pool)
+                picked_note = (f"исполнителя выбрал сервер случайно: "
+                               f"{voice} (random.choice по умеющим "
+                               f"правки — НЕ жребий drand)")
             with RUN_LOCK:
                 busy_edit = [t for t in RUNNING.values()
                              if t.get("edit")
@@ -2644,18 +2826,6 @@ class Handler(BaseHTTPRequestHandler):
                 # данных; здесь данных нет, пока кресло не выдано).
                 return self._json(409, {"error": "идёт слепая фаза — "
                                         "кресло не выдаётся до её конца"})
-            if voice == "random":
-                pool = edits.random_pool()
-                if not pool:
-                    return self._json(409, {"error": "пул random пуст — "
-                                            "все кресла сняты галочками; "
-                                            "выберите исполнителя явно"})
-                voice = secrets.choice(pool)
-                picked_note = (f"исполнителя выбрал сервер случайно: "
-                               f"{voice} (random.choice по умеющим "
-                               f"правки — НЕ жребий drand)")
-            else:
-                picked_note = ""
             files = req.get("files")
             if isinstance(files, str):
                 files = [x.strip() for x in files.split(",") if x.strip()]
@@ -3051,6 +3221,7 @@ class Handler(BaseHTTPRequestHandler):
             clear_model = "model" in req and not model
             clear_effort = "effort" in req and not effort
             if clear_model or clear_effort:
+                dropped_effort = None
                 with CFG_LOCK:
                     ent = VOICE_CFG.setdefault(name, {})
                     pair = dict(ent.get(vscope) or {})
@@ -3058,6 +3229,14 @@ class Handler(BaseHTTPRequestHandler):
                         pair.pop("model", None)
                     if clear_effort:
                         pair.pop("effort", None)
+                    if clear_model and pair.get("effort"):
+                        # Оставшееся усилие сверяется с моделью УМОЛЧАНИЯ:
+                        # gpt-5.6-sol+ultra после сброса модели иначе
+                        # превращалось в gpt-5.4+ultra, которое POST не
+                        # принял бы (нашёл codex).
+                        dm = (_defaults_for(name, vscope) or {}).get("model")
+                        if pair["effort"] not in _efforts(name, dm):
+                            dropped_effort = pair.pop("effort")
                     if pair:
                         ent[vscope] = pair
                     else:
@@ -3072,8 +3251,12 @@ class Handler(BaseHTTPRequestHandler):
                        else "[комната]") + ": "
                     + ", ".join(k for k, c in (("model", clear_model),
                                                ("effort", clear_effort)) if c)
-                    + " → умолчание канала (сброс из окна Автора)",
-                    voice=name, cfg_scope=vscope, reset=True, by="arr")
+                    + " → умолчание канала (сброс из окна Автора)"
+                    + (f"; усилие {dropped_effort} снято вместе с моделью — "
+                       f"у модели умолчания такой ступени нет"
+                       if dropped_effort else ""),
+                    voice=name, cfg_scope=vscope, reset=True,
+                    dropped_effort=dropped_effort, by="arr")
                 with CFG_LOCK:
                     _save_voice_cfg(name, vscope)
                 limits, _ = limits_now()
@@ -3088,17 +3271,21 @@ class Handler(BaseHTTPRequestHandler):
             # «принято»: настройка, которая никуда не доедет, хуже
             # отсутствия настройки.
             if vscope == "exec":
-                # Рычаги КРЕСЛА свои: у claude/kimi только модель, у
-                # grok только усилие, у dsh — ничего. Комнатные can_*
-                # тут принимали мёртвые настройки, которые argv молча
-                # игнорировал (нашли codex и grok).
-                if model and name not in ("codex", "claude", "kimi",
-                                          "deepseek"):
+                # Рычаги КРЕСЛА объявляет edits.EXEC_LEVERS — ровно те,
+                # за которыми стоит флаг в argv лямбды (правило 8.5).
+                # Комнатные can_* тут принимали мёртвые настройки,
+                # которые argv молча игнорировал (нашли codex и grok).
+                levers = edits.EXEC_LEVERS.get(name, ())
+                if model and "model" not in levers:
                     return self._json(400, {"error": f"модель кресла "
-                                            f"{name} не крутится"})
-                if effort and name not in ("codex", "grok"):
+                                            f"{name} не крутится",
+                                            "why": edits.EXEC_DEFAULT_SRC
+                                            .get(name, "")})
+                if effort and "effort" not in levers:
                     return self._json(400, {"error": f"усилие кресла "
-                                            f"{name} не крутится"})
+                                            f"{name} не крутится",
+                                            "why": edits.EXEC_DEFAULT_SRC
+                                            .get(name, "")})
             elif model and not ctl.get("model_env"):
                 return self._json(400, {"error": f"модель {name} из окна "
                                         "не меняется",
@@ -3107,7 +3294,15 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(400, {"error": f"усилие {name} из окна "
                                         "не меняется",
                                         "why": ctl.get("locked", "")})
-            allowed = EFFORTS.get(name) or []
+            # Ступень сверяется С МОДЕЛЬЮ: заданной этим же запросом,
+            # иначе сохранённой для области, иначе умолчанием области.
+            # Общий список по всем моделям пропускал grok-4.5+xhigh.
+            with CFG_LOCK:
+                saved_model = ((VOICE_CFG.get(name) or {}).get(vscope)
+                               or {}).get("model")
+            dflt = _defaults_for(name, vscope) or {}
+            pair_model = model or saved_model or dflt.get("model")
+            allowed = _efforts(name, pair_model)
             if effort and effort not in allowed:
                 # Уровень вне лестницы — отказ, а НЕ посадка на потолок
                 # (как делает eff() в choir.py). Там подмена уместна:
@@ -3123,17 +3318,26 @@ class Handler(BaseHTTPRequestHandler):
                     # вовсе, и отказ по недопустимому усилию падал
                     # NameError — то есть вместо честного 400 с
                     # объяснением человек получал 500 и трейсбек.
-                    "source": EFFORTS_SRC_BY.get(name, EFFORTS_SRC)})
+                    "for_model": pair_model,
+                    "source": catalog.source(name)})
             unverified = False
+            if model and model in catalog.unaliased(name):
+                # Сервер модель знает, а CLI без алиаса её не запустит —
+                # голос выпал бы на платном ходу (нашли все ревьюеры).
+                return self._json(400, {
+                    "error": f"модель «{model}» у сервера есть, но у CLI "
+                             f"{name} нет алиаса — добавьте её в [models] "
+                             f"конфига CLI",
+                    "known": catalog.models(name)})
             if model:
-                known = model in (ctl.get("models") or [])
+                known = model in catalog.models(name)
                 shaped = bool(ctl.get("model_re")
                               and re.fullmatch(ctl["model_re"], model))
                 if not MODEL_RE.match(model) or not (known or shaped):
                     return self._json(400, {
                         "error": f"модель «{model}» для {name} не "
                                  "распознана",
-                        "known": ctl.get("models") or [],
+                        "known": catalog.models(name),
                         "also_ok": ctl.get("model_re", "")})
                 # Имя подходит по форме, но в известном списке его нет.
                 # Запрещать нельзя — список зашит в коде и устареет раньше
@@ -3150,20 +3354,21 @@ class Handler(BaseHTTPRequestHandler):
                     cur["model"] = model
                 if effort:
                     cur["effort"] = effort
-                if name == "grok" and GROK_CACHE_OK:
-                    # Пара проверяется ПОСЛЕ слияния: до него смена одной
-                    # модели при сохранённом xhigh проскакивала — общий
-                    # список пропускал grok-4.5+xhigh, и CLI падал уже на
-                    # платном ходу (нашли все четверо ревьюеров; перенос
-                    # за слияние — при сборке тумблера областей).
-                    pm, pe = cur.get("model"), cur.get("effort")
-                    ok = _GROK_BY_MODEL.get(pm)
-                    if pm and pe and ok and pe not in ok:
-                        return self._json(400, {
-                            "error": f"пара {pm}+{pe} недопустима",
-                            "allowed": ok,
-                            "why": "у этой модели такой ступени нет "
-                                   "(reasoning_efforts в кэше CLI)"})
+                # Пара проверяется ПОСЛЕ слияния: до него смена одной
+                # модели при сохранённом xhigh проскакивала — общий
+                # список пропускал grok-4.5+xhigh, и CLI падал уже на
+                # платном ходу (нашли все четверо ревьюеров). Теперь —
+                # у всех, чей канал различает лестницы по моделям
+                # (codex: у gpt-5.4 нет max/ultra).
+                pe = cur.get("effort")
+                pm = cur.get("model") or dflt.get("model")
+                ok = _efforts(name, pm)
+                if pm and pe and ok and pe not in ok:
+                    return self._json(400, {
+                        "error": f"пара {pm}+{pe} недопустима",
+                        "allowed": ok,
+                        "why": "у этой модели такой ступени нет "
+                               "(лестница модели из кэша/справки канала)"})
                 ent[vscope] = cur
             up = name.upper()
             envs = {}
@@ -3186,15 +3391,21 @@ class Handler(BaseHTTPRequestHandler):
             ev = feed_append(
                 "voice_config",
                 f"голос {name} "
-                + ("[раунды/дирижёр]" if vscope == "rounds" else "[комната]")
+                + ("[раунды/дирижёр]" if vscope == "rounds"
+                   else "[кресло]" if vscope == "exec" else "[комната]")
                 + ": "
                 + ", ".join(
                     f"{k} {prev.get(k) or '(по умолчанию)'} → {cur[k]}"
                     for k in ("model", "effort") if k in cur)
                 + " — задано из окна Автора"
-                + ("" if vscope == "rounds" else "; "
-                   + (ctl.get("scope")
-                      or ", ".join(ctl.get("applies_to", []))))
+                # Комнатная область — только у комнаты: событие кресла
+                # с текстом «живая комната (live.py…)» врало читателю
+                # ленты при верном cfg_scope (нашли codex, grok, claude).
+                + ("; " + (ctl.get("scope")
+                           or ", ".join(ctl.get("applies_to", [])))
+                   if vscope == "room" else
+                   "; argv кресла (edits.EDIT_VOICES)" if vscope == "exec"
+                   else "")
                 + ("; идущий ход этого голоса запущен ещё со старым "
                    "окружением" if busy else "")
                 + ("; ⚠ модель НЕ ПРОВЕРЕНА: подходит по форме, но в "
@@ -3228,10 +3439,48 @@ class Handler(BaseHTTPRequestHandler):
                             "свойством. Проверьте первым же ходом."
                             if unverified else "")})
 
+        if self.path == "/models_refresh":
+            # Кнопка ⟳ окна (наказ Автора 2026-09-02): разведка списков
+            # у самих каналов, без единого модельного вызова — API по
+            # токену CLI, кэши CLI, --models адаптеров. Итог — событием
+            # в ленту: через месяц «какой список видело окно» — вопрос
+            # к журналу, а не к памяти. Отказ источника — строка отчёта,
+            # прежний список остаётся.
+            # Дедуп по фиксированному VOICES: список из тысячи «claude»
+            # иначе становился тысячей нитей разведки (нашёл codex).
+            want = {v for v in (req.get("voices") or [])
+                    if isinstance(v, str)}
+            names = [v for v in VOICES if v in want]
+            rep_ = catalog.refresh(names or None)
+            # Разрешённые умолчания кресел (grok из кэша) — пересчитать.
+            _sync_exec_overrides()
+            # В ленту — без чужих хвостов, похожих на ключ: отчёт вечен.
+            rep_ = {n: {k: (_no_secrets(v) if isinstance(v, str) else v)
+                        for k, v in r.items()} for n, r in rep_.items()}
+            ok = [n for n in rep_ if rep_[n].get("ok")]
+            bad = [n for n in rep_ if not rep_[n].get("ok")]
+            ev = feed_append(
+                "models_refresh",
+                ("каталог моделей обновлён: "
+                 + ", ".join(f"{n} {rep_[n]['models']}" for n in ok)
+                 if ok else "разведка моделей не удалась")
+                + ("; не удалось: " + ", ".join(
+                    f"{n} ({rep_[n].get('error')})" for n in bad)
+                   if bad else ""),
+                report=rep_, by="arr")
+            limits, _ = limits_now()
+            return self._json(200, {
+                "report": rep_, "event": ev["id"],
+                "voices": [voice_report(n, limits.get(n)
+                                        or {"kind": "unknown"})
+                           for n in VOICES]})
+
         if self.path == "/lot":
-            cands = [v for v in (req.get("candidates") or []) if v in VOICES]
+            cands = list(dict.fromkeys(
+                v for v in (req.get("candidates") or []) if v in VOICES))
             if len(cands) < 2:
-                return self._json(400, {"error": "жребий — минимум из двух"})
+                return self._json(400, {"error": "жребий — минимум из двух "
+                                        "разных кандидатов"})
             with LOT_LOCK, _SafeGate():
                 if _lot_load():
                     return self._json(409, {"error": "жребий уже брошен и "
@@ -3521,7 +3770,20 @@ flex:none;min-width:2.4rem;text-align:right;cursor:help}
 margin-top:.3rem;padding-top:.3rem;max-height:9rem;overflow-y:auto}
 .actrow{padding:.14rem 0;border-bottom:1px dashed var(--rule)}
 .actrow button{font-size:.7rem;padding:0 .45rem;margin-left:.3rem}
-#coderblk{border-left:2px solid var(--acc);padding-left:.45rem}
+#coderblk{border-left:2px solid var(--acc);padding-left:.45rem;margin-top:.5rem}
+/* Блок кодера живёт в УЗКОЙ правой панели: ряды переносятся, иначе
+   селектор исполнителя вылезал за край (наказ Автора 2026-09-02:
+   «кнопочки правки — во вкладку Кодер, ниже Бросить/Раскрыть»). */
+#coderblk .qrow{flex-wrap:wrap;margin:.25rem 0}
+/* Кнопки гейта в узкой панели НЕ сжимаются до «Рев…/При…» (общее
+   правило .qrow>button{min-width:0} для колонки внизу): ширина по
+   тексту, лишнее переносится на следующую строку. */
+#coderblk .qrow>button{flex:1 1 auto;min-width:max-content}
+#coderblk .qrow>input{box-sizing:border-box}
+.vhead3row{display:flex;align-items:center;justify-content:space-between;gap:.4rem}
+#mrefresh{font-size:.7rem;padding:0 .45rem;line-height:1.4}
+#vnote{font:.72rem ui-monospace,monospace;color:var(--muted,#777);
+margin:.2rem 0 .3rem;white-space:pre-wrap;word-break:break-word}
 </style></head><body>
 <div id="feed" aria-live="polite"><div id="feedtop"><div id="quickbar" title="Быстрые переключатели окна. Живут поверх ленты, чтобы не занимать место в колонке действий.">
   <label id="belllab" title="Звонок по завершении действия — как у микроволновки: короткое тройное «дзынь», когда ход или такт закончился (done, error или прерван). Работает, пока вкладка открыта; браузер разрешает звук после первого клика по странице. Выключается здесь же, выбор запоминается."><input type="checkbox" id="bell">🔔</label>
@@ -3530,17 +3792,19 @@ margin-top:.3rem;padding-top:.3rem;max-height:9rem;overflow-y:auto}
 </div></div></div>
 <div id="side">
   <div class="grip grip-v" id="grip-side" title="Ширина правой панели. Тяните; положение запоминается. Двойной щелчок — вернуть по умолчанию."></div>
-  <h3 id="vhead3">Голоса · кому уйдёт</h3>
+  <div class="vhead3row"><h3 id="vhead3">Голоса · кому уйдёт</h3>
+    <button id="mrefresh" title="Обновить списки моделей и ступеней у ВСЕХ голосов — для всех трёх вкладок сразу. Без единого модельного вызова: claude — api.anthropic.com/v1/models по OAuth-токену самого Claude Code; codex и grok — кэши их CLI (обновляются самими CLI при их вызовах); kimi — Moonshot /v1/models ключом линии плюс алиасы config.toml; deepseek и gemini — `--models` адаптеров. Итог — событием models_refresh в ленту; отказ источника не стирает прежний список. Наказ Автора 2026-09-02: «появилась новая модель — предусмотрим кнопочку обновить список».">⟳ модели</button></div>
   <div id="scopebar" title="ОДИН переключатель на весь список (наказ Автора 2026-08-31: «чтобы видно было»). Он выбирает, ЧЬЮ пару модель+усилие показывают и меняют ячейки ниже — у каждого голоса их две, независимые.
 💬 комната: живой разговор, запускает live.py — «Сказать», «Слепой ход», «Быстрый вопрос».
 🎼 раунды: протокол стола, запускает choir.py — «Раунд стола» (жребий, затравка, слепая фаза, витки, свод).
 🔧 coder: кресло исполнителя — задание уходит правкой в git-worktree, ревизия дифа столом, приёмка через гейт. У голосов здесь СВОЯ пара модель+усилие (только там, где рычаг существует) и галочка участия в random-пуле.
-Настройки хранятся раздельно и переживают перезапуск окна.">
+Настройки хранятся раздельно и переживают перезапуск окна. Галочки у каждой вкладки СВОИ: 💬 — кому уйдёт реплика и слепой ход, 🎼 — состав раунда и кандидаты жребия, 🔧 — пул random кресел.">
     <button id="sc-room" class="scopetab on">💬 комната</button>
     <button id="sc-rounds" class="scopetab">🎼 раунды</button>
     <button id="sc-exec" class="scopetab">🔧 coder</button>
   </div>
   <div id="voices" title="Полоса — израсходованная доля окна; ◇ — был отказ по квоте, числа нет; тонкая линия — канал остаток не сообщает. Пустое место ≠ «квота цела». Окон у голоса может быть несколько — каждое своей полосой, среднего между окнами не бывает; имя окна и срок сброса — в подсказке самой полосы."></div>
+  <div id="vnote" hidden></div>
 
   <h3>Проект (--project)</h3>
   <input id="project" value="__PROJECT_DEFAULT__" placeholder="путь к каталогу; пусто — без него" title="Каталог, который голоса получат на чтение. Подставлен тот, из которого запущено окно; очистить поле — значит спрашивать без проекта.">
@@ -3548,6 +3812,35 @@ margin-top:.3rem;padding-top:.3rem;max-height:9rem;overflow-y:auto}
   <div id="lotbox" title="Имя ведущего видите только вы — в ленте до раскрытия лишь хеш-обязательство. «Раскрыть» допишет соль, и sha256 пересчитывается по журналу: проверить может каждый, у кого есть лента.">не брошен</div>
   <button id="lot" title="Бросить жребий дирижёра по протоколу commit-reveal: обязательство (sha256 соли, кандидатов и БУДУЩЕГО раунда drand) публикуется в ленту ДО того, как подпись раунда существует — подогнать выбор под вопрос нельзя. Имя ведущего увидите только вы, до раскрытия.">Бросить (commit)</button>
   <button id="reveal" title="Раскрыть жребий: соль дописывается в ленту, и любой голос пересчитает sha256(подпись:соль:кандидаты) и проверит честность. До целевого раунда drand кнопка ответит «рано».">Раскрыть</button>
+  <div id="coderblk" hidden>
+    <div class="qrow">
+      <button id="editbtn" title="Выдать кресло исполнителя: текст из поля ввода внизу уходит ЗАДАНИЕМ одному голосу, тот правит код в отдельном git-worktree (ветка act/…). Кресло одно на проект; слепой ход и правка взаимно блокируются. Итог — событиями edit_open/edit_close в ленте; при вылете worktree остаётся на диске карантином. Merge в main — пока руками через гейт (этап 3).">Правка</button>
+      <select id="evoice" title="Кто исполняет. codex — единственный с песочницей (workspace-write + .git базы); claude — набор инструментов Write/Edit/Bash(git:*), но git-alias пробивает и его, граница словесная; kimi ⚠ ДОРОГОЙ И МОНОПОЛЬНЫЙ ПО ЛИНИИ: правка — длинная агентная сессия (15–20 внутренних запросов), и обёртка держит ОДНУ из его линий весь акт; вторая линия (если жива её квота) остаётся столу — ревизии и комната идут по ней, но медленнее, в очередь. Его лучший случай — небольшая точная правка. «случайно» — random.choice сервера по умеющим, НЕ жребий drand; kimi в случайный выбор не входит — только явно. grok — через pty, ПЕСОЧНИЦЫ НЕТ (Landlock на этой машине не готовится): ограничен только словами задания. deepseek — в кресле dsh (агентный харнесс), не HTTP-голос стола. gemini файлов не видит — только ревьюер.">
+        <option value="">случайно</option>
+        <option value="codex">codex</option>
+        <option value="claude">claude</option>
+        <option value="grok">grok</option>
+        <option value="deepseek">deepseek (dsh)</option>
+        <option value="kimi">kimi ⚠ дорогой</option>
+      </select>
+    </div>
+    <div class="qrow">
+      <input id="scopefiles" placeholder="скоуп: файлы через запятую (пусто — не заявлен)" title="Заявка исполнительского намерения (спека п.1): какие файлы правка ИМЕЕТ ПРАВО трогать (можно маски: src/*.py). Гейт при приёмке сверит диф с заявкой — вышедший за скоуп акт не пройдёт. Пусто — скоуп не заявлен, сверки не будет, и событие merge честно это скажет." style="flex:1;min-width:12rem">
+    </div>
+    <div class="qrow">
+      <input id="actid" placeholder="акт" title="Идентификатор акта правки (hex из события edit_open; после кнопки «Правка» подставляется сам). Кнопки ниже действуют на него." style="width:7.5rem">
+      <label id="batchlab" title="Тумблер этапа 5 (умолчание — ПОШТУЧНО: проверено, доказано, работает). Включён — кнопка «Ревизия» ревизует ВСЕ ждущие акты одной пачкой: один веер вызовов вместо N, вердикты по каждому акту отдельной строкой «ВЕРДИКТ <act>: …». Потолки честные: до 4 актов и 60К символов дифа — внимание ревьюера не резина, большие правки только поштучно. Выбор запоминается."><input type="checkbox" id="revbatch">батчем</label>
+    </div>
+    <div class="qrow">
+      <button id="revbtn" title="Разослать диф ветки акта ВСЕМ голосам, кроме исполнителя (правило 13 в миниатюре). Каждый ответ — событие edit_review в ленте с вердиктом первой строкой (ОДОБРЯЮ/ОТКАЗ) и sha, на который он дан. Платно: до пяти вызовов. Доправка после ревизии меняет sha — старые одобрения гаснут.">Ревизия</button>
+      <button id="mrgbtn" title="Принять правку в main через гейт: аренда закрыта (или adopt) · база не сдвинута · одобрений ≥2 и ни одного ОТКАЗА — всё на текущий sha ветки. Merge-коммит несёт Reviewed-by и тройку sha; автор коммита — голос-исполнитель. Истина — ref: рабочая копия обновляется после и только чистая.">Принять</button>
+      <button id="adoptbtn" title="Для ВЫЛЕТЕВШЕГО акта: явное решение Автора рассмотреть работу из карантина (событие edit_adopt). Снимает одно условие гейта — закрытую аренду; ревизия, кворум и база остаются в силе (спека п.9).">Adopt</button>
+    </div>
+    <div class="qrow">
+      <label id="actfeedlab" title="Опциональная ЛЕНТА АКТОВ (идея голоса claude из раунда вкладки-v1): каждый акт — строка со стадиями «кресло → диф → ревизия N/M → merge», и кнопка существует только на той стадии, где она легальна: Ревизия у закрытого, Принять при кворуме, Adopt у вылетевшего. Выбор запоминается."><input type="checkbox" id="actfeed">лента актов</label>
+    </div>
+    <div id="actlist" hidden></div>
+    </div>
 
 </div>
 <div id="bar">
@@ -3576,31 +3869,6 @@ margin-top:.3rem;padding-top:.3rem;max-height:9rem;overflow-y:auto}
         <option value="">случайно</option>
       </select>
       <label id="qexeclab" title="coder: текст уходит не вопросом, а ЗАДАНИЕМ НА ПРАВКУ тому же голосу — с worktree, арендой и гейтом, как во вкладке 🔧. Если выбранный голос правок не умеет (умеющих объявляет сервер; gemini не умеет — файлов не видит), кресло уходит случайному из умеющих — и подмена называется вслух. ВЫКЛ по умолчанию — решение стола (раунд вкладки-v1, 6/6): самый частый жест окна не должен по умолчанию быть платной правкой с правом записи. Платно, с подтверждением."><input type="checkbox" id="qexec">coder</label>
-    </div>
-    <div id="coderblk">
-    <div class="qrow">
-      <button id="editbtn" title="Выдать кресло исполнителя: текст из поля уходит ЗАДАНИЕМ одному голосу, тот правит код в отдельном git-worktree (ветка act/…). Кресло одно на проект; слепой ход и правка взаимно блокируются. Итог — событиями edit_open/edit_close в ленте; при вылете worktree остаётся на диске карантином. Merge в main — пока руками через гейт (этап 3).">Правка</button>
-      <select id="evoice" title="Кто исполняет. codex — единственный с песочницей (workspace-write + .git базы); claude — набор инструментов Write/Edit/Bash(git:*), но git-alias пробивает и его, граница словесная; kimi ⚠ ДОРОГОЙ И МОНОПОЛЬНЫЙ ПО ЛИНИИ: правка — длинная агентная сессия (15–20 внутренних запросов), и обёртка держит ОДНУ из его линий весь акт; вторая линия (если жива её квота) остаётся столу — ревизии и комната идут по ней, но медленнее, в очередь. Его лучший случай — небольшая точная правка. «случайно» — random.choice сервера по умеющим, НЕ жребий drand; kimi в случайный выбор не входит — только явно. grok — через pty, ПЕСОЧНИЦЫ НЕТ (Landlock на этой машине не готовится): ограничен только словами задания. deepseek — в кресле dsh (агентный харнесс), не HTTP-голос стола. gemini файлов не видит — только ревьюер.">
-        <option value="">случайно</option>
-        <option value="codex">codex</option>
-        <option value="claude">claude</option>
-        <option value="grok">grok</option>
-        <option value="deepseek">deepseek (dsh)</option>
-        <option value="kimi">kimi ⚠ дорогой</option>
-      </select>
-    </div>
-    <div class="qrow">
-      <input id="scopefiles" placeholder="скоуп: файлы через запятую (пусто — не заявлен)" title="Заявка исполнительского намерения (спека п.1): какие файлы правка ИМЕЕТ ПРАВО трогать (можно маски: src/*.py). Гейт при приёмке сверит диф с заявкой — вышедший за скоуп акт не пройдёт. Пусто — скоуп не заявлен, сверки не будет, и событие merge честно это скажет." style="flex:1;min-width:12rem">
-    </div>
-    <div class="qrow">
-      <input id="actid" placeholder="акт" title="Идентификатор акта правки (hex из события edit_open; после кнопки «Правка» подставляется сам). Кнопки ниже действуют на него." style="width:7.5rem">
-      <label id="batchlab" title="Тумблер этапа 5 (умолчание — ПОШТУЧНО: проверено, доказано, работает). Включён — кнопка «Ревизия» ревизует ВСЕ ждущие акты одной пачкой: один веер вызовов вместо N, вердикты по каждому акту отдельной строкой «ВЕРДИКТ <act>: …». Потолки честные: до 4 актов и 60К символов дифа — внимание ревьюера не резина, большие правки только поштучно. Выбор запоминается."><input type="checkbox" id="revbatch">батчем</label>
-      <button id="revbtn" title="Разослать диф ветки акта ВСЕМ голосам, кроме исполнителя (правило 13 в миниатюре). Каждый ответ — событие edit_review в ленте с вердиктом первой строкой (ОДОБРЯЮ/ОТКАЗ) и sha, на который он дан. Платно: до пяти вызовов. Доправка после ревизии меняет sha — старые одобрения гаснут.">Ревизия</button>
-      <button id="mrgbtn" title="Принять правку в main через гейт: аренда закрыта (или adopt) · база не сдвинута · одобрений ≥2 и ни одного ОТКАЗА — всё на текущий sha ветки. Merge-коммит несёт Reviewed-by и тройку sha; автор коммита — голос-исполнитель. Истина — ref: рабочая копия обновляется после и только чистая.">Принять</button>
-      <button id="adoptbtn" title="Для ВЫЛЕТЕВШЕГО акта: явное решение Автора рассмотреть работу из карантина (событие edit_adopt). Снимает одно условие гейта — закрытую аренду; ревизия, кворум и база остаются в силе (спека п.9).">Adopt</button>
-      <label id="actfeedlab" title="Опциональная ЛЕНТА АКТОВ (идея голоса claude из раунда вкладки-v1): каждый акт — строка со стадиями «кресло → диф → ревизия N/M → merge», и кнопка существует только на той стадии, где она легальна: Ревизия у закрытого, Принять при кворуме, Adopt у вылетевшего. Выбор запоминается."><input type="checkbox" id="actfeed">лента актов</label>
-    </div>
-    <div id="actlist" hidden></div>
     </div>
     <div class="qrow" id="ctlrow">
     </div>
@@ -3764,6 +4032,10 @@ let SCOPE='room';
 // «кнопки чата пропали совсем» — стартуем в 💬 (или 🎼, если так было),
 // кодер — только по клику (2026-09-02).
 try{const v=localStorage.getItem('rt-scope');if(v==='rounds')SCOPE=v}catch(_){}
+// ?tab=room|rounds|exec — явная просьба в адресе (закладка на вкладку
+// кодера, скриншот в проверке): она сильнее памяти localStorage.
+try{const q=new URLSearchParams(location.search).get('tab');
+  if(q==='room'||q==='rounds'||q==='exec')SCOPE=q}catch(_){}
 // Что сервер объявил про себя. Оба поля молодые, и «не объявил» здесь
 // НЕ значит «не умеет» — значит «окно не знает». Разница важна: пока
 // не знаем, окно выбирает осторожный путь (см. sendQuick), а не
@@ -4345,12 +4617,18 @@ function vrow(name){
     '<div class="verr" hidden></div>';
   document.getElementById('voices').appendChild(d);
   VROW[name]=d;
+  // Галочка сразу по набору вкладки, а не «отмечено» до первого
+  // /voices: картинка и оплачиваемый набор расходились (нашёл grok).
+  try{const pk=d.querySelector('.vpick input');
+    if(SCOPE!=='exec')pk.checked=!PICK_OFF[SCOPE].has(name);
+    else pk.disabled=true;   // пул кресел придёт с /voices — до него не кликать
+  }catch(_){}
   if(!VMETA[name])VMETA[name]={name:name};
   vplain(d);renderLim(d,VMETA[name]);
   return d;
 }
 function fillCell(row,name,field,cur,list,settable,fixTitle,setTitle,mark,
-                  resettable){
+                  resettable,dflt,isDefault){
   const cell=row.querySelector(field==='model'?'.mdl':'.eff');
   // Не перерисовываем то, в чём сейчас рука: опрос раз в 15 с иначе
   // схлопывал бы открытый список ровно в момент выбора.
@@ -4366,39 +4644,48 @@ function fillCell(row,name,field,cur,list,settable,fixTitle,setTitle,mark,
     cell.appendChild(s);return;
   }
   let el;
+  // prevVal — что вернуть селектору при отказе сервера: пустое, если
+  // стояло умолчание (пункт «X (умолчание)»), иначе заданное значение.
+  const prevVal=isDefault?'':(cur||'');
   if(list&&list.length){
     el=document.createElement('select');
     const all=list.slice();
-    // Текущее значение обязано быть в списке, даже если сервер его туда
+    // Заданное значение обязано быть в списке, даже если сервер его туда
     // не положил: иначе select молча покажет первый пункт, и панель
     // соврёт, чем голос идёт на самом деле.
-    if(cur&&all.indexOf(cur)<0)all.unshift(cur);
-    // «(умолчание)» — сброс настройки: пустое значение сервер понимает
-    // как «вернуть умолчание канала» (раньше сбросить было нельзя —
-    // kimi). Пункт показываем только когда есть что сбрасывать.
-    // «(умолчание)» есть ВСЕГДА: после сброса cur='' — без этого пункта
-    // селект молча показывал первый реальный, и панель врала (deepseek).
+    if(cur&&!isDefault&&all.indexOf(cur)<0)all.unshift(cur);
+    // Пункт умолчания ЯВНЫЙ: «opus (умолчание)», а не безымянное
+    // «(умолчание)» — наказ Автора 2026-09-02: «не понятно, какая модель
+    // и какое усилие». Значение пункта пустое: сервер понимает его как
+    // «вернуть умолчание канала». Пункт есть ВСЕГДА: после сброса без
+    // него селект молча показывал первый реальный (deepseek).
     all.unshift('');
     all.forEach(function(x){
       const o=document.createElement('option');
-      o.value=x;o.textContent=x===''?'(умолчание)':x;
-      if(x===cur)o.selected=true;el.appendChild(o)});
+      o.value=x;o.textContent=x===''?((dflt||'—')+' (умолчание)'):x;
+      if(isDefault?x==='':x===cur)o.selected=true;
+      el.appendChild(o)});
   }else{
     el=document.createElement('input');el.className='free';
-    el.value=cur||'';el.placeholder=field==='model'?'модель':'усилие';
+    el.value=prevVal;
+    el.placeholder=dflt?(dflt+' (умолчание)'):(field==='model'?'модель':'усилие');
   }
   // Значение первой строкой — как у .fix: ячейка узкая, «deepseek-v4-…»
   // без подсказки не отличить от «deepseek-v4-pro» (нашёл kimi).
-  el.title=(cur?cur+'\n':'')+setTitle+
-    (mark?'\n⚠ комната и раунды настроены по-разному':'');
+  el.title=(cur?cur+(isDefault?' (умолчание)':' (задано в окне)')+'\n':'')+
+    setTitle+(mark?'\n⚠ комната и раунды настроены по-разному':'');
   if(mark)el.className=(el.className?el.className+' ':'')+'set';
+  // Область фиксируется ПРИ ОТРИСОВКЕ: ячейка с фокусом при смене
+  // вкладки не перерисовывается, и выбор из списка старой вкладки
+  // иначе уходил POST'ом в новую область (нашёл claude).
+  const scAt=SCOPE;
   el.onchange=function(){
     const v=String(el.value).trim();
     if(v===''&&!resettable){
       // Сбрасывать нечего — POST со сбросом был бы пустым событием-шумом.
-      el.value=cur||'';return;
+      el.value=prevVal;return;
     }
-    push(name,field,v,el,cur)};
+    push(name,field,v,el,prevVal,scAt)};
   cell.appendChild(el);
 }
 // ── двигаемые границы ────────────────────────────────────────────────
@@ -4520,8 +4807,22 @@ addEventListener('resize',function(){
 
 document.getElementById('voices').addEventListener('change',async function(e){
   const t=e.target;
-  if(!t||!t.dataset||!t.dataset.execpool)return;
+  if(!t||!t.dataset||t.type!=='checkbox')return;
   const name=t.value;
+  if(SCOPE==='exec'&&!t.dataset.execpool){
+    // 🔧 до первого ответа /voices: галочка ещё не «пул» (метку ставит
+    // applyVoices), и клик иначе молча правил набор КОМНАТЫ (нашёл
+    // deepseek). Откатываем и говорим.
+    t.checked=!t.checked;
+    return acterr('список кресел ещё не загружен — секунду',true);
+  }
+  if(!t.dataset.execpool){
+    // 💬/🎼: набор вкладки, локально. Снятый — в списке, отмеченный — нет.
+    const sc=SCOPE==='rounds'?'rounds':'room';
+    if(t.checked)PICK_OFF[sc].delete(name);else PICK_OFF[sc].add(name);
+    pickSave(sc);
+    return;
+  }
   try{
     const r=await fetch('/voices',{method:'POST',
       headers:{'Content-Type':'application/json'},
@@ -4532,27 +4833,78 @@ document.getElementById('voices').addEventListener('change',async function(e){
   }catch(err){t.checked=!t.checked;acterr('сервер не ответил: '+err)}
 });
 
+// ГАЛОЧКИ — СВОИ У КАЖДОЙ ВКЛАДКИ (наказ Автора 2026-09-02): 💬 — кому
+// уйдёт реплика и слепой ход, 🎼 — состав раунда и кандидаты жребия,
+// 🔧 — пул random кресел (его хранит сервер, см. execpool). Первые две
+// живут в localStorage списком СНЯТЫХ: новый голос по умолчанию
+// отмечен, и «пустое хранилище» значит «все», а не «никто».
+// Кнопки читают НЕ DOM, а набор СВОЕЙ вкладки: на 🔧 в строках стоит
+// пул кресел, и «Слепой ход», прочитавший его как адресатов, оплатил
+// бы не то, что отмечено (цена ошибки — ЧЬИ вызовы будут оплачены).
+const PICK_OFF={room:new Set(),rounds:new Set()};
+['room','rounds'].forEach(function(sc){
+  try{const v=JSON.parse(localStorage.getItem('rt-pick-off-'+sc)||'[]');
+    if(Array.isArray(v))v.forEach(function(n){PICK_OFF[sc].add(String(n))});
+  }catch(_){}
+});
+function pickSave(sc){
+  try{localStorage.setItem('rt-pick-off-'+sc,
+    JSON.stringify(Array.from(PICK_OFF[sc])))}catch(_){}
+}
+function picked(sc){
+  sc=(sc==='room'||sc==='rounds')?sc:(SCOPE==='rounds'?'rounds':'room');
+  const off=PICK_OFF[sc];
+  // Состав — по /state (живой список сервера), VMETA лишь запас:
+  // она помнит голоса навсегда (нашёл kimi).
+  const live=(window.STATE&&Array.isArray(window.STATE.voices))
+    ?window.STATE.voices:Object.keys(VMETA);
+  return live.filter(function(n){return !off.has(n)});
+}
+function vnote(text,isNote){
+  const n=document.getElementById('vnote');
+  if(!n)return;
+  n.hidden=!text;n.textContent=text||'';
+  n.style.color=isNote?'':'var(--err,#b3261e)';
+}
+// ⟳ модели: разведка у самих каналов, без модельных вызовов; отчёт —
+// строкой под списком, списки — перерисовкой карточек с сервера.
+document.getElementById('mrefresh').onclick=async function(){
+  const b=document.getElementById('mrefresh');
+  b.disabled=true;vnote('обновляю списки моделей у всех голосов…',true);
+  let r;
+  try{
+    r=await fetch('/models_refresh',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:'{}'});
+  }catch(e){b.disabled=false;return vnote('сервер не ответил: '+e)}
+  let j={};try{j=await r.json()}catch(_){}
+  b.disabled=false;
+  if(!r.ok)return vnote('не обновилось: '+((j&&j.error)||('ошибка '+r.status)));
+  const rep=j.report||{};
+  const parts=Object.keys(rep).map(function(n){const x=rep[n]||{};
+    return n+': '+(x.ok?(x.models+' моделей'):('✗ '+(x.error||'?')))});
+  vnote('обновлено '+new Date().toLocaleTimeString()+' — '+parts.join(' · '),true);
+  if(Array.isArray(j.voices))applyVoices(j.voices,true);
+};
 function setScope(v){
   SCOPE=v;
   try{localStorage.setItem('rt-scope',v)}catch(_){}
   document.getElementById('sc-room').className='scopetab'+(v==='room'?' on':'');
   document.getElementById('sc-rounds').className='scopetab'+(v==='rounds'?' on':'');
   document.getElementById('sc-exec').className='scopetab'+(v==='exec'?' on':'');
-  // Вкладка coder: блок правок ЖИВЁТ только в ней; комнатные и
-  // раундовые кнопки уходят — Автор: «внизу куча кнопочек,
-  // перегружено» (раунд вкладки-v1: перенос — единогласно).
+  // Стандартные кнопки диалога (Сказать, Слепой ход, Раунд, Быстрый
+  // вопрос) стоят внизу ВСЕГДА; блок правок живёт в правой панели под
+  // жребием и виден только на 🔧 (наказ Автора 2026-09-02: «на этом
+  // месте ожидаю стандартные кнопочки диалога, а Правка/Ревизия/
+  // Принять/Adopt — во вкладку Кодер, ниже Бросить/Раскрыть»).
   try{
     document.getElementById('vhead3').textContent=
       v==='exec'?'Голоса · кресла (🔧 coder)'
-      :v==='rounds'?'Голоса · раунды (🎼)':'Голоса · кому уйдёт';
+      :v==='rounds'?'Голоса · состав раунда (🎼)':'Голоса · кому уйдёт (💬)';
     document.getElementById('msg').placeholder=
-      v==='exec'?'Задание исполнителю (кнопка Правка); поле «акт» ниже — для гейта'
-      :v==='rounds'?'Вопрос раунда одной строкой (кнопка «Раунд стола»)'
+      v==='exec'?'Задание исполнителю (кнопка «Правка» в правой панели); кнопки диалога внизу работают как прежде'
+      :v==='rounds'?'Вопрос раунда одной строкой (кнопка «Раунд стола»); Enter — реплика в комнату'
       :'Реплика в комнату (@имя — адресно; Enter — отправить, Alt+Enter — перенос)';
     document.getElementById('coderblk').hidden=(v!=='exec');
-    document.getElementById('sendrow').hidden=(v==='exec');
-    document.getElementById('roundrow').hidden=(v==='exec');
-    document.getElementById('quickrow').hidden=(v==='exec');
   }catch(_){}
   // Перерисовка БЕЗ обновления _got: замера не было, и подделывать его
   // свежесть нельзя (тот же довод, что у прежнего тумблера).
@@ -4566,7 +4918,7 @@ document.getElementById('sc-exec').onclick=function(){setScope('exec')};
 // расходились до первого клика.
 setScope(SCOPE);
 function applyVoices(list,fresh){
-  // fresh=false — локальная перерисовка (тумблер 💬/🎼): _got трогать
+  // fresh=false — локальная перерисовка (тумблер вкладок): _got трогать
   // нельзя, иначе возраст замера лжёт «только что» без нового опроса
   // (нашёл codex).
   if(fresh===undefined)fresh=true;
@@ -4577,118 +4929,93 @@ function applyVoices(list,fresh){
     if(fresh)m._got=Date.now();
     VMETA[name]=m;
     const row=vrow(name);
-    const efl=Array.isArray(m.efforts)?m.efforts:[];
     const mdl=Array.isArray(m.models)?m.models:[];
     const set=m.set_in_window||{};
-    // Подпись области зависит от ВКЛАДКИ: на 🎼 показывать «только
-    // live.py» из комнатного scope значило бы отвечать не о том, что
-    // человек сейчас правит (нашёл codex).
-    const area=SCOPE==='rounds'
-      ?'раунды choir.py'+((m.rounds||{}).source?' · '+(m.rounds||{}).source:'')
-      :(m.scope||(m.applies_to||[]).join(', '));
-    const why=m.locked_why||'';
-    // Ручка есть, только если сервер сказал can_set_* И назвал, ЧЕМ её
-    // крутить. can_set_effort=true при пустом списке ступеней ручкой не
-    // является: POST сверяет значение со списком и отклонит любое —
-    // так сейчас у deepseek, которого нет в choir.EFFORT_LADDER.
-    // Селектор там был бы управлением, которого не существует.
-    // Кресло: ручка только там, где за ней механика (правило 8.5) —
-    // dsh не крутится вовсе, claude/kimi — только модель, grok —
-    // только усилие; списки объявляет сервер (m.exec.can_*).
-    // Галочка строки при 🔧 — это ПУЛ random кресел, не адресат
-    // рассылки: своё состояние (m.exec.pool) и свой POST. У голоса без
-    // кресла (gemini) галочка гаснет. Дорогой (kimi) в random не
-    // входит независимо от галочки — она для него disabled.
+    const sc=SCOPE;
+    // Карточки вкладок — ОТ СЕРВЕРА (m.tabs): одинаковое наполнение у
+    // трёх вкладок, у каждой свои действующее значение, заданное в
+    // окне, явное умолчание с хранителем и рычаги (наказ Автора
+    // 2026-09-02). tabs.exec===null — кресла нет (gemini).
+    const tabs=m.tabs||{};
+    const t=(tabs[sc]&&!tabs[sc].error)?tabs[sc]:null;
+    const terr=tabs[sc]&&tabs[sc].error?tabs[sc].error:'';
+    const ex=(tabs.exec&&!tabs.exec.error)?tabs.exec:null;
+    // Галочка строки: 💬/🎼 — набор вкладки (локально), 🔧 — пул random
+    // кресел (сервер). У голоса без кресла галочка гаснет; дорогой
+    // (kimi) в random не входит независимо от галочки — она disabled.
     try{
       const pick=row.querySelector('.vpick input');
-      if(SCOPE==='exec'){
-        if(!row.dataset.pickKeep)row.dataset.pickKeep=pick.checked?'1':'0';
-        const vp0=row.querySelector('.vpick');
-        if(vp0.dataset.origTitle===undefined)
-          vp0.dataset.origTitle=vp0.title||'';
+      const vp=row.querySelector('.vpick');
+      if(vp.dataset.origTitle===undefined)vp.dataset.origTitle=vp.title||'';
+      if(sc==='exec'){
         pick.disabled=!ex||!!(ex&&ex.costly);
         pick.checked=!!(ex&&ex.pool&&!ex.costly);
         pick.dataset.execpool='1';
-        row.querySelector('.vpick').title=!ex
-          ?'кресла нет: только ревьюер'
+        vp.title=!ex?'кресла нет: только ревьюер'
           :(ex.costly?'дорогой — в random не входит, зовите явно'
             :'галочка = участие в random-пуле кресел (POST /voices scope=exec)');
-      }else if(pick.dataset.execpool){
+      }else{
         delete pick.dataset.execpool;
         pick.disabled=false;
-        pick.checked=row.dataset.pickKeep!=='0';
-        delete row.dataset.pickKeep;
-        const vp=row.querySelector('.vpick');
-        vp.title=vp.dataset.origTitle||'';
+        pick.checked=!PICK_OFF[sc].has(name);
+        vp.title=(sc==='rounds'
+          ?'галочка = участие в раунде и в жребии ведущего (вкладка 🎼)'
+          :'галочка = кому уйдёт реплика и слепой ход (вкладка 💬)')+
+          (vp.dataset.origTitle?'\n'+vp.dataset.origTitle:'');
       }
     }catch(_){}
-    const canM=SCOPE==='exec'?!!(m.exec&&m.exec.can_model)
-      :m.can_set_model===true;
-    const canE=SCOPE==='exec'?!!(m.exec&&m.exec.can_effort&&efl.length>0)
-      :(m.can_set_effort===true&&efl.length>0);
-    // Тумблер области: 💬 комната / 🎼 раунды. Ячейки показывают пару
-    // ВЫБРАННОЙ области; у раундов свои значения (rounds из /voices) и
-    // те же списки допустимого.
-    const sc=SCOPE;
-    const rd=m.rounds||{};
-    const ex=m.exec||null;   // кресло исполнителя (вкладка 🔧 coder)
-    // Слова вместо прочерка: «у большинства вендоров прочерки» Автор
-    // прочёл как поломку, а это честное «рычага нет» (2026-09-02).
-    const showM=sc==='room'?(m.model||''):sc==='exec'
-      ?((ex&&ex.can_model)?(ex.model||''):(ex?'нет рычага':'нет кресла'))
-      :(rd.model||'');
-    const showE=sc==='room'?(m.effort||''):sc==='exec'
-      ?((ex&&ex.can_effort)?(efl.length?(ex.effort||''):'ступени не объявлены')
-        :(ex?'нет рычага':'нет кресла'))
-      :(rd.effort||'');
-    const srcM=sc==='room'?m.model_source:sc==='exec'
-      ?(ex?(ex.model?'задано в окне (кресло)':'умолчание кресла — '+
-            (ex.seat||name)):'кресла нет: '+name+' — только ревьюер')
-      :(rd.source||'умолчание choir.py');
-    const srcE=sc==='room'?m.effort_source:sc==='exec'
-      ?(ex?(ex.effort?'задано в окне (кресло)':'умолчание кресла')
-          :'кресла нет')
-      :(rd.source||'умолчание choir.py');
-    // Жёлтая рамка = «комната и раунды настроены ПО-РАЗНОМУ» (наказ
-    // Автора 2026-08-31: рамка только там, где есть разница, — тогда
-    // понятно, зачем она). Сравниваются ЗАДАННЫЕ значения областей;
-    // умолчания областей могут различаться и без рамки — это сказано
-    // в подсказке ячейки. Рамка не зависит от выбранной вкладки и не
-    // прыгает при переключении.
+    const tabName=sc==='room'?'комната (💬)':sc==='exec'?'кресло (🔧 coder)':'раунды (🎼)';
+    if(!t){
+      // Слова вместо прочерка (Автор прочёл прочерки как поломку): на
+      // 🔧 это честное «кресла нет», иначе — сервер без карточки вкладки.
+      const why=terr?('сервер: '+terr):sc==='exec'
+        ?'кресла нет: '+name+' — только ревьюер, файлов не видит'
+        :'сервер не прислал карточку вкладки '+tabName;
+      const word=terr?'ошибка карточки':sc==='exec'?'нет кресла':'';
+      fillCell(row,name,'model',word,[],false,why,'',false,false,null,false);
+      fillCell(row,name,'effort',word,[],false,why,'',false,false,null,false);
+      renderLim(row,m);
+      return;
+    }
+    const efl=Array.isArray(t.efforts)?t.efforts:[];
+    // Жёлтая рамка = «комната и раунды ЗАДАНЫ по-разному» (наказ Автора
+    // 2026-08-31: рамка только там, где есть разница). Сравниваются
+    // ЗАДАННЫЕ значения; умолчания вкладок могут различаться и без
+    // рамки — об этом подсказка ячейки. Рамка не зависит от вкладки.
     const rmS=set.room||{},rdS=set.rounds||{};
     const diffM=(rmS.model||null)!==(rdS.model||null);
     const diffE=(rmS.effort||null)!==(rdS.effort||null);
     const diffNote=function(d,f){return (d?'\n⚠ области различаются: '+
       '💬 '+((rmS[f])||'(умолчание)')+' · 🎼 '+((rdS[f])||'(умолчание)'):'')+
       '\nжёлтая рамка = комната и раунды ЗАДАНЫ по-разному; умолчания '+
-      'областей могут различаться и без рамки'};
-    fillCell(row,name,'model',showM,mdl,canM,
-      clip(why||srcM||'из окна не меняется',300),
-      'модель '+(sc==='exec'?'КРЕСЛА':'голоса')+' ('+
-      (sc==='room'?'комната':sc==='exec'?'вкладка coder':'раунды/дирижёр')+')'+
-      (srcM?'\nоткуда сейчас: '+clip(srcM,200):'')+
-      diffNote(diffM,'model')+
-      (area?'\nобласть: '+clip(area,300):'')+'\nсмена уходит POST /voices',
-      sc==='exec'?false:diffM,
-      !!(sc==='room'?rmS.model:sc==='exec'?(set.exec||{}).model:rdS.model));
-    fillCell(row,name,'effort',showE,efl,canE,
-      clip((m.can_set_effort===true&&!efl.length
-        ?'ручка у канала есть, но сервер не назвал ни одной допустимой '+
-         'ступени — он отклонит любое значение; '
-        :'')+(why||srcE||'рычага усилия у этого канала нет'),300),
-      'усилие '+(sc==='exec'?'КРЕСЛА':'голоса')+' ('+
-      (sc==='room'?'комната':sc==='exec'?'вкладка coder':'раунды/дирижёр')+')'+
-      (srcE?'\nоткуда сейчас: '+clip(srcE,200):'')+
-      diffNote(diffE,'effort')+
-      (m.efforts_source?'\nсписок ступеней: '+clip(m.efforts_source,120):'')+
-      (area?'\nобласть: '+clip(area,300):'')+'\nсмена уходит POST /voices',
-      diffE,
-      !!(sc==='room'?rmS.effort:rdS.effort));
+      'вкладок могут различаться и без рамки'};
+    const src=t.default_src||'';
+    const mtitle='модель · '+tabName+
+      '\nсейчас: '+(t.model||'—')+(t.set_model?' (задано в окне)':' (умолчание)')+
+      '\nумолчание: '+(t.default_model||'не объявлено')+
+      (src?'\nхранитель умолчания: '+clip(src,240):'')+
+      (m.models_source?'\nсписок моделей: '+clip(m.models_source,200):'')+
+      diffNote(diffM,'model')+'\nсмена уходит POST /voices';
+    const etitle='усилие · '+tabName+
+      '\nсейчас: '+(t.effort||'—')+(t.set_effort?' (задано в окне)':' (умолчание)')+
+      '\nумолчание: '+(t.default_effort||'не объявлено')+
+      (src?'\nхранитель умолчания: '+clip(src,240):'')+
+      (efl.length?'\nступени этой модели: '+efl.join(', '):'')+
+      diffNote(diffE,'effort')+'\nсмена уходит POST /voices';
+    // Без рычага — словами, не прочерком: «нет рычага» и подсказка ПОЧЕМУ.
+    const mshow=t.model||(t.can_model?'':'нет рычага');
+    const eshow=t.effort||(t.can_effort?'':'нет рычага');
+    fillCell(row,name,'model',mshow,mdl,!!t.can_model,
+      clip((t.why_model||'из окна не меняется')+(src?'\n'+src:''),300),
+      mtitle,sc==='exec'?false:diffM,!!t.set_model,t.default_model,!t.set_model);
+    fillCell(row,name,'effort',eshow,efl,!!t.can_effort,
+      clip((t.why_effort||'рычага усилия у этого канала нет')+(src?'\n'+src:''),300),
+      etitle,sc==='exec'?false:diffE,!!t.set_effort,t.default_effort,!t.set_effort);
     renderLim(row,m);
   });
 }
-async function push(name,field,val,el,prev){
-  const m=VMETA[name]||{},body={voice:name,scope:SCOPE};
+async function push(name,field,val,el,prev,sc){
+  const m=VMETA[name]||{},body={voice:name,scope:sc||SCOPE};
   // Шлём ТОЛЬКО изменённое поле: сервер хранит вторую половину пары
   // сам, а досылка «текущего» значения из комнаты в область раундов
   // протаскивала бы чужую пару (поймано при сборке тумблера областей).
@@ -4831,12 +5158,6 @@ async function state(){
   else if(!lb.dataset.err)lb.textContent='не брошен';
 }
 setInterval(state,2000);state();
-// input[type=checkbox] обязательно: в строке голоса теперь живут и
-// поля ввода модели/усилия, а `input:checked` по ним не сработает лишь
-// по счастливой случайности спецификации — полагаться на неё нельзя,
-// цена ошибки в том, ЧЬИ вызовы будут оплачены.
-const picked=()=>[...document.querySelectorAll(
-  '#voices input[type=checkbox]:checked')].map(i=>i.value);
 async function send(blind){
   const text=msg.value.trim(); if(!text)return acterr('пустая реплика',true);
   const project=document.getElementById('project').value.trim();
@@ -4847,7 +5168,7 @@ async function send(blind){
   // Автору набранной реплики, если снять его вслепую.
   try{
     r=await fetch('/act',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({text,blind,voices:picked(),project,brief:briefOn()})});
+      body:JSON.stringify({text,blind,voices:picked('room'),project,brief:briefOn()})});
   }catch(e){return acterr('сервер не ответил: '+e)}
   let j={};try{j=await r.json()}catch(_){}
   if(r.ok)msg.value='';
@@ -4918,7 +5239,7 @@ async function sendQuick(){
   const project=document.getElementById('project').value.trim();
   let voice=qsel.value||null,here=false;
   if(!voice&&!(MODES&&MODES.indexOf('quick')>=0)){
-    const pool=picked().length?picked()
+    const pool=picked('room').length?picked('room')
       :[].map.call(qsel.options,function(o){return o.value}).filter(Boolean);
     if(!pool.length)return acterr('некого спросить: ни одного голоса в списке');
     voice=pool[Math.floor(Math.random()*pool.length)];here=true;
@@ -4994,13 +5315,21 @@ document.getElementById('round').onclick=async()=>{
   }
   const auto=document.getElementById('auto').checked;
   const rebuts=+document.getElementById('rebuts').value;
+  // Состав раунда — галочки вкладки 🎼 (не текущей!): на 💬 они значат
+  // адресатов реплики, на 🔧 — пул кресел. Меньше двух — не раунд.
+  const rvoices=picked('rounds');
+  if(rvoices.length<2){alert('раунд — минимум два голоса: отметьте их на '+
+    'вкладке 🎼 раунды (если список голосов ещё не загрузился — '+
+    'подождите секунду)');return}
   // Подтверждение только для авто: это единственный режим, где после
   // нажатия человека больше не спрашивают, а вызовы шести голосов
   // платные. По шагам подтверждать нечего — такт сам встанет.
   if(auto&&!confirm('Автопрогон «'+name+'»: pick → expand → ask → rebut ×'+
-      rebuts+' → summarize, без остановки. Все шесть голосов, платно. Пускаем?'))return;
+      rebuts+' → summarize, без остановки. Голоса: '+rvoices.join(', ')+
+      ' — платно. Пускаем?'))return;
   const r=await fetch('/round',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({question,name,auto,rebuts,brief:briefOn()})});
+    body:JSON.stringify({question,name,auto,rebuts,brief:briefOn(),
+                         voices:rvoices})});
   if(r.ok)msg.value='';
   else alert((await r.json()).error||'ошибка');
 };
@@ -5039,7 +5368,7 @@ document.getElementById('lot').onclick=async()=>{
   const lb=document.getElementById('lotbox');delete lb.dataset.err;
   const r=await fetch('/lot',{method:'POST',
     headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({candidates:picked()})});
+    body:JSON.stringify({candidates:picked('rounds')})});
   const j=await r.json();
   if(r.ok)lb.innerHTML='commit опубликован — имя появится через ~'+j.wait_s+'с';
   else{lb.dataset.err=1;
@@ -5201,8 +5530,26 @@ def main(argv: list[str] | None = None) -> int:
         print(f"нет ленты {FEED} — сначала python3 live.py ask …",
               file=sys.stderr)
         return 1
+    discovery = os.environ.get("CHOIR_RT_NO_DISCOVERY") != "1"
+    if discovery:
+        # Кэши CLI codex/grok — СИНХРОННО и до чтения настроек: это
+        # два локальных файла (миллисекунды), а сохранённое усилие
+        # сверяется с их лестницами — на запасном каталоге xhigh/max
+        # выпадали (нашли claude и субагент).
+        try:
+            catalog.refresh(["codex", "grok"], timeout=5)
+        except Exception as e:                  # noqa: BLE001
+            print(f"каталог codex/grok при старте: {e}", file=sys.stderr)
     _load_voice_cfg()
     _sync_exec_overrides()               # кресла — из того же кэша
+    # Остальной каталог — В ФОНЕ (около секунды, без единого модельного
+    # вызова), чтобы селекторы не жили вчерашним кэшем; по завершении
+    # пересчёт разрешённых умолчаний кресел. CHOIR_RT_NO_DISCOVERY=1 —
+    # тесты и машины без сети.
+    if discovery:
+        threading.Thread(
+            target=lambda: (catalog.refresh(), _sync_exec_overrides()),
+            daemon=True, name="catalog-refresh").start()
     with CFG_LOCK:
         restored = sum(1 for v in VOICE_CFG.values()
                        if any(v.get(sc) for sc in SCOPES))

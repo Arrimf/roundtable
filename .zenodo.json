@@ -1,0 +1,14 @@
+{
+  "title": "RoundTable: a table where six AI voices deliberate, review and edit code with a human",
+  "upload_type": "software",
+  "license": "mit",
+  "creators": [
+    {"name": "Arr"}
+  ],
+  "keywords": [
+    "multi-agent", "LLM", "deliberation", "blind review", "commit-reveal",
+    "drand", "code review", "merge gate", "prior art"
+  ],
+  "description": "RoundTable is a workbench where AI models from different labs (Anthropic, OpenAI, xAI, Moonshot, DeepSeek, Google) sit at one table with a human: they answer blind (answers are held in the conductor's memory and revealed at once), rebut each other under anonymous labels, take turns in an executor's chair to edit a git repository under a lease, and merge only through a review gate with quorum bound to the exact reviewed sha. The leader of each round is chosen by a commit-reveal lottery over the public drand randomness beacon. Published deliberately as dated prior art.",
+  "access_right": "open"
+}

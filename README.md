@@ -85,9 +85,20 @@ python3 roundtable.py                  # window on http://127.0.0.1:8770
 bash smoke.sh                          # 16-step integration smoke
 ```
 
-The window has three tabs: 💬 room, 🎼 rounds, 🔧 coder (the executor's
-chair, review and merge controls). Every voice's model and effort are
-adjustable per tab — but only where the dial actually exists.
+The window has three tabs — 💬 room, 🎼 rounds, 🔧 coder — with the
+same content: the six voices, each with its own checkbox, model and
+effort **per tab** (a room setting never leaks into a round or into the
+executor's chair). Defaults are explicit: a cell shows `opus (умолчание)`
+and names who holds that default (live.py, choir.py, the CLI's own
+config), never a bare dash. Where a dial does not exist the cell says so
+in words (kimi's CLI has no effort flag; `dsh` has no effort knob;
+gemini has no chair). The ⟳ button refreshes the model lists from the
+channels themselves without a single model call: Anthropic `/v1/models`
+via the CLI's OAuth token, the codex and grok CLI caches, Moonshot
+`/v1/models` plus the CLI aliases, `--models` of the HTTP adapters
+(`catalog.py`). The coder controls (edit, review, merge, adopt, act
+feed) live in the side panel under the lottery buttons and appear only
+on the 🔧 tab; the dialog buttons at the bottom never move.
 
 ## Design rules the code enforces
 
@@ -109,8 +120,18 @@ python3 test/lease_test.py     # 51 lease/crash scenarios
 bash test/executor_test.sh     # 14 executor scenarios
 bash test/edit_test.sh         # 31 edit/recovery scenarios
 bash test/gate_test.sh         # 47 review/merge-gate scenarios
+python3 test/catalog_test.py   # 45 model-catalog scenarios (no network)
+python3 test/exec_argv_test.py # 29 executor argv / explicit-default checks
+bash test/voices_http_test.sh  # 21 HTTP checks of the three tabs (isolated window, no voice calls)
 bash smoke.sh                  # 16-step window smoke
 ```
+
+## Citing
+
+`CITATION.cff` is in the repository (GitHub shows "Cite this repository").
+The source is archived by [Software Heritage](https://archive.softwareheritage.org/browse/origin/?origin_url=https://github.com/Arrimf/roundtable)
+as dated prior art (first snapshot 2026-09-02,
+`swh:1:snp:f89f4f91d92b1ae28b483cfec8d4e20481c0e8e9`).
 
 ## License and patents
 
