@@ -3623,6 +3623,11 @@ class Handler(BaseHTTPRequestHandler):
                 # --by не шлём: choir.py сам берёт запасной жребий
                 # (lot_summary) или ведущего — окно не решает, кто сводит.
                 cmd = [sys.executable, "choir.py", step, "--round", name]
+                if step == "summarize":
+                    # Карточка свода — файлом, как у автопрогона (у run
+                    # умолчание СВОД-<раунд>.md); без --out summarize
+                    # пишет свод только в журнал (поймано на «Канбан1»).
+                    cmd += ["--out", f"СВОД-{name}.md"]
                 who = view.get("summarizer") or view["conductor"]
                 label = (f"round: {name} [виток критики "
                          f"№{view.get('rebuts', 0) + 1}]" if step == "rebut"

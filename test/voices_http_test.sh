@@ -146,7 +146,7 @@ tail -n 3 "$W/choir/live.jsonl" | grep -q '"status": "done"' && tail -n 3 "$W/ch
 tail -n 3 "$W/choir/live.jsonl" | grep '"status": "done"' | grep -q '"step": "rebut"' && pass "финал акта несёт step" || fail "финал без step"
 [ "$(code /round_step '{"name":"t1","step":"summarize"}')" = 200 ] && pass "/round_step summarize после витка → 200" || fail "/round_step summarize"
 sleep 5
-grep -q "^summarize --round t1$" "$W/choir/argv.log" && pass "summarize: --by не передаётся (сводчика выбирает choir.py)" || fail "argv summarize: $(cat "$W/choir/argv.log")"
+grep -q "^summarize --round t1 --out СВОД-t1.md$" "$W/choir/argv.log" && pass "summarize: без --by (сводчика выбирает choir.py), с --out СВОД-<раунд>.md" || fail "argv summarize: $(cat "$W/choir/argv.log")"
 mkdir -p "$W/proj2" && git -C "$W/proj2" init -q
 R="$(post /round "{\"question\":\"q\",\"name\":\"pj2\",\"project\":\"$W/proj2\"}")"
 echo "$R" | grep -q '"act"' && pass "/round с проектом → 200" || fail "/round с проектом: $R"
