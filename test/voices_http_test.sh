@@ -107,6 +107,52 @@ mkdir -p "$W/proj" && git -C "$W/proj" init -q && git -C "$W/proj" -c user.name=
 [ "$(code /edit "{\"task\":\"t\",\"voice\":\"random\",\"project\":\"$W/proj\"}")" = 409 ] && pass "/edit random при пустом пуле → 409" || fail "/edit пустой пул"
 R="$(post /edit "{\"task\":\"t\",\"voice\":\"random\",\"project\":\"$W/proj\"}")"
 echo "$R" | grep -q 'пул random пуст' && pass "/edit: повтор — снова «пул пуст», а не «проект занят» (резерв не завис)" || fail "/edit: резерв завис: $R"
+# карточка раунда: /round_view читает room.jsonl, /round_step — шаги по человеку
+cat >> "$W/choir/room.jsonl" <<'EOF'
+{"id":"a1","ts":"2026-09-03T10:00:00+00:00","round":"t1","phase":"pick","voice":"choir","role":"lot","text":"grok","conductor":"grok","candidates":["claude","grok"],"drand_round":1,"project":"/tmp"}
+{"id":"a2","ts":"2026-09-03T10:00:01+00:00","round":"t1","phase":"expand","voice":"grok","role":"seed_expanded","status":"ok","text":"# затравка"}
+{"id":"a3","ts":"2026-09-03T10:00:02+00:00","round":"t1","phase":"blind","voice":"claude","role":"answer","status":"ok","text":"ответ клода","elapsed_s":12.5}
+{"id":"a4","ts":"2026-09-03T10:00:03+00:00","round":"t1","phase":"blind","voice":"grok","role":"answer","status":"ok","text":"ответ грока","model":"grok-4.6"}
+{"id":"a5","ts":"2026-09-03T10:00:04+00:00","round":"t1","phase":"summary","voice":"choir","role":"lot_summary","text":"grok"}
+{"id":"a6","ts":"2026-09-03T10:00:05+00:00","round":"t2","phase":"pick","voice":"choir","role":"lot","text":"kimi","conductor":"kimi","candidates":["kimi","codex"]}
+EOF
+curl -s "$B/round_view?name=t1" | python3 -c '
+import json,sys; d=json.load(sys.stdin)
+assert d["found"] and d["conductor"]=="grok" and d["project"]=="/tmp", d
+assert len(d["answers"])==2 and d["answers"][1]["model"]=="grok-4.6" and d["answers"][0]["text"]=="ответ клода"
+assert d["seed"]["text"]=="# затравка" and d["rebuts"]==0 and d["summary"] is None, d
+' && pass "/round_view: жребий, затравка, ответы дословно; lot_summary не считается сводом" || fail "/round_view t1"
+curl -s "$B/round_view?name=nope" | grep -q '"found": false' && pass "/round_view: неизвестный раунд → found=false" || fail "/round_view nope"
+[ "$(curl -s -o /dev/null -w '%{http_code}' "$B/round_view?name=..%2Fetc")" = 400 ] && pass "/round_view: кривое имя → 400" || fail "/round_view имя"
+[ "$(code /round_step '{"name":"t1","step":"merge"}')" = 400 ] && pass "/round_step: чужой шаг → 400" || fail "/round_step шаг"
+[ "$(code /round_step '{"name":"t2","step":"rebut"}')" = 409 ] && pass "/round_step: без слепой фазы → 409" || fail "/round_step без ответов"
+[ "$(code /round_step '{"name":"t9","step":"summarize"}')" = 409 ] && pass "/round_step: без жребия → 409" || fail "/round_step без жребия"
+[ "$(code /round '{"question":"q","name":"pj","project":"/nonexistent/dir"}')" = 400 ] && pass "/round: проект не каталог → 400 до записи файла" || fail "/round проект"
+[ ! -e "$W/choir/ВОПРОС-pj.md" ] && pass "/round: файл вопроса при отказе не создан" || fail "/round: файл вопроса создан при отказе"
+# ── шаги раунда с ЗАГЛУШКОЙ дирижёра: argv в файл, сон 3 с, код 0 ──
+# (ревизия 2026-09-03: без стаба «проверка занятости мертва с рождения» и
+# «финал без поля round» проходили тесты — codex, grok, kimi, claude, субагент)
+cat > "$W/choir/choir.py" <<'EOF'
+import sys, time, os
+open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "argv.log"), "a").write(" ".join(sys.argv[1:]) + "\n")
+time.sleep(3 if sys.argv[1] in ("rebut", "summarize") else 0)
+EOF
+R="$(post /round_step '{"name":"t1","step":"rebut"}')"
+echo "$R" | grep -q '"act"' && pass "/round_step rebut → 200 (стаб дирижёра)" || fail "/round_step 200: $R"
+[ "$(code /round_step '{"name":"t1","step":"summarize"}')" = 409 ] && pass "/round_step: второй шаг того же раунда во время первого → 409" || fail "/round_step: занятость не видна"
+sleep 5
+grep -q "^rebut --round t1$" "$W/choir/argv.log" && pass "/round_step: argv «rebut --round t1» без --by и без лишнего" || fail "argv rebut: $(cat "$W/choir/argv.log")"
+tail -n 3 "$W/choir/live.jsonl" | grep -q '"status": "done"' && tail -n 3 "$W/choir/live.jsonl" | grep '"status": "done"' | grep -q '"round": "t1"' && pass "финал акта несёт round (карточка появится)" || fail "финал акта без round: $(tail -n 2 "$W/choir/live.jsonl" | cut -c1-200)"
+tail -n 3 "$W/choir/live.jsonl" | grep '"status": "done"' | grep -q '"step": "rebut"' && pass "финал акта несёт step" || fail "финал без step"
+[ "$(code /round_step '{"name":"t1","step":"summarize"}')" = 200 ] && pass "/round_step summarize после витка → 200" || fail "/round_step summarize"
+sleep 5
+grep -q "^summarize --round t1$" "$W/choir/argv.log" && pass "summarize: --by не передаётся (сводчика выбирает choir.py)" || fail "argv summarize: $(cat "$W/choir/argv.log")"
+mkdir -p "$W/proj2" && git -C "$W/proj2" init -q
+R="$(post /round "{\"question\":\"q\",\"name\":\"pj2\",\"project\":\"$W/proj2\"}")"
+echo "$R" | grep -q '"act"' && pass "/round с проектом → 200" || fail "/round с проектом: $R"
+sleep 2
+grep -q "^pick --round pj2 --seed .* --project $W/proj2$" "$W/choir/argv.log" && pass "/round: --project уходит в pick (цепочка по шагам)" || fail "argv pick без --project: $(grep pick "$W/choir/argv.log")"
+grep -q "^ask --round pj2 --seed" "$W/choir/argv.log" && ! grep "^ask --round pj2" "$W/choir/argv.log" | grep -q -- "--project" && pass "/round: ask без --project (берёт из жребия)" || fail "argv ask: $(grep '^ask' "$W/choir/argv.log")"
 grep -q "Traceback" "$W/srv.log" && fail "в логе сервера трейсбек: $(grep -A3 Traceback "$W/srv.log" | head -5)" || pass "трейсбеков в логе сервера нет"
 printf '\nvoices_http: PASS %d · FAIL %d\n' "$PASS" "$FAIL"
 [ "$FAIL" = 0 ]

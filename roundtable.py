@@ -123,6 +123,8 @@ RUN_LOCK = threading.Lock()
 # Проекты, чьё кресло исполнителя прямо сейчас ОТКРЫВАЕТСЯ (между
 # резервом в /edit и записью спавна в RUNNING). Под RUN_LOCK.
 _EDIT_RESERVED: set[str] = set()
+# Резерв имени раунда между проверкой занятости и spawn шага (/round_step).
+_ROUND_RESERVED: set[str] = set()
 
 # Жребий. Схема v2 — после ревью В1 (2026-08-25), три дыры v1:
 #   • имя было ВЫЧИСЛИМО из commit-события: индекс считался только от
@@ -281,6 +283,82 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def round_view(name: str) -> dict:
+    """Карточка раунда из room.jsonl: жребий, затравка, слепые ответы,
+    витки, свод — дословно, как записано (правило 3), плюс счётчики
+    стадий для кнопок. Отсутствие записи — честное отсутствие поля."""
+    # Тот же путь, что у choir.py: CHOIR_ROOM переопределяет журнал
+    # (тесты, чужая комната) — окно не должно читать не тот файл (deepseek).
+    room = Path(os.environ.get("CHOIR_ROOM") or (CHOIR / "room.jsonl"))
+    recs: list[dict] = []
+    needle = json.dumps(name, ensure_ascii=False)
+    try:
+        with room.open(encoding="utf-8") as f:
+            for line in f:
+                # Дешёвый префильтр: журнал 3 МБ и растёт, а клик —
+                # полный разбор; строки чужих раундов не парсим вовсе.
+                if needle not in line:
+                    continue
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(r, dict) and r.get("round") == name:
+                    recs.append(r)
+    except FileNotFoundError:
+        return {"round": name, "found": False}
+    if not recs:
+        return {"round": name, "found": False}
+    lots = [r for r in recs if r.get("role") == "lot"]
+    seeds = ([r for r in recs if r.get("role") == "seed_expanded"]
+             or [r for r in recs if r.get("role") == "seed"])
+    # Схема 1 писала слепые ответы БЕЗ phase — они слепые (как считает
+    # choir.py; нашли kimi, claude). Аннулированные — вон, как у rebut.
+    annul = {i for r in recs if r.get("role") == "annul"
+             for i in (r.get("ids") or [])}
+    answers = [r for r in recs if r.get("phase", "blind") == "blind"
+               and r.get("role") == "answer" and r.get("id") not in annul]
+    rebuts = [r for r in recs if str(r.get("phase", "")).startswith("rebut")
+              and r.get("role") in ("answer", "pass")
+              and r.get("id") not in annul]
+    summaries = [r for r in recs if r.get("role") == "summary"]
+    lot_sum = [r for r in recs if r.get("role") == "lot_summary"]
+
+    def slim(r: dict) -> dict:
+        return {k: r.get(k) for k in ("id", "ts", "phase", "role", "voice",
+                                      "status", "model", "model_fallback",
+                                      "elapsed_s", "queued_s", "cli", "text",
+                                      "recovered", "error", "detail", "eyes",
+                                      "visibility", "late", "nonblind",
+                                      "channel", "role_declared")
+                if r.get(k) is not None}
+    ok = ("ok", "pass")
+    # Витки считаются, как у cmd_rebut: только ok/pass — виток, где все
+    # упали, дирижёр назовёт тем же номером (нашёл claude).
+    rebut_rounds = sorted({str(r.get("phase")) for r in rebuts
+                           if r.get("status") in ok})
+    last_sum = summaries[-1] if summaries else None
+    try:
+        cap = int(choir.MAX_REBUT_ROUNDS) if CHOIR_OK else 3
+    except Exception:                               # noqa: BLE001
+        cap = 3
+    return {"round": name, "found": True,
+            "conductor": (lots[-1].get("conductor") if lots else None),
+            "summarizer": (lot_sum[-1].get("text") if lot_sum else None),
+            "project": (lots[-1].get("project") if lots else None),
+            "drand_round": (lots[-1].get("drand_round") if lots else None),
+            "seed": (slim(seeds[-1]) if seeds else None),
+            "answers": [slim(r) for r in answers],
+            "n_ok_answers": sum(1 for r in answers if r.get("status") in ok),
+            "rebut_phases": rebut_rounds,
+            "rebuts": len(rebut_rounds),
+            "rebut_cap": cap,
+            "rebut_records": [slim(r) for r in rebuts],
+            "summary": (slim(last_sum) if last_sum else None),
+            "summary_ok": bool(last_sum and last_sum.get("status") == "ok"),
+            "n_records": len(recs)}
+
+
 def feed_append(kind: str, text: str, **extra) -> dict:
     """Дописать событие в ленту — ЧЕРЕЗ live.post, не своим форматом.
 
@@ -330,6 +408,16 @@ def _log_tail(log_path: Path, limit: int = 400) -> str:
             "utf-8", errors="replace")[-limit:].strip()
     except OSError:
         return ""
+
+
+def _act_fields(rec: dict | None) -> dict:
+    """Поля события акта (round/step/auto/voices/project) для финалов —
+    без служебных ключей, которые финал ставит сам."""
+    f = dict((rec or {}).get("fields") or {})
+    for k in ("act_id", "status", "rc", "text",
+              "id", "ts", "author", "kind", "schema", "live"):
+        f.pop(k, None)
+    return f
 
 
 def spawn(cmd: list[str], label: str, voices: list[str],
@@ -393,6 +481,7 @@ def spawn(cmd: list[str], label: str, voices: list[str],
         log.close()
         feed_append("act_status",
                     f"act {act_id} error: {label} — запуск не удался: {e}",
+                    **_act_fields({"fields": fields}),
                     act_id=act_id, status="error", rc=-1)
         return act_id
     # pgid берём СЕЙЧАС, пока процесс заведомо жив. Позже os.getpgid(pid)
@@ -406,7 +495,11 @@ def spawn(cmd: list[str], label: str, voices: list[str],
         RUNNING[act_id] = {**(meta or {}),
                            "label": label, "voices": voices,
                            "since": time.time(), "pid": proc.pid,
-                           "proc": proc, "pgid": os.getpgid(proc.pid)}
+                           "proc": proc, "pgid": os.getpgid(proc.pid),
+                           # Поля события (round, step, auto…) — И В
+                           # ФИНАЛ: карточка раунда вешается на done/error,
+                           # а они шли без round (нашли codex, grok, claude).
+                           "fields": dict(fields or {})}
 
     def reap():
         rc = proc.wait()
@@ -422,14 +515,16 @@ def spawn(cmd: list[str], label: str, voices: list[str],
         try:
             if rc == 0:
                 feed_append("act_status", f"act {act_id} done: {label}",
-                            act_id=act_id, status="done")
+                            act_id=act_id, status="done",
+                            **_act_fields(mine))
             else:
                 tail = _log_tail(log_path)
                 feed_append(
                     "act_status",
                     f"act {act_id} error (rc={rc}): {label}"
                     + (f"\n{tail}" if tail else ""),
-                    act_id=act_id, status="error", rc=rc)
+                    act_id=act_id, status="error", rc=rc,
+                    **_act_fields(mine))
         except Exception as e:              # noqa: BLE001
             # статус не записался — хотя бы след в терминале, не молча
             print(f"act {act_id}: статус не записан: {e}", file=sys.stderr)
@@ -2447,6 +2542,17 @@ class Handler(BaseHTTPRequestHandler):
                              "lot": ({"commit": lot["commit"][:16],
                                       "target": lot["target"],
                                       "conductor": winner} if lot else None)})
+        elif self.path.partition("?")[0] == "/round_view":
+            # Ответы раунда — В ОКНО (наказ Автора 2026-09-03: «ожидаю
+            # увидеть полный ответ и расшифровку каждого голоса, а не
+            # act done»). Читаем room.jsonl, ничего не переписываем и
+            # не копируем в live.jsonl: журнал раунда один, окно —
+            # его читатель.
+            qs = parse_qs(self.path.partition("?")[2])
+            name = (qs.get("name") or [""])[0].strip()
+            if not re.fullmatch(ROUND_RE, name):
+                return self._json(400, {"error": "имя раунда"})
+            return self._json(200, round_view(name))
         elif self.path.partition("?")[0] == "/voices":
             # Карточки голосов: чем отвечает каждый и что о его лимите
             # известно. Лимиты — из кэша (см. limits_now): окно не имеет
@@ -2675,6 +2781,27 @@ class Handler(BaseHTTPRequestHandler):
             # протокол, а монолог.
             raw_rv = req.get("voices")
             rvoices = sorted({v for v in (raw_rv or []) if v in VOICES})
+            # Проект раунда (2026-09-03): без него раунд из окна,
+            # запущенного в Cursor_W, шёл про каталог Choir/ — «первый
+            # боевой вызов» Автора. Та же проверка, что у комнаты.
+            # Ключ есть, но пуст — Автор ОЧИСТИЛ поле: без проекта.
+            # Ключа нет (старый клиент, curl) — проект окна, и это
+            # названо в событии полем project_source (kimi, claude).
+            if "project" in req:
+                rproject = str(req.get("project") or "").strip()
+                psrc = "поле окна" if rproject else "поле очищено"
+            else:
+                rproject = str(PROJECT or "")
+                psrc = "каталог запуска окна (поля в запросе не было)"
+            rp: Path | None = None
+            if rproject:
+                rp = Path(rproject).expanduser()
+                if not rp.is_absolute():
+                    rp = CHOIR / rp
+                rp = rp.resolve()
+                if not rp.is_dir():
+                    return self._json(400, {"error": f"не каталог: {rp}"})
+            pflag = ["--project", str(rp)] if rp else []
             if raw_rv is not None and not rvoices:
                 return self._json(400, {"error": "не выбран ни один голос "
                                         "раунда — отметьте хотя бы двух"})
@@ -2709,7 +2836,8 @@ class Handler(BaseHTTPRequestHandler):
                 # лишний слой кавычек — лишний способ ошибиться.
                 cmd = [sys.executable, "choir.py", "run", "--round", name,
                        "--seed", qfile.name, "--rebuts", str(rebuts),
-                       *(["--voices", ",".join(rvoices)] if rvoices else [])]
+                       *(["--voices", ",".join(rvoices)] if rvoices else []),
+                       *pflag]
                 label = f"round: {name} [авто, витков: {rebuts}]"
                 note = (f"АВТОПРОГОН: такт идёт сам — pick → expand → ask → "
                         f"rebut ×{rebuts} → summarize, без остановки на "
@@ -2724,8 +2852,11 @@ class Handler(BaseHTTPRequestHandler):
                 # уже выбран жребием среди названных).
                 vs = (" --voices " + shlex.quote(",".join(rvoices))
                       if rvoices else "")
+                # --project только у pick: он пишет проект в запись
+                # жребия, остальные фазы читают его оттуда (choir.py).
+                pj = (" --project " + shlex.quote(str(rp))) if rp else ""
                 cmd = ["bash", "-c",
-                       f"{py} choir.py pick --round {rn} --seed {seed}{vs} && "
+                       f"{py} choir.py pick --round {rn} --seed {seed}{vs}{pj} && "
                        f"{py} choir.py expand --round {rn} --seed {seed} && "
                        f"{py} choir.py ask --round {rn} --seed {zt}{vs}"]
                 label = f"round: {name}"
@@ -2742,6 +2873,9 @@ class Handler(BaseHTTPRequestHandler):
                 fields["rebuts"] = rebuts
             if rvoices:
                 fields["voices"] = rvoices
+            if rp:
+                fields["project"] = str(rp)
+                fields["project_source"] = psrc
             # Краткость — та же опция, что и в комнате: choir.py читает
             # CHOIR_BRIEF при импорте и подставляет жёсткие рамки в
             # затравку и свод. Умолчание — полный вывод.
@@ -3076,7 +3210,8 @@ class Handler(BaseHTTPRequestHandler):
                                 f"act {aid} {'done' if rc == 0 else 'error'} "
                                 f"(успел до «прервать всё»): {t['label']}",
                                 act_id=aid,
-                                status="done" if rc == 0 else "error", rc=rc)
+                                status="done" if rc == 0 else "error", rc=rc,
+                                **_act_fields(t))
                     finished.append(aid)
                     continue
                 rnd = t.get("round")
@@ -3124,7 +3259,8 @@ class Handler(BaseHTTPRequestHandler):
                     feed_append("act_status",
                                 f"act {aid} done (успел завершиться, пока "
                                 f"шло «прервать всё»): {t['label']}",
-                                act_id=aid, status="done", rc=0)
+                                act_id=aid, status="done", rc=0,
+                                **_act_fields(t))
                     finished.append(aid)
                     continue
                 if rc is not None and not killed:
@@ -3137,7 +3273,8 @@ class Handler(BaseHTTPRequestHandler):
                     feed_append("act_status",
                                 f"act {aid} error (rc={rc}, упал сам, "
                                 f"пока шло «прервать всё»): {t['label']}",
-                                act_id=aid, status="error", rc=rc)
+                                act_id=aid, status="error", rc=rc,
+                                **_act_fields(t))
                     finished.append(aid)
                     continue
                 feed_append(
@@ -3438,6 +3575,77 @@ class Handler(BaseHTTPRequestHandler):
                             "целиком, и в ленте отказ будет выглядеть его "
                             "свойством. Проверьте первым же ходом."
                             if unverified else "")})
+
+        if self.path == "/round_step":
+            # Шаги раунда ПО ЧЕЛОВЕКУ: без галочки «авто» такт стоит
+            # после слепой фазы, а rebut и summarize запускались только
+            # руками из терминала. Теперь — кнопки карточки раунда.
+            name = (req.get("name") or "").strip()
+            step = (req.get("step") or "").strip()
+            if not re.fullmatch(ROUND_RE, name):
+                return self._json(400, {"error": "имя раунда"})
+            if step not in ("rebut", "summarize"):
+                return self._json(400, {"error": "step: rebut или summarize"})
+            brief = bool(req.get("brief"))
+            view = round_view(name)
+            if not view.get("conductor"):
+                return self._json(409, {"error": "у раунда нет жребия — "
+                                        "сначала «Раунд стола»"})
+            if not view.get("n_ok_answers"):
+                return self._json(409, {"error": "слепой фазы ещё нет — "
+                                        "нечего критиковать и сводить"})
+            if view.get("summary_ok"):
+                # Повторный свод — второй платный вызов и вторая запись
+                # role=summary; виток после свода ломает порядок такта
+                # (нашли grok, kimi).
+                return self._json(409, {"error": "свод уже есть — раунд "
+                                        "закрыт"})
+            if step == "rebut" and view.get("rebuts", 0) >= view.get(
+                    "rebut_cap", 3):
+                return self._json(409, {"error": f"{view.get('rebut_cap', 3)} "
+                                        "витка — потолок (правило 12)"})
+            # Занятость — по ПЛОСКОЙ записи RUNNING (meta разложен
+            # спавном; ключа «meta» нет — та же ошибка уже ловилась у
+            # автопрогона) и РЕЗЕРВ имени под замком до spawn: два
+            # параллельных POST иначе оба проходили проверку (нашли
+            # codex, grok, kimi, claude).
+            with RUN_LOCK:
+                busy = [aid for aid, t in RUNNING.items()
+                        if t.get("round") == name]
+                if not busy and name in _ROUND_RESERVED:
+                    busy = ["резерв"]
+                if not busy:
+                    _ROUND_RESERVED.add(name)
+            if busy:
+                return self._json(409, {"error": f"раунд {name} уже идёт "
+                                        f"(акт {busy[0]})"})
+            try:
+                # --by не шлём: choir.py сам берёт запасной жребий
+                # (lot_summary) или ведущего — окно не решает, кто сводит.
+                cmd = [sys.executable, "choir.py", step, "--round", name]
+                who = view.get("summarizer") or view["conductor"]
+                label = (f"round: {name} [виток критики "
+                         f"№{view.get('rebuts', 0) + 1}]" if step == "rebut"
+                         else f"round: {name} [свод: {who}]")
+                # detach=True: при закрытии окна шаг не убивается, а
+                # дописывает оплаченный вызов, как автопрогон (субагент);
+                # не auto — иначе кнопка «Стоп» обещала бы остановку, а
+                # rebut/summarize флаг-стоп не читают. brief — та же
+                # опция, что у раунда.
+                act = spawn(cmd, label, VOICES, cwd=CHOIR,
+                            meta={"round": name, "step": step,
+                                  "detach": True},
+                            env_extra={"CHOIR_BRIEF": "1"} if brief else None,
+                            note=("виток открытой критики: каждый читает "
+                                  "чужие ответы под анонимными метками"
+                                  if step == "rebut" else
+                                  "свод по жребию (запасной жребий, если "
+                                  "был); расхождения — отдельным разделом"),
+                            fields={"round": name, "step": step})
+            finally:
+                with RUN_LOCK:
+                    _ROUND_RESERVED.discard(name)
+            return self._json(200, {"act": act, "step": step, "by": who})
 
         if self.path == "/models_refresh":
             # Кнопка ⟳ окна (наказ Автора 2026-09-02): разведка списков
@@ -3771,6 +3979,16 @@ margin-top:.3rem;padding-top:.3rem;max-height:9rem;overflow-y:auto}
 .actrow{padding:.14rem 0;border-bottom:1px dashed var(--rule)}
 .actrow button{font-size:.7rem;padding:0 .45rem;margin-left:.3rem}
 #coderblk{border-left:2px solid var(--acc);padding-left:.45rem;margin-top:.5rem}
+/* Карточка раунда под act_status: ответы голосов дословно из room.jsonl
+   (наказ Автора 2026-09-03: «ожидаю увидеть полный ответ и расшифровку
+   каждого голоса»). Свёрнута по умолчанию — лента не тонет в 40К символов. */
+.rcard{margin:.3rem 0 .2rem 1.2rem;border-left:2px solid var(--acc);padding:.25rem .5rem;font-size:.9rem}
+.rcard button{font-size:.72rem;padding:.05rem .5rem;margin-right:.3rem}
+.rcard details{margin:.25rem 0}
+.rcard summary{cursor:pointer;color:var(--dim)}
+.rcard pre{white-space:pre-wrap;word-break:break-word;margin:.2rem 0 .4rem;
+font:.84rem/1.35 ui-sans-serif,system-ui,sans-serif;max-height:28rem;overflow:auto}
+.rcard .rstat{font:.74rem ui-monospace,monospace;color:var(--dim)}
 /* Блок кодера живёт в УЗКОЙ правой панели: ряды переносятся, иначе
    селектор исполнителя вылезал за край (наказ Автора 2026-09-02:
    «кнопочки правки — во вкладку Кодер, ниже Бросить/Раскрыть»). */
@@ -4073,6 +4291,98 @@ function tsView(raw){
     full:'местное: '+day+' '+hms+' '+zone+'\nв журнале (UTC): '+utc+
          '\nсырое поле ts: '+String(raw)};
 }
+// ── КАРТОЧКА РАУНДА ─────────────────────────────────────────────────
+// Под событием act_status раунда (done/error) — кнопка «ответы»; по
+// клику окно читает GET /round_view и рисует дословно: затравка, слепые
+// ответы каждого голоса, витки, свод. Кнопки «Виток критики» и «Свод»
+// — шаги такта по человеку (POST /round_step), раньше они были только
+// в терминале. Карточка одна на раунд: последнее событие её обновляет.
+const RCARDS={};
+function roundCard(host,name){
+  let box=RCARDS[name];
+  if(!box){
+    box=document.createElement('div');box.className='rcard';
+    box.dataset.round=name;RCARDS[name]=box;
+  }
+  host.appendChild(box);   // переезжает под самое свежее событие раунда
+  // Раунд шагнул дальше — открытая карточка перечитывается сама.
+  if(box.querySelector('.rbody'))loadRound(name,box);
+  if(!box.dataset.built){
+    box.dataset.built='1';
+    const b=document.createElement('button');
+    b.textContent='ответы раунда «'+name+'»';
+    b.title='Показать затравку, слепые ответы каждого голоса, витки критики и свод — дословно из room.jsonl';
+    b.onclick=function(){loadRound(name,box)};
+    box.appendChild(b);
+    const st=document.createElement('span');st.className='rstat';box.appendChild(st);
+  }
+  return box;
+}
+function rline(label,rec){
+  const d=document.createElement('details');
+  const sm=document.createElement('summary');
+  const meta=[rec.voice||'',rec.status||'',rec.model?('модель '+rec.model+(rec.model_fallback?' (запасная)':'')):'',
+    (rec.elapsed_s!=null)?(Math.round(rec.elapsed_s)+' с'):'',
+    (rec.text?(rec.text.length+' симв.'):''),rec.recovered?'восстановлено из истории CLI':'',
+    // Пометки журнала — не снимать: опоздавший ответ добран после
+    // раскрытия и слепым не является (правила 4 и 8.5; субагент).
+    rec.nonblind?'НЕСЛЕПОЙ (добран после раскрытия)':'',rec.late&&!rec.nonblind?'поздний':''].filter(Boolean);
+  sm.textContent=label+': '+meta.join(' · ');
+  d.appendChild(sm);
+  const pre=document.createElement('pre');
+  // Отказ канала choir.py пишет в detail (правило 4): quota/stalled
+  // иначе выглядели пустым ответом (нашли grok, codex).
+  pre.textContent=rec.text||rec.detail||rec.error||'(пусто)';
+  d.appendChild(pre);
+  return d;
+}
+async function loadRound(name,box){
+  const st=box.querySelector('.rstat');st.textContent=' загружаю…';
+  let r,j={};
+  try{r=await fetch('/round_view?name='+encodeURIComponent(name));j=await r.json();}
+  catch(e){st.textContent=' сервер не ответил: '+e;return}
+  if(!r.ok||!j.found){st.textContent=' '+((j&&j.error)||'записей раунда нет');return}
+  st.textContent='';
+  let body=box.querySelector('.rbody');
+  if(!body){body=document.createElement('div');body.className='rbody';box.appendChild(body)}
+  body.innerHTML='';
+  const head=document.createElement('div');head.className='rstat';
+  head.textContent='ведущий: '+(j.conductor||'нет жребия')+' · ответов: '+(j.n_ok_answers||0)+
+    ' из '+j.answers.length+' · витков: '+j.rebuts+' из '+(j.rebut_cap||3)+
+    ' · свод: '+(j.summary_ok?'есть':(j.summary?'не удался':'нет'))+
+    (j.summarizer?' · сводит: '+j.summarizer:'')+(j.project?' · проект: '+j.project:'');
+  body.appendChild(head);
+  if(j.seed)body.appendChild(rline('затравка ('+(j.seed.voice||'')+')',j.seed));
+  j.answers.forEach(function(a){body.appendChild(rline('слепой ответ',a))});
+  (j.rebut_records||[]).forEach(function(a){body.appendChild(rline('виток '+(a.phase||''),a))});
+  if(j.summary)body.appendChild(rline('свод ('+(j.summary.voice||'')+')',j.summary));
+  // шаги по человеку — кнопка есть только там, где шаг легален
+  const row=document.createElement('div');
+  function stepBtn(label,step,confirmText){
+    const b=document.createElement('button');b.textContent=label;
+    b.onclick=async function(){
+      if(!confirm(confirmText))return;
+      b.disabled=true;
+      let rr,jj={};
+      try{rr=await fetch('/round_step',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({name:name,step:step,brief:briefOn()})});jj=await rr.json();}
+      catch(e){b.disabled=false;return acterr('сервер не ответил: '+e)}
+      if(!rr.ok){b.disabled=false;return acterr((jj&&jj.error)||('ошибка '+rr.status))}
+      // Кнопки гаснут до финала акта: карточка перечитается по событию.
+      row.querySelectorAll('button').forEach(function(x){x.disabled=true});
+      acterr('шаг «'+step+'» раунда '+name+' запущен: акт '+jj.act,true);
+    };
+    row.appendChild(b);
+  }
+  const who=j.summarizer||j.conductor;
+  if(j.conductor&&j.n_ok_answers&&j.rebuts<(j.rebut_cap||3)&&!j.summary_ok)
+    stepBtn('Виток критики №'+(j.rebuts+1),'rebut','Виток открытой критики раунда «'+name+
+      '»: каждый голос читает чужие ответы под анонимными метками. Все голоса, платно. Пускаем?');
+  if(j.conductor&&j.n_ok_answers&&!j.summary_ok)
+    stepBtn('Свод ('+who+')','summarize','Свод раунда «'+name+'» пишет '+who+
+      (j.summarizer?' (запасной жребий)':' (ведущий по жребию)')+'. Один вызов, платно. Пускаем?');
+  body.appendChild(row);
+}
 function add(ev){
   if(ev.id&&seen.has(ev.id))return; if(ev.id)seen.add(ev.id);
   const el=document.createElement('div');
@@ -4098,6 +4408,13 @@ function add(ev){
   const tsEl=el.querySelector('.ts'); if(tsEl)tsEl.title=tv.full;
   const stick=feed.scrollHeight-feed.scrollTop-feed.clientHeight<60;
   feed.appendChild(el); if(stick)feed.scrollTop=feed.scrollHeight;
+  // Раунд: под его завершающим событием — карточка с ответами.
+  // Любое событие с полем round (act_status любого статуса, note о
+  // раунде, запущенном из терминала) — карточка переезжает под него:
+  // ответы можно открыть уже во время слепой фазы, по мере прихода.
+  try{
+    if(ev.round&&(k==='act_status'||k==='note'))roundCard(el,String(ev.round));
+  }catch(_){}
 }
 // ── звонок «как у микроволновки» (просьба Автора 2026-08-25) ─────────
 // Три коротких синусовых «дзынь» на завершение действия. BOOT-порог —
@@ -5329,7 +5646,8 @@ document.getElementById('round').onclick=async()=>{
       ' — платно. Пускаем?'))return;
   const r=await fetch('/round',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({question,name,auto,rebuts,brief:briefOn(),
-                         voices:rvoices})});
+                         voices:rvoices,
+                         project:document.getElementById('project').value.trim()})});
   if(r.ok)msg.value='';
   else alert((await r.json()).error||'ошибка');
 };
@@ -5658,14 +5976,16 @@ def main(argv: list[str] | None = None) -> int:
                 # записи нет вовсе, значит detach автопрогона не работал
                 # никогда: такт уходил в interrupted и killpg, стирая
                 # оплаченные ответы (нашли grok и kimi в живой ленте).
-                auto_round = t.get("auto") and t.get("round")
+                # detach — ручной шаг раунда (rebut/summarize): не убивать,
+                # дописать оплаченный вызов, как и автопрогон.
+                auto_round = (t.get("auto") or t.get("detach")) and t.get("round")
                 if auto_round:
                     feed_append(
                         "act_status",
                         f"act {aid}: окно закрыто, но автопрогон "
                         f"«{auto_round}» продолжается — выставлен "
                         f"флаг-стоп, дирижёр закончит текущий шаг",
-                        act_id=aid, status="detached")
+                        act_id=aid, status="detached", **_act_fields(t))
                 else:
                     # Спросить процесс, прежде чем объявлять ход
                     # несостоявшимся: он мог успеть завершиться, и
@@ -5678,12 +5998,14 @@ def main(argv: list[str] | None = None) -> int:
                         feed_append("act_status",
                                     f"act {aid} done (успел до закрытия "
                                     f"окна): {t['label']}",
-                                    act_id=aid, status="done", rc=0)
+                                    act_id=aid, status="done", rc=0,
+                                    **_act_fields(t))
                     elif rc is not None:
                         feed_append("act_status",
                                     f"act {aid} error (rc={rc}, окно "
                                     f"закрыто): {t['label']}",
-                                    act_id=aid, status="error", rc=rc)
+                                    act_id=aid, status="error", rc=rc,
+                                    **_act_fields(t))
                     else:
                         # Ход действительно не завершился. Но частичные
                         # результаты могли попасть в ленту (голос успел
@@ -5695,7 +6017,8 @@ def main(argv: list[str] | None = None) -> int:
                             f"act {aid} прерван: окно закрыто во время "
                             f"хода — {t['label']}; частичные результаты "
                             f"могли попасть в ленту выше",
-                            act_id=aid, status="interrupted")
+                            act_id=aid, status="interrupted",
+                            **_act_fields(t))
             except Exception as e:                  # noqa: BLE001
                 print(f"act {aid}: статус не записан: {e}", file=sys.stderr)
         for aid, t in unfinished:

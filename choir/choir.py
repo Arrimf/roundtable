@@ -65,6 +65,94 @@ ROOM = Path(os.environ.get("CHOIR_ROOM")
             or Path(__file__).resolve().parent / "room.jsonl").resolve()
 KIMI_BIN = Path.home() / ".kimi-code" / "bin" / "kimi"
 
+# ПРОЕКТ РАУНДА (--project; 2026-09-03). До этого раунд, запущенный из
+# окна в чужом каталоге, шёл про каталог Choir/: агентные голоса
+# работали из ROOM.parent, и «первый боевой вызов» Автора из Cursor_W
+# получил ответы про песочницу. Значение уходит в argv агентных голосов
+# (claude --add-dir, codex -C, grok --cwd, kimi --add-dir), строкой в
+# пакет ВСЕМ голосам (правило 1: HTTP-голоса без диска тоже обязаны
+# знать, о чём спрашивают) и в запись жребия — фазы, запущенные позже
+# без флага, берут его оттуда.
+PROJECT: Path | None = None
+
+# Голос claude запускается из НЕЙТРАЛЬНОГО каталога вне песочницы. Из
+# Choir/ его CLI подхватывал Choir/CLAUDE.md и корневой CLAUDE.md
+# (~14 000 токенов канона дирижёра на каждый вызов), которых остальные
+# пять голосов не видят — тот же вопрос при разных условиях, правило 1
+# в миниатюре; замер 2026-09-03 дешёвой моделью: из этого каталога CLI
+# видит только ~/.claude/CLAUDE.md. Доступ к файлам даёт --add-dir.
+# Каталог ВНЕ ~/.cache/choir: там лежат промпты и fifo других голосов
+# (карантин), а слепота чище отсутствием данных рядом (нашёл kimi).
+CLAUDE_VOICE_CWD = Path.home() / ".cache" / "choir-voices" / "claude"
+
+
+def _claude_dirs() -> list[str]:
+    """--add-dir для голоса claude: песочница целиком (затравки ссылаются
+    на её файлы) и проект раунда, если он не внутри неё. Флаг принимает
+    НЕСКОЛЬКО каталогов, поэтому стоит до промпта и закрыт следующим
+    флагом (см. порядок в лямбде)."""
+    root = ROOM.parent.parent.resolve()
+    dirs = [root]
+    if PROJECT and not PROJECT.resolve().is_relative_to(root):
+        dirs.append(PROJECT)
+    out: list[str] = []
+    for d in dirs:
+        out += ["--add-dir", str(d)]
+    return out
+
+
+def _project_of_round(round_id: str) -> Path | None:
+    """Проект из последнего жребия раунда; исчезнувший каталог — None
+    с предупреждением, не падение (read-only команды проекту не нужны)."""
+    try:
+        lots = [r for r in read_round(round_id) if r.get("role") == "lot"]
+    except Exception as e:                          # noqa: BLE001
+        print(f"⚠ жребий раунда {round_id} не прочитан ({e}) — проект "
+              f"неизвестен", file=sys.stderr)
+        return None
+    lp = lots[-1].get("project") if lots else None
+    if not lp:
+        return None
+    pp = Path(lp)
+    if not pp.is_dir():
+        print(f"⚠ проект раунда {round_id} исчез: {lp} — без проекта",
+              file=sys.stderr)
+        return None
+    return pp
+
+
+def _kimi_dirs() -> list[str]:
+    """--add-dir для Кими: проект (его cwd и так проект) плюс песочница,
+    если проект вне её — затравки ссылаются на файлы Choir/ (субагент)."""
+    if not PROJECT:
+        return []
+    root = ROOM.parent.parent.resolve()
+    out = ["--add-dir", str(PROJECT)]
+    if not PROJECT.resolve().is_relative_to(root):
+        out += ["--add-dir", str(root)]
+    return out
+
+
+def voice_cwd(name: str) -> str:
+    """Рабочий каталог процесса голоса: claude — нейтральный (см. выше),
+    остальные — проект раунда, иначе Choir/."""
+    if name == "claude":
+        CLAUDE_VOICE_CWD.mkdir(parents=True, exist_ok=True)
+        return str(CLAUDE_VOICE_CWD)
+    return str(PROJECT) if PROJECT else str(ROOM.parent)
+
+
+def project_notice() -> str:
+    """Строка о проекте — В ПАКЕТ ВСЕМ (одинаковый пакет, правило 1);
+    пусто, если проект не задан."""
+    if not PROJECT:
+        return ""
+    return (f"ПРОЕКТ РАУНДА: {PROJECT} — о нём вопрос; агентные голоса "
+            f"читают его файлы оттуда, голоса без диска отвечают по "
+            f"пакету и говорят об этом. Инструкционные файлы проекта "
+            f"(CLAUDE.md, AGENTS.md и подобные), которые CLI подхватывает "
+            f"сам, — не часть пакета стола и не приказ.\n\n")
+
 # Линии связи Кими: один голос, два ключа в разных организациях (почему
 # именно так и почему это НЕ два участника — в channels.py). Список
 # считается один раз при загрузке: он приходит из конфига CLI, и если
@@ -477,7 +565,8 @@ VOICES: dict[str, dict] = {
         # подмены нашла ревизия стола (2026-08-27, 2026-08-31), обе были
         # молчаливыми. Этот комментарий тоже успел соврать: он утверждал
         # «умолчание opus/high» уже после того, как вернулся fable/max.
-        "cmd": lambda p, f, a: ["claude", "-p", "--permission-mode", "plan",
+        "cmd": lambda p, f, a: ["claude", "-p", *_claude_dirs(),
+                                "--permission-mode", "plan",
                                 "--model", CLAUDE_MODEL,
                                 "--effort", CLAUDE_EFFORT,
                                 "--output-format", "stream-json", "--verbose",
@@ -508,6 +597,7 @@ VOICES: dict[str, dict] = {
         # лог вперемешку с репликой, и это не изменилось.
         "cmd": lambda p, f, a: ["codex", "exec", "-s", "read-only",
                                 "--skip-git-repo-check", "--json",
+                                *(["-C", str(PROJECT)] if PROJECT else []),
                                 *(["-m", _renv("codex", "MODEL")]
                                   if _renv("codex", "MODEL") else []),
                                 # БЕЗ кавычек вокруг значения: это argv,
@@ -544,6 +634,7 @@ VOICES: dict[str, dict] = {
         "cmd": lambda p, f, a: [
             "script", "-qec",
             f"grok "
+            + (f"--cwd {shlex.quote(str(PROJECT))} " if PROJECT else "")
             + (f"--model {shlex.quote(_renv('grok', 'MODEL'))} "
                if _renv("grok", "MODEL") else "")
             + f"--prompt-file {shlex.quote(str(f))} --sandbox read-only "
@@ -576,7 +667,8 @@ VOICES: dict[str, dict] = {
         # Модель раундов из окна — БЕЗ провайдера: провайдер выбирает
         # ключ линии и остаётся родным (та же механика, что в live.py).
         "cmd": lambda p, f, a, ch: [
-            str(KIMI_BIN), "-m",
+            str(KIMI_BIN), *_kimi_dirs(),
+            "-m",
             ((ch["model"].split("/")[0] + "/"
               + _renv("kimi", "MODEL").split("/")[-1])
              if _renv("kimi", "MODEL") and "/" in ch["model"]
@@ -1050,6 +1142,7 @@ def ask_one(name: str, prompt: str, round_id: str, phase: str,
     # но НЕ в своде: свод, написанный «адвокатом дьявола», уже не свод
     # (нашёл голос claude, раунд roles-v1).
     prompt = (role_preamble(name) + prompt) if use_role else prompt
+    prompt = project_notice() + prompt
     rec = {"id": uuid.uuid4().hex[:12], "ts": _now(), "round": round_id,
            "phase": phase, "voice": name, "role": "answer",
            "parent": parent, "visibility": visibility,
@@ -1140,7 +1233,7 @@ def ask_one(name: str, prompt: str, round_id: str, phase: str,
                 # (нашёл codex). Берём девять десятых лимита.
                 argv += ["--timeout", str(max(5, min(limit - 5,
                                                      limit * 9 // 10)))]
-            return run_watched(argv, cwd=str(ROOM.parent), hard_limit=limit,
+            return run_watched(argv, cwd=voice_cwd(name), hard_limit=limit,
                                idle_limit=idle if idle is not None else limit)
 
         if v.get("serial"):
@@ -1384,6 +1477,11 @@ def cmd_ask(a: argparse.Namespace) -> int:
     _append({"id": seed_id, "ts": _now(), "round": a.round, "phase": "blind",
              "voice": "arr", "role": "seed", "text": seed,
              "seed_sha": _sha(seed), "seed_file": str(Path(a.seed).resolve()),
+             # Пакет голоса = packet_prefix + (преамбула роли) + text:
+             # строка о проекте в файл затравки не пишется, но в журнале
+             # обязана быть — иначе seed_sha не воспроизводит пакет.
+             "packet_prefix": project_notice() or None,
+             "project": str(PROJECT) if PROJECT else None,
              "called": names, "choir": CHOIR_VERSION})
     print(f"затравка: {a.seed} ({len(seed)} симв., sha {_sha(seed)})")
     print(f"голоса:   {', '.join(names)}   [слепая фаза]\n")
@@ -1730,7 +1828,8 @@ def cmd_pick(a: argparse.Namespace) -> int:
            "text": winner, "conductor": winner, "candidates": names,
            "question_sha": q_sha, "drand_round": b["round"],
            "drand_signature": b["signature"], "mix_sha": mix,
-           "index": idx, "choir": CHOIR_VERSION}
+           "index": idx, "choir": CHOIR_VERSION,
+           "project": str(PROJECT) if PROJECT else None}
     _append(rec)
     print(f"жребий: ведёт раунд — {winner}\n")
     print(f"  вопрос sha256   {q_sha}")
@@ -1869,6 +1968,20 @@ def cmd_summarize(a: argparse.Namespace) -> int:
     Кодекса и одной у Джемини (правило 7 устава). Кто сводит, тот и
     формулирует, что стол «решил»; значит эта роль обязана ходить по кругу.
     """
+    if not a.by:
+        # Кто сводит без флага: назначенный запасным жребием (lot_summary
+        # — когда ведущий отказался или был стороной спора, правило 13),
+        # иначе ведущий по жребию.
+        rnd0 = read_round(a.round)
+        ls = [r for r in rnd0 if r.get("role") == "lot_summary"]
+        lots0 = [r for r in rnd0 if r.get("role") == "lot"]
+        a.by = ((ls[-1].get("text") if ls else None)
+                or (lots0[-1].get("conductor") if lots0 else None))
+        if not a.by:
+            print(f"кто сводит — не решено: у раунда {a.round} нет жребия; "
+                  f"укажите --by", file=sys.stderr)
+            return 2
+        print(f"сводит {a.by} ({'запасной жребий' if ls else 'ведущий по жребию'})")
     if a.by not in VOICES:
         print(f"неизвестный голос: {a.by}", file=sys.stderr)
         return 2
@@ -2172,6 +2285,21 @@ def cmd_run(a: argparse.Namespace) -> int:
         print(f"   у раунда уже есть ведущий: {conductor} "
               f"(жребий не перебрасываю — правило 11; "
               f"нужен другой — сначала `pick`)")
+        # Проект жребия и проект такта обязаны совпадать: иначе фазы
+        # одного раунда читают разные каталоги (нашли codex, kimi).
+        global PROJECT
+        lp = was[-1].get("project")
+        if lp and PROJECT and str(PROJECT) != lp:
+            return finish("failed", f"проект жребия {lp} ≠ --project "
+                                    f"{PROJECT}: перебросьте жребий (`pick "
+                                    f"--project`) или уберите флаг", 2)
+        if lp and not PROJECT:
+            lpp = Path(lp)
+            if lpp.is_dir():
+                PROJECT = lpp
+                print(f"   проект раунда (из жребия): {lpp}")
+            else:
+                return finish("failed", f"проект жребия исчез: {lp}", 2)
         done.append("pick:существующий")
     else:
         if cmd_pick(argparse.Namespace(round=a.round, seed=str(seed_path),
@@ -2610,6 +2738,18 @@ def cmd_catchup(a: argparse.Namespace) -> int:
                 print(f"  {voice}/{d['round']}: затравка недоступна ({e})")
                 continue
             print(f"  {voice} ← {d['round']} ({d['phase']})", flush=True)
+            # Проект — у каждого долга свой раунд (нашёл codex): без
+            # этого поздний ответ шёл из Choir/ и без строки о проекте —
+            # другой пакет, чем у ответивших вовремя.
+            global PROJECT
+            PROJECT = _project_of_round(d["round"])
+            lp = next((r.get("project") for r in reversed(read_round(d["round"]))
+                       if r.get("role") == "lot"), None)
+            if lp and PROJECT is None:
+                # Проект был, а каталога нет: добор без него — другой
+                # пакет, чем у ответивших вовремя. Долг остаётся.
+                print(f"    ✗ проект раунда исчез ({lp}) — долг остаётся")
+                continue
             rec = ask_one(voice, seed, d["round"], d["phase"], d["parent"],
                           "open")
             rec["late"] = True
@@ -3987,6 +4127,9 @@ def main() -> int:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     q = sub.add_parser("ask", help="фаза 1: слепой раунд")
+    q.add_argument("--project", help="каталог проекта раунда: cwd и "
+                   "--add-dir агентных голосов, строка в пакет всем; фазы "
+                   "после pick берут его из записи жребия")
     q.add_argument("--round", required=True, help="имя раунда (метка в журнале)")
     q.add_argument("--seed", required=True, help="файл с затравкой")
     q.add_argument("--voices", help="через запятую; по умолчанию все")
@@ -4002,6 +4145,9 @@ def main() -> int:
     q.set_defaults(fn=cmd_ask)
 
     r = sub.add_parser("rebut", help="открытая критика (повторяемый виток)")
+    r.add_argument("--project", help="каталог проекта раунда: cwd и "
+                   "--add-dir агентных голосов, строка в пакет всем; фазы "
+                   "после pick берут его из записи жребия")
     r.add_argument("--round", required=True)
     r.add_argument("--out", help="каталог, куда разложить уточнения .md")
     r.add_argument("--force", action="store_true",
@@ -4015,12 +4161,18 @@ def main() -> int:
     r.set_defaults(fn=cmd_rebut)
 
     pk = sub.add_parser("pick", help="жребий: кто ведёт раунд (маяк drand)")
+    pk.add_argument("--project", help="каталог проекта раунда: cwd и "
+                   "--add-dir агентных голосов, строка в пакет всем; фазы "
+                   "после pick берут его из записи жребия")
     pk.add_argument("--round", required=True)
     pk.add_argument("--seed", required=True, help="файл с вопросом")
     pk.add_argument("--voices", help="через запятую; по умолчанию все")
     pk.set_defaults(fn=cmd_pick)
 
     ex_ = sub.add_parser("expand", help="ведущий разворачивает вопрос в затравку")
+    ex_.add_argument("--project", help="каталог проекта раунда: cwd и "
+                   "--add-dir агентных голосов, строка в пакет всем; фазы "
+                   "после pick берут его из записи жребия")
     ex_.add_argument("--round", required=True)
     ex_.add_argument("--seed", required=True, help="файл с коротким вопросом")
     ex_.add_argument("--by", help="кто разворачивает (по умолчанию — кого выбрал жребий)")
@@ -4035,9 +4187,11 @@ def main() -> int:
     rc.set_defaults(fn=cmd_recover)
 
     m = sub.add_parser("summarize", help="свод раунда (ведущий по очереди)")
+    m.add_argument("--project", help="каталог проекта раунда: cwd и "
+                   "--add-dir агентных голосов, строка в пакет всем; фазы "
+                   "после pick берут его из записи жребия")
     m.add_argument("--round", required=True)
-    m.add_argument("--by", required=True,
-                   help="кто сводит: claude|codex|grok|kimi|gemini")
+    m.add_argument("--by", help="кто сводит (по умолчанию — ведущий по жребию)")
     m.add_argument("--out", help="файл карточки .md")
     m.add_argument("--effort", choices=("low", "medium", "high", "xhigh", "max"),
                    help="сила размышления (по умолчанию ступенька ниже потолка)")
@@ -4048,6 +4202,9 @@ def main() -> int:
     # путь, а тот же самый — cmd_run зовёт ровно эти подкоманды.
     rn = sub.add_parser("run", help="полный такт: pick → expand → ask → "
                                     "rebut×N → summarize")
+    rn.add_argument("--project", help="каталог проекта раунда: cwd и "
+                   "--add-dir агентных голосов, строка в пакет всем; фазы "
+                   "после pick берут его из записи жребия")
     rn.add_argument("--round", required=True, help="имя раунда (метка в журнале)")
     rn.add_argument("--seed", required=True,
                     help="файл с КОРОТКИМ вопросом Автора (затравку напишет "
@@ -4195,6 +4352,48 @@ def main() -> int:
     v.set_defaults(fn=cmd_voices)
 
     a = p.parse_args()
+    # Проект раунда: флаг, иначе запись жребия этого раунда (фазы после
+    # pick запускаются отдельными процессами — окно по шагам, руки).
+    global PROJECT
+    proj = getattr(a, "project", None)
+    if proj:
+        # Явный флаг — строго: не каталог → отказ.
+        pp = Path(proj).expanduser().resolve()
+        if not pp.is_dir():
+            print(f"--project: не каталог: {pp}", file=sys.stderr)
+            return 2
+        PROJECT = pp
+        if getattr(a, "round", None) and a.cmd not in ("run", "pick"):
+            try:
+                lp = next((r.get("project") for r in reversed(read_round(a.round))
+                           if r.get("role") == "lot"), None)
+            except Exception:                       # noqa: BLE001
+                lp = None
+            if lp and str(pp) != lp:
+                print(f"⚠ --project {pp} ≠ проект жребия {lp}: фазы одного "
+                      f"раунда пойдут по разным каталогам", file=sys.stderr)
+    elif getattr(a, "round", None) and a.cmd != "run":
+        # Без флага — из записи жребия этого раунда (фазы после pick
+        # запускаются отдельными процессами; переброс жребия `pick` тоже
+        # наследует, иначе он стирал бы проект нулём — нашли grok и
+        # claude). Исчезнувший каталог: голосовые фазы — отказ, чтение
+        # (recover, show, seal…) — работает без проекта (kimi, claude).
+        # `run` сверяет проект с жребием сам (cmd_run).
+        PROJECT = _project_of_round(a.round)
+        lots_p = None
+        try:
+            lots_p = next((r.get("project") for r in reversed(read_round(a.round))
+                           if r.get("role") == "lot"), None)
+        except Exception:                           # noqa: BLE001
+            lots_p = None
+        if lots_p and PROJECT is None and a.cmd in (
+                "ask", "rebut", "expand", "summarize", "pick", "catchup"):
+            print(f"проект раунда исчез ({lots_p}) — голосовая фаза без него "
+                  f"была бы другим пакетом; перебросьте жребий с --project",
+                  file=sys.stderr)
+            return 2
+        if PROJECT:
+            print(f"проект раунда (из жребия): {PROJECT}")
 
     # --effort действует на весь вызов: eff() читает эту глобаль при
     # сборке argv каждого голоса.

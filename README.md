@@ -42,7 +42,14 @@ one CLI that insists on writing its answer to a path is given a named
 pipe, so the bytes never rest on disk — blindness by absence of data,
 not by a promise not to look); up to
 three rebuttal rounds; a summary that must name where the voices
-*disagreed* — disagreement is the product, not a defect.
+*disagreed* — disagreement is the product, not a defect. The window
+shows every round as a card under its feed event: the seed, each
+voice's blind answer verbatim, the rebuttal rounds and the summary,
+with buttons to run the next rebuttal or the summary by hand when the
+round was started step by step. A round started from a project
+directory carries that project to every voice (`--project`), and the
+`claude` voice runs from a neutral directory so that it sees exactly
+the packet the others see — not the conductor's own instruction files.
 
 **The executor's chair** (`edits.py`, `executor_run.py`) — a voice can
 be handed the right to edit a repository: an isolated git worktree per
@@ -82,7 +89,7 @@ Voices you don't have simply fail honestly and are recorded as absent.
 : > choir/live.jsonl                  # a fresh, empty feed
 python3 choir/live.py ask "привет, стол"   # first blind move
 python3 roundtable.py                  # window on http://127.0.0.1:8770
-bash smoke.sh                          # 16-step integration smoke
+bash smoke.sh                          # integration smoke, 16 checks
 ```
 
 The window has three tabs — 💬 room, 🎼 rounds, 🔧 coder — with the
@@ -123,7 +130,7 @@ bash test/gate_test.sh         # 47 review/merge-gate scenarios
 python3 test/catalog_test.py   # 45 model-catalog scenarios (no network)
 python3 test/exec_argv_test.py # 29 executor argv / explicit-default checks
 bash test/voices_http_test.sh  # 21 HTTP checks of the three tabs (isolated window, no voice calls)
-bash smoke.sh                  # 16-step window smoke
+bash smoke.sh                  # window smoke, 16 checks
 ```
 
 ## Citing

@@ -360,6 +360,7 @@ VOICES: dict[str, dict] = {
                                        "--resume", s, p],
         "new_session": lambda: str(uuid.uuid4()),
         "bin": "claude",
+        "neutral_cwd": str(Path.home() / ".cache" / "choir-voices" / "claude"),
     },
     "codex": {
         "start": lambda p, f, a, s, d: ["codex", "exec", "-s", "read-only",
@@ -833,6 +834,15 @@ def turn(name: str, prompt) -> dict:
             # и передаются абсолютными путями, так что подмена cwd их
             # не задевает.
             cwd = PROJECT if (PROJECT and v.get("cwd_project")) else home
+            if v.get("neutral_cwd"):
+                # Голос claude — из каталога ВНЕ песочницы: из
+                # voices/claude его CLI подхватывал Choir/CLAUDE.md и
+                # корневой канон (~14К токенов дирижёрского знания),
+                # которых остальные голоса не видят (правило 1). Нить
+                # адресуется --resume <uuid>, state.json остаётся в
+                # home — каталог процесса ей не важен (2026-09-03).
+                cwd = Path(v["neutral_cwd"])
+                cwd.mkdir(parents=True, exist_ok=True)
             pfile = home / "prompt.txt"
             afile = home / "answer.txt"
             if ch and isinstance(prompt, dict):
