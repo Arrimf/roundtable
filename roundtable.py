@@ -283,6 +283,40 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+_GOAL_CACHE: dict = {"key": None, "goal": ""}
+
+
+def _last_goal() -> str:
+    """Действующая цель — последнее событие goal ленты (поле goal;
+    пустое = снята). ВЕСЬ файл с дешёвым префильтром, как у голосов
+    (live.current_goal, choir.goal_notice): хвост в 512 КБ терял цель
+    старше хвоста, и окно с голосами расходились (нашли все шестеро).
+    Кэш по (размер, mtime): /state опрашивается каждые две секунды."""
+    try:
+        st = FEED.stat()
+        key = (st.st_size, st.st_mtime_ns)
+    except OSError:
+        return ""
+    if _GOAL_CACHE["key"] == key:
+        return _GOAL_CACHE["goal"]
+    goal = ""
+    try:
+        with FEED.open("r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if '"goal"' not in line:
+                    continue
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(e, dict) and e.get("kind") == "goal":
+                    goal = str(e.get("goal") or "").strip()
+    except OSError:
+        return ""
+    _GOAL_CACHE.update(key=key, goal=goal)
+    return goal
+
+
 def round_view(name: str) -> dict:
     """Карточка раунда из room.jsonl: жребий, затравка, слепые ответы,
     витки, свод — дословно, как записано (правило 3), плюс счётчики
@@ -1593,6 +1627,31 @@ def _room_quota() -> dict[str, dict]:
                           "round": o.get("round")}
     except OSError:
         pass
+    # Комната (live.jsonl) — с 2026-09-06 её отказы типизированы
+    # (status у kind=error, см. live._status_of), поэтому читается и она:
+    # прежде отказ по квоте лежал там как «error, код N», и окно его не
+    # видело намеренно — гадать по тексту нельзя (правило 8.5).
+    try:
+        with FEED.open("r", encoding="utf-8") as f:
+            for line in f:
+                if '"quota"' not in line or '"error"' not in line:
+                    continue
+                try:
+                    o = json.loads(line)
+                except Exception:               # noqa: BLE001
+                    continue
+                if o.get("kind") != "error" or o.get("status") != "quota":
+                    continue
+                v = o.get("author")
+                if not isinstance(v, str) or v not in VOICES:
+                    continue
+                prev = out.get(v)
+                if not prev or str(o.get("ts") or "") > str(prev.get("at") or ""):
+                    out[v] = {"at": o.get("ts"),
+                              "text": ANSI_RE.sub("", (o.get("detail") or ""))[:300],
+                              "round": "комната"}
+    except OSError:
+        pass
     return out
 
 
@@ -2531,6 +2590,7 @@ class Handler(BaseHTTPRequestHandler):
                 print(f"/state acts: {e}", file=sys.stderr)
                 acts = None                     # None ≠ [] — «не собралось»
             self._json(200, {"voices": VOICES, "running": running,
+                             "goal": _last_goal(),
                              "edit_voices": sorted(edits.EDIT_VOICES),
                              "exec_pool": edits.random_pool(),
                              "acts": acts,
@@ -2718,6 +2778,9 @@ class Handler(BaseHTTPRequestHandler):
             brief = bool(req.get("brief"))
             if brief:
                 acc_fields["brief"] = True
+            peer = bool(req.get("peer"))
+            if peer:
+                acc_fields["peer"] = True
             if picked_by_server:
                 acc_fields.update(picked_by="server-random",
                                   voice=picked_by_server)
@@ -2732,7 +2795,8 @@ class Handler(BaseHTTPRequestHandler):
                               f"random.choice по составу)"
                               if picked_by_server else ""),
                         fields=acc_fields or None,
-                        env_extra={"CHOIR_BRIEF": "1"} if brief else None)
+                        env_extra={"CHOIR_BRIEF": "1" if brief else "0",
+                                   "CHOIR_PEER": "1" if peer else "0"})
             return self._json(200, {"act": act})
 
         if self.path == "/round":
@@ -2885,7 +2949,7 @@ class Handler(BaseHTTPRequestHandler):
             act = spawn(cmd, label, rvoices or VOICES, cwd=CHOIR,
                         meta={"round": name, "auto": auto},
                         note=note, fields=fields,
-                        env_extra={"CHOIR_BRIEF": "1"} if brief else None)
+                        env_extra={"CHOIR_BRIEF": "1" if brief else "0"})
             return self._json(200, {"act": act, "auto": auto,
                                     "rebuts": rebuts if auto else None,
                                     "question_file": qfile.name})
@@ -3640,7 +3704,7 @@ class Handler(BaseHTTPRequestHandler):
                 act = spawn(cmd, label, VOICES, cwd=CHOIR,
                             meta={"round": name, "step": step,
                                   "detach": True},
-                            env_extra={"CHOIR_BRIEF": "1"} if brief else None,
+                            env_extra={"CHOIR_BRIEF": "1" if brief else "0"},
                             note=("виток открытой критики: каждый читает "
                                   "чужие ответы под анонимными метками"
                                   if step == "rebut" else
@@ -3651,6 +3715,18 @@ class Handler(BaseHTTPRequestHandler):
                 with RUN_LOCK:
                     _ROUND_RESERVED.discard(name)
             return self._json(200, {"act": act, "step": step, "by": who})
+
+        if self.path == "/goal":
+            # Цель целеполагателя — событием в ленту (append-only): её
+            # читают live.py (первый ход) и choir.py (пакет раунда).
+            if req.get("text") is not None and not isinstance(req.get("text"), str):
+                return self._json(400, {"error": "text — строка"})
+            text = str(req.get("text") or "").strip()
+            if len(text) > 2000:
+                return self._json(400, {"error": "цель — до 2000 символов"})
+            ev = feed_append("goal", text or "(цель снята)",
+                             goal=text, by="arr")
+            return self._json(200, {"event": ev["id"], "goal": text})
 
         if self.path == "/models_refresh":
             # Кнопка ⟳ окна (наказ Автора 2026-09-02): разведка списков
@@ -3984,6 +4060,10 @@ margin-top:.3rem;padding-top:.3rem;max-height:9rem;overflow-y:auto}
 .actrow{padding:.14rem 0;border-bottom:1px dashed var(--rule)}
 .actrow button{font-size:.7rem;padding:0 .45rem;margin-left:.3rem}
 #coderblk{border-left:2px solid var(--acc);padding-left:.45rem;margin-top:.5rem}
+/* Адресная ветка между голосами: сдвиг и пунктир, чтобы разговор
+   двух голосов читался как ветка, а не как общий поток. */
+.ev.thr{margin-left:1.4rem;border-left:2px dashed var(--rule);padding-left:.5rem}
+#goal{width:100%;box-sizing:border-box;min-height:3.2rem;font:.85rem/1.3 ui-sans-serif,system-ui,sans-serif}
 /* Карточка раунда под act_status: ответы голосов дословно из room.jsonl
    (наказ Автора 2026-09-03: «ожидаю увидеть полный ответ и расшифровку
    каждого голоса»). Свёрнута по умолчанию — лента не тонет в 40К символов. */
@@ -4011,6 +4091,7 @@ margin:.2rem 0 .3rem;white-space:pre-wrap;word-break:break-word}
 <div id="feed" aria-live="polite"><div id="feedtop"><div id="quickbar" title="Быстрые переключатели окна. Живут поверх ленты, чтобы не занимать место в колонке действий.">
   <label id="belllab" title="Звонок по завершении действия — как у микроволновки: короткое тройное «дзынь», когда ход или такт закончился (done, error или прерван). Работает, пока вкладка открыта; браузер разрешает звук после первого клика по странице. Выключается здесь же, выбор запоминается."><input type="checkbox" id="bell">🔔</label>
   <label id="brieflab" title="Краткость. Снята (умолчание) — голоса отвечают столько, сколько нужно доводу: ответ приходит целиком. Поставлена — возвращаются прежние жёсткие рамки правила 16: реплика 120–250 слов в комнате, ответ 250–400 и свод до 400 слов в раундах. Переключатель уходит в ленту полем brief, чтобы короткий ответ не путался с урезанным. Выбор запоминается."><input type="checkbox" id="brief">кратко</label>
+  <label id="peerlab" title="Адресные сообщения между голосами (опция; наказ Автора 2026-09-06). Снята (умолчание) — «@имя» в реплике голоса просто текст, слово по адресу даёт только человек. Поставлена — голос может задать вопрос коллеге строкой «@имя …»: адресат отвечает следующим ходом, потом слово только поднявшим руку, иначе ветка закрывается и слово у человека. Всё в той же ленте, ветка помечена полем thread. Каждый такой вопрос — платный ход; потолок реплик без человека действует. Уходит в ленту полем peer. Выбор запоминается."><input type="checkbox" id="peer">адресно</label>
   <label id="hintlab" title="Всплывающие подсказки: у кнопок, галочек, шкал и панелей — при наведении. Жёлтая рамка у модели/усилия значит «комната и раунды настроены по-разному». Снята — все подсказки скрыты, интерфейс тихий; выбор запоминается."><input type="checkbox" id="hints">hint</label>
 </div></div></div>
 <div id="side">
@@ -4031,6 +4112,9 @@ margin:.2rem 0 .3rem;white-space:pre-wrap;word-break:break-word}
 
   <h3>Проект (--project)</h3>
   <input id="project" value="__PROJECT_DEFAULT__" placeholder="путь к каталогу; пусто — без него" title="Каталог, который голоса получат на чтение. Подставлен тот, из которого запущено окно; очистить поле — значит спрашивать без проекта.">
+  <h3 title="Целеполагатель — прослойка между человеком и столом (RoundTable/CLAUDE.md): формулирует цель и критерии «готово», режет скоуп, держит цель между раундами. Сейчас это Автор. Цель уходит первым ходом каждому голосу комнаты и в пакет каждого раунда — всем одинаково; каждая смена — событие goal в ленте.">Цель (целеполагатель)</h3>
+  <textarea id="goal" placeholder="цель и критерии «готово»; пусто — цель не задана" title="Текст цели, который получат все голоса: в комнате — первым ходом, в раундах — строкой пакета. Кнопка ниже пишет его событием goal в ленту; последняя запись и есть действующая цель."></textarea>
+  <button id="goalbtn" title="Записать цель событием goal в ленту (append-only). Пустой текст снимает цель отдельным событием.">Задать цель</button>
   <h3>Жребий дирижёра</h3>
   <div id="lotbox" title="Имя ведущего видите только вы — в ленте до раскрытия лишь хеш-обязательство. «Раскрыть» допишет соль, и sha256 пересчитывается по журналу: проверить может каждый, у кого есть лента.">не брошен</div>
   <button id="lot" title="Бросить жребий дирижёра по протоколу commit-reveal: обязательство (sha256 соли, кандидатов и БУДУЩЕГО раунда drand) публикуется в ленту ДО того, как подпись раунда существует — подогнать выбор под вопрос нельзя. Имя ведущего увидите только вы, до раскрытия.">Бросить (commit)</button>
@@ -4398,10 +4482,12 @@ function add(ev){
   // молча врал, что голос ответил ничем.
   const sys=(a==='choir'||a==='roundtable'||k==='act_status'||
              k==='lot_commit'||k==='lot_reveal');
-  el.className='ev '+(k==='error'?'err':(a==='arr'?'arr':(sys?'sys':'')));
+  el.className='ev '+(k==='error'?'err':(a==='arr'?'arr':(sys?'sys':'')))+(ev.thread?' thr':'');
   const body=(ev.text||'')||(k==='error'?'(пусто)':'');
   const det=ev.detail?'<div class="det">'+esc(ev.detail)+'</div>':'';
-  const badge=k&&k!=='say'?'<span class="kind">'+esc(k)+'</span>':'';
+  const badge=(k&&k!=='say'?'<span class="kind">'+esc(k)+'</span>':'')+
+    (ev.thread?'<span class="kind" title="ответ в адресной ветке между голосами">↳ ветка '+esc(String(Number(ev.thread)||''))+'</span>':'')+
+    (k==='error'&&ev.status?'<span class="kind">'+esc(String(ev.status))+'</span>':'');
   const tv=tsView(ev.ts);
   el.innerHTML='<span class="who">'+esc(a)+'</span>'+badge+
     '<span class="ts">'+esc(tv.short)+'</span>'+
@@ -4447,6 +4533,10 @@ const briefBox=document.getElementById('brief');
 try{briefBox.checked=localStorage.getItem('rt-brief')==='1'}catch(_){briefBox.checked=false}
 briefBox.onchange=function(){try{localStorage.setItem('rt-brief',briefBox.checked?'1':'0')}catch(_){}}
 function briefOn(){return !!(briefBox&&briefBox.checked)}
+const peerBox=document.getElementById('peer');
+try{peerBox.checked=localStorage.getItem('rt-peer')==='1'}catch(_){peerBox.checked=false}
+peerBox.onchange=function(){try{localStorage.setItem('rt-peer',peerBox.checked?'1':'0')}catch(_){}}
+function peerOn(){return !!(peerBox&&peerBox.checked)}
 const hintBox=document.getElementById('hints');
 try{hintBox.checked=localStorage.getItem('rt-hints')!=='0'}catch(_){hintBox.checked=true}
 function stripTitle(el){
@@ -5190,6 +5280,18 @@ function vnote(text,isNote){
 }
 // ⟳ модели: разведка у самих каналов, без модельных вызовов; отчёт —
 // строкой под списком, списки — перерисовкой карточек с сервера.
+document.getElementById('goal').addEventListener('input',function(){this.dataset.dirty='1'});
+document.getElementById('goalbtn').onclick=async function(){
+  const g=document.getElementById('goal');
+  const text=g.value.trim();
+  delete g.dataset.dirty;
+  let r,j={};
+  try{r=await fetch('/goal',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({text:text})});j=await r.json();}
+  catch(e){return acterr('сервер не ответил: '+e)}
+  if(!r.ok)return acterr((j&&j.error)||('ошибка '+r.status));
+  acterr(text?'цель задана (событие '+j.event+')':'цель снята',true);
+};
 document.getElementById('mrefresh').onclick=async function(){
   const b=document.getElementById('mrefresh');
   b.disabled=true;vnote('обновляю списки моделей у всех голосов…',true);
@@ -5435,6 +5537,12 @@ async function state(){
   // сказать «режима нет» — достаточно, чтобы окно не полагалось на него.
   if(Array.isArray(s.modes))MODES=s.modes;
   window.STATE=s;   // страница читает s.edit_voices и прочие поля
+  // Действующая цель — из ленты; поле не трогаем, пока в нём рука.
+  try{const g=document.getElementById('goal');
+    // Черновик не трогаем: пока Автор набирает (флаг dirty по input),
+    // опрос не затирает поле, даже если фокус ушёл (нашли gemini, claude).
+    if(typeof s.goal==='string'&&!g.dataset.dirty&&document.activeElement!==g&&g.value!==s.goal)g.value=s.goal;
+  }catch(_){}
   try{renderActs()}catch(_){}
   syncQuick(Array.isArray(s.voices)?s.voices:[]);
   // Строку голоса заводит ЛЮБОЙ из двух источников — /voices (модель,
@@ -5490,7 +5598,8 @@ async function send(blind){
   // Автору набранной реплики, если снять его вслепую.
   try{
     r=await fetch('/act',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({text,blind,voices:picked('room'),project,brief:briefOn()})});
+      body:JSON.stringify({text,blind,voices:picked('room'),project,brief:briefOn(),
+        peer:peerOn()})});
   }catch(e){return acterr('сервер не ответил: '+e)}
   let j={};try{j=await r.json()}catch(_){}
   if(r.ok)msg.value='';

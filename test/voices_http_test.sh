@@ -153,6 +153,104 @@ echo "$R" | grep -q '"act"' && pass "/round с проектом → 200" || fail
 sleep 2
 grep -q "^pick --round pj2 --seed .* --project $W/proj2$" "$W/choir/argv.log" && pass "/round: --project уходит в pick (цепочка по шагам)" || fail "argv pick без --project: $(grep pick "$W/choir/argv.log")"
 grep -q "^ask --round pj2 --seed" "$W/choir/argv.log" && ! grep "^ask --round pj2" "$W/choir/argv.log" | grep -q -- "--project" && pass "/round: ask без --project (берёт из жребия)" || fail "argv ask: $(grep '^ask' "$W/choir/argv.log")"
+# ── цель целеполагателя и адресная опция комнаты ──────────────────
+R="$(post /goal '{"text":"Довести окно до релиза 0.2"}')"
+echo "$R" | grep -q '"goal": "Довести окно до релиза 0.2"' && pass "/goal → событие goal" || fail "/goal: $R"
+curl -s "$B/state" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get("goal")=="Довести окно до релиза 0.2" else 1)' && pass "/state несёт действующую цель" || fail "/state без цели"
+post /goal '{"text":""}' > /dev/null; curl -s "$B/state" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get("goal")=="" else 1)' && pass "пустая цель снимает цель" || fail "цель не снялась"
+[ "$(code /goal "{\"text\":\"$(python3 -c 'print("x"*2001)')\"}")" = 400 ] && pass "/goal: длиннее 2000 → 400" || fail "/goal длина"
+[ "$(code /goal '{"text":["a"]}')" = 400 ] && pass "/goal: не строка → 400" || fail "/goal тип"
+( cd "$W/choir" && python3 - <<'EOF'
+import sys; sys.path.insert(0, "."); import live
+f = live._status_of
+assert f(3, "", "", 3) == "quota" and f(1, "", "HTTP 429 Too Many Requests: rate limit", None) == "quota"
+assert f(1, "", "Not logged in · Please run /login", None) == "auth" and f(1, "", "Error: 403 Forbidden", None) == "auth"
+assert f(1, "", "429 max organization concurrency", None) == "busy", "занятость линии — не квота"
+assert f(0, "", "", None) == "empty" and f(0, "да", "", None) == "ok" and f(None, "", "", None, True) == "timeout" and f(2, "", "boom", None) == "error"
+# ложные срабатывания по подстрокам (нашли все шестеро)
+assert f(1, "", "failed to open /tmp/quota-report.txt", None) == "error"
+assert f(1, "", "connection reset https://host/item/4032", None) == "error"
+assert f(1, "", "PID 40382 died, line 429 of main.py", None) == "error"
+assert f(1, "HTTP 429 rate limit exceeded", "", None) == "quota", "stdout тоже читается"
+assert f(1, "You've reached your Fable 5 limit. Switch to another model or wait for reset.", "", None) == "quota", "дословный отказ Клода по лимиту (лента 2026-08-25)"
+assert f(1, "", "ключ #0: 429 quota exceeded; ключ #1: 503 у шлюза", 3) == "error", "у адаптера с кодом квоты вердикт — код: смешанный отказ не квота"
+assert f(3, "", "", 3) == "quota"
+h = {"author": "arr", "text": "спроси @grok"}; v = {"author": "claude", "text": "как заметил @grok, спорно.\n@deepseek уточни"}
+live.PEER = False
+assert live.pick_voices(h, ["grok", "claude"])[1] == "по адресу"
+assert live.pick_voices(v, ["deepseek", "grok", "claude"])[1] != "по адресу коллеги", "адрес голоса при выключенной опции не должен давать слово"
+live.PEER = True
+assert live.pick_voices(v, ["deepseek", "grok", "claude"]) == (["deepseek"], "по адресу коллеги"), "адрес голоса — только с начала строки"
+assert live.pick_voices({"author": "claude", "text": "@claude сам"}, ["claude", "grok"])[1] != "по адресу коллеги", "самоадрес — не ход"
+assert live.pick_voices(v, ["deepseek", "grok", "claude"], allow_address=False)[1] != "по адресу коллеги", "внутри ветки адрес — текст"
+assert live.current_goal() == ""
+EOF
+) && pass "live.py: типы отказов (без ложных), адресная опция: начало строки, самоадрес, ветка" || fail "live.py: статусы/адресация"
+# цель: окно и голоса читают одно и то же, и старая цель не теряется за хвостом
+post /goal '{"text":"Цель-А для проверки"}' > /dev/null
+python3 - "$W/choir/live.jsonl" <<'EOF'
+import json, sys
+# 600 КБ балласта после цели — хвост в 512 КБ её терял
+with open(sys.argv[1], "a", encoding="utf-8") as f:
+    for i in range(700):
+        f.write(json.dumps({"id": 900000 + i, "ts": "2026-09-06T00:00:00+00:00", "author": "choir", "kind": "note", "text": "x" * 900}, ensure_ascii=False) + "\n")
+EOF
+curl -s "$B/state" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get("goal")=="Цель-А для проверки" else 1)' && pass "/state.goal не теряется за 600 КБ балласта (весь файл, не хвост)" || fail "/state.goal потерялся за хвостом"
+( cd "$W/choir" && python3 -c 'import sys; sys.path.insert(0,"."); import live; assert live._read_goal()=="Цель-А для проверки"' ) && pass "live.current_goal видит ту же цель, что окно" || fail "live/окно расходятся в цели"
+# сценарий комнаты с ПОДДЕЛЬНЫМИ голосами (turn подменён): адрес → ответ адресата → рук нет → ветка закрыта
+( cd "$W/choir" && CHOIR_PEER=1 python3 - <<'EOF'
+import sys, json, argparse
+sys.path.insert(0, "."); import live
+calls = []
+def bump(name):
+    # настоящий turn() считает ходы нити в state.json — фальшивый тоже
+    st = live.load_state(name, None); st["turns"] = st.get("turns", 0) + 1; live.save_state(name, st, None)
+def fake_turn(name, prompt):
+    calls.append(name); bump(name)
+    text = {"claude": "Спорно.\n@deepseek уточни, откуда цифра", "deepseek": "Цифра из README, строка 12."}.get(name, "ПАС")
+    return {"author": name, "kind": "pass" if text == "ПАС" else "say", "text": text, "elapsed_s": 0.1}
+live.turn = fake_turn
+live.available = lambda n: True
+live.PEER = True
+live.cmd_say(argparse.Namespace(text="@claude что скажешь про цифру 142?", voices="claude,deepseek,grok", once=False))
+evs = [json.loads(l) for l in open("live.jsonl", encoding="utf-8")]
+tail = evs[-12:]
+say = [e for e in tail if e.get("kind") == "say"]
+by = {e["author"]: e for e in say if e["author"] != "arr"}
+assert calls == ["claude", "deepseek"], f"вызовы: {calls} (третий голос без руки не должен звучать)"
+assert "thread" not in by["claude"], "первый ответ — не в ветке"
+assert by["deepseek"].get("thread") == by["claude"]["id"], "ответ адресата помечен веткой = id адресной реплики"
+notes = [e for e in tail if e.get("kind") == "note" and "ветка закрыта" in (e.get("text") or "")]
+assert notes and notes[-1].get("thread") == by["claude"]["id"], "ветка закрыта заметкой с тем же thread"
+print("ok", calls)
+# смена опции доезжает до начатой нити: второй акт при выключенной опции
+live.PEER = False
+prompts = {}
+def fake_turn2(name, prompt):
+    bump(name)
+    prompts[name] = prompt if isinstance(prompt, str) else json.dumps(prompt, ensure_ascii=False)
+    return {"author": name, "kind": "pass", "text": "ПАС", "elapsed_s": 0.1}
+live.turn = fake_turn2
+live.cmd_say(argparse.Namespace(text="@claude ещё раз", voices="claude,deepseek,grok", once=True))
+assert "Адресные вопросы коллегам сейчас ВЫКЛЮЧЕНЫ" in prompts.get("claude", ""), "уведомление о смене опции в промпте начатой нити"
+print("peer-switch ok")
+EOF
+) && pass "комната (фальшивые голоса): адрес коллеги → ответ в ветке → рук нет → ветка закрыта, третий не оплачен; смена опции доезжает до нити" || fail "сценарий адресной ветки"
+( cd "$W/choir" && python3 - <<'EOF'
+import sys, json, importlib.util
+# choir.py здесь заглушка — читаем ЖИВОЙ дирижёр по абсолютному пути
+spec = importlib.util.spec_from_file_location("choir_live", "choir_real.py")
+m = importlib.util.module_from_spec(spec); sys.modules["choir_live"] = m; spec.loader.exec_module(m)
+import os
+m.ROOM = __import__("pathlib").Path(os.getcwd()) / "room.jsonl"
+m._append({"id": "s1", "ts": "2026-09-06T00:00:00+00:00", "round": "g1", "phase": "blind", "voice": "arr", "role": "seed", "text": "q", "packet_prefix": "ЦЕЛЬ (целеполагатель — Автор): строка 1\nстрока 2\n\n", "goal": None})
+m._append({"id": "s2", "ts": "2026-09-06T00:00:01+00:00", "round": "g2", "phase": "blind", "voice": "arr", "role": "seed", "text": "q", "packet_prefix": "ЦЕЛЬ (целеполагатель — Автор): a\nb\n\n", "goal": "a\nb"})
+assert m.goal_of_seed("g1") == "строка 1\nстрока 2", m.goal_of_seed("g1")
+assert m.goal_of_seed("g2") == "a\nb"
+m.snapshot_goal("зафиксированная"); assert m.goal_notice().startswith("ЦЕЛЬ (целеполагатель — Автор): зафиксированная")
+print("goal_of_seed ok")
+EOF
+) && pass "choir.py: goal_of_seed многострочная (поле goal и запасной разбор префикса), снимок цели" || fail "choir.py: goal_of_seed"
 grep -q "Traceback" "$W/srv.log" && fail "в логе сервера трейсбек: $(grep -A3 Traceback "$W/srv.log" | head -5)" || pass "трейсбеков в логе сервера нет"
 printf '\nvoices_http: PASS %d · FAIL %d\n' "$PASS" "$FAIL"
 [ "$FAIL" = 0 ]

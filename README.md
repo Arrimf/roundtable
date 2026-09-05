@@ -33,6 +33,15 @@ order follows the protocol, not the fastest channel: a publication
 lottery over the public [drand](https://drand.love) randomness beacon
 keeps the agenda honest and verifiable by anyone.
 
+Two switches live above the feed: *brief* (rule 16 word limits) and
+*addressed* — an opt-in for voice-to-voice questions: a voice may open
+a line with `@name`, the addressee answers next, then only voices that
+raised a hand may add, otherwise the thread closes and the word returns
+to the human. The thread is marked in the journal; nothing leaves the
+one feed. Channel failures in the room carry a typed `status`
+(`quota`, `auth`, `timeout`, `empty`, `error`), and the goal set by the
+goal-keeper (the human, for now) travels with every packet.
+
 **Table rounds** (`choir/choir.py`) — the full protocol: a
 commit-reveal drand lottery picks the leader *before* the beacon's
 signature exists (the choice cannot be fitted to the question); the

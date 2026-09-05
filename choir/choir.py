@@ -133,6 +133,67 @@ def _kimi_dirs() -> list[str]:
     return out
 
 
+# Цель — СНИМОК НА ПРОЦЕСС: читается один раз (main, до первой фазы) и
+# уходит всем голосам всех фаз этого процесса одинаково. Перечитывание
+# на каждый ask_one давало голосам одного раунда разные пакеты при
+# смене цели посреди фазы — правило 1 (нашли все шестеро). Добор долгов
+# берёт цель из записи затравки того раунда, а не текущую.
+_GOAL_SNAPSHOT: str | None = None
+GOAL_LINE = "ЦЕЛЬ (целеполагатель — Автор): "
+
+
+def _read_goal_now() -> str:
+    try:
+        live = ROOM.parent / "live.jsonl"
+        goal = ""
+        with live.open(encoding="utf-8") as f:
+            for line in f:
+                if '"goal"' not in line:
+                    continue
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(e, dict) and e.get("kind") == "goal":
+                    goal = str(e.get("goal") or "").strip()
+    except OSError:
+        return ""
+    return goal
+
+
+def snapshot_goal(text: str | None = None) -> str:
+    """Зафиксировать цель на процесс: явным текстом (добор долгов — из
+    записи затравки раунда) или чтением ленты сейчас."""
+    global _GOAL_SNAPSHOT
+    _GOAL_SNAPSHOT = (text if text is not None else _read_goal_now()).strip()
+    return _GOAL_SNAPSHOT
+
+
+def goal_of_seed(round_id: str) -> str:
+    """Цель, с которой шёл раунд: из packet_prefix записи затравки."""
+    try:
+        seeds = [r for r in read_round(round_id) if r.get("role") == "seed"]
+    except Exception:                               # noqa: BLE001
+        return ""
+    if not seeds:
+        return ""
+    if seeds[-1].get("goal") is not None:
+        return str(seeds[-1]["goal"]).strip()
+    # Записи до поля goal: разбор префикса — до пустой строки, цель
+    # многострочная (нашёл субагент: первая строка теряла остальные).
+    pref = seeds[-1].get("packet_prefix") or ""
+    if GOAL_LINE not in pref:
+        return ""
+    tail = pref.split(GOAL_LINE, 1)[1]
+    return tail.split("\n\n", 1)[0].strip()
+
+
+def goal_notice() -> str:
+    """Строка цели для пакета — из снимка; снимка нет — берём сейчас."""
+    goal = _GOAL_SNAPSHOT if _GOAL_SNAPSHOT is not None else snapshot_goal()
+    return f"{GOAL_LINE}{goal}\n\n" if goal else ""
+
+
 def voice_cwd(name: str) -> str:
     """Рабочий каталог процесса голоса: claude — нейтральный (см. выше),
     остальные — проект раунда, иначе Choir/."""
@@ -1142,7 +1203,7 @@ def ask_one(name: str, prompt: str, round_id: str, phase: str,
     # но НЕ в своде: свод, написанный «адвокатом дьявола», уже не свод
     # (нашёл голос claude, раунд roles-v1).
     prompt = (role_preamble(name) + prompt) if use_role else prompt
-    prompt = project_notice() + prompt
+    prompt = project_notice() + goal_notice() + prompt
     rec = {"id": uuid.uuid4().hex[:12], "ts": _now(), "round": round_id,
            "phase": phase, "voice": name, "role": "answer",
            "parent": parent, "visibility": visibility,
@@ -1480,7 +1541,8 @@ def cmd_ask(a: argparse.Namespace) -> int:
              # Пакет голоса = packet_prefix + (преамбула роли) + text:
              # строка о проекте в файл затравки не пишется, но в журнале
              # обязана быть — иначе seed_sha не воспроизводит пакет.
-             "packet_prefix": project_notice() or None,
+             "packet_prefix": (project_notice() + goal_notice()) or None,
+             "goal": (_GOAL_SNAPSHOT or None),
              "project": str(PROJECT) if PROJECT else None,
              "called": names, "choir": CHOIR_VERSION})
     print(f"затравка: {a.seed} ({len(seed)} симв., sha {_sha(seed)})")
@@ -2743,6 +2805,7 @@ def cmd_catchup(a: argparse.Namespace) -> int:
             # другой пакет, чем у ответивших вовремя.
             global PROJECT
             PROJECT = _project_of_round(d["round"])
+            snapshot_goal(goal_of_seed(d["round"]))   # цель ТОГО раунда
             lp = next((r.get("project") for r in reversed(read_round(d["round"]))
                        if r.get("role") == "lot"), None)
             if lp and PROJECT is None:
@@ -4394,6 +4457,14 @@ def main() -> int:
             return 2
         if PROJECT:
             print(f"проект раунда (из жребия): {PROJECT}")
+    if a.cmd != "catchup":
+        # Одна цель на РАУНД: у раунда с затравкой фазы, запущенные
+        # отдельными процессами (виток, свод из окна), берут цель
+        # затравки, а не текущую (нашёл субагент); иначе — цель сейчас.
+        seeded = ""
+        if getattr(a, "round", None) and a.cmd not in ("pick", "expand", "run"):
+            seeded = goal_of_seed(a.round)
+        snapshot_goal(seeded if seeded else None)
 
     # --effort действует на весь вызов: eff() читает эту глобаль при
     # сборке argv каждого голоса.

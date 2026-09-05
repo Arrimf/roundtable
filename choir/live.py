@@ -150,6 +150,94 @@ AGREE_RE = re.compile(
 
 HUMAN = "arr"
 
+# АДРЕСНЫЕ СООБЩЕНИЯ МЕЖДУ ГОЛОСАМИ — ОПЦИЯ (наказ Автора 2026-09-06:
+# «адресные сообщения в общий чат; после ответа адресата могут ответить
+# остальные, если захотят; сделать опцией, а то модели могут болтать
+# безостановочно»). Выключено (умолчание): `@имя` в реплике ГОЛОСА —
+# просто текст, слово по адресу даёт только человек. Включено
+# (CHOIR_PEER=1, окно ставит галочкой «адресно»): голос задаёт вопрос
+# коллеге, адресат отвечает следующим ходом, дальше слово — только
+# поднявшим руку, иначе возвращается человеку. Всё в той же ленте (одна
+# истина, дословно), с полем thread = id адресной реплики, чтобы окно
+# показывало ветку. Потолок MAX_TURNS_WITHOUT_HUMAN действует как прежде.
+PEER = os.environ.get("CHOIR_PEER") == "1"
+THREAD: int | None = None      # id адресной реплики текущей ветки
+# Адрес ОТ ГОЛОСА — только строка, начинающаяся с @имя (так обещает
+# устав); упоминание посреди фразы или user@host — просто текст (нашли
+# grok, codex, claude). Адрес человека — по-прежнему ADDRESS_RE где угодно.
+PEER_ADDRESS_RE = re.compile(r"(?m)^\s*@([a-zA-Zа-яА-Я]+)\b")
+# Цель — СНИМОК НА АКТ: читается один раз при старте say/ask и уходит
+# всем голосам этого акта одинаково (правило 1); смена цели посреди
+# акта доедет до нитей дельтой (событие goal в «что сказали»).
+GOAL_SNAPSHOT: str | None = None
+
+
+def _read_goal() -> str:
+    try:
+        goals = [e for e in read_events() if e.get("kind") == "goal"]
+    except Exception:                               # noqa: BLE001
+        return ""
+    return (goals[-1].get("goal") or "").strip() if goals else ""
+
+
+def current_goal() -> str:
+    """Цель целеполагателя — последнее событие kind=goal ленты (ставит
+    окно). В акте — снимок, взятый при его старте (см. GOAL_SNAPSHOT)."""
+    return GOAL_SNAPSHOT if GOAL_SNAPSHOT is not None else _read_goal()
+
+
+def _since_human(events: list[dict] | None = None) -> int:
+    """Сколько реплик голосов подряд после последней реплики человека —
+    тот же счёт, что у guards(); нужен ДО каждой группы вызовов."""
+    ev = events if events is not None else read_events()
+    n = 0
+    for e in reversed([x for x in ev if x["kind"] in ("say", "pass", "error")]):
+        if e["author"] == HUMAN:
+            break
+        n += 1
+    return n
+
+
+def _status_of(rc, out: str, err: str, quota_exit, timed_out: bool = False) -> str:
+    """Тип отказа канала — поле status у kind=error, как у choir.py
+    (quota/timeout/stalled/empty/error), плюс auth. Раньше комната
+    писала любой отказ как «error, код N», и окно не могло отличить
+    квоту от поломки (правило 4: отказ канала — не позиция участника;
+    Hermes-релиз 2026-08-31 — тот же приём: типизированные причины)."""
+    if timed_out:
+        return "timeout"
+    if quota_exit is not None and rc == quota_exit:
+        return "quota"
+    # Шаблоны с ГРАНИЦАМИ и по обоим потокам: голое «403» ловило порт,
+    # хеш и URL, «quota» — путь /tmp/quota-report (нашли все шестеро).
+    # «max organization concurrency» — занятость линии, не квота: это
+    # отдельный тип busy, повтор уместен (choir.py повторяет именно его).
+    low = ((out or "") + "\n" + (err or "")).lower()
+    if rc != 0:
+        if re.search(r"max organization concurrency|\bconcurrency limit\b", low):
+            return "busy"
+        # У адаптера с кодом квоты вердикт — КОД: gemini-http отдаёт 3
+        # лишь когда все ключи ответили 429, а смешанный отказ (429 и
+        # 503) — 1 намеренно, чтобы лежащий шлюз не получал ярлык квоты;
+        # текстовый скан возвращал бы ярлык обратно (нашёл субагент).
+        if quota_exit is None and re.search(
+                r"\bhttp[ /]*429\b|\b429\b[^\n]{0,60}(too many|rate|limit|quota)|"
+                r"\brate[ _-]?limit(ed|s)?\b|resource[_ ]exhausted|"
+                r"insufficient[ _]balance|quota (exceeded|exhausted)|"
+                r"exceeded your (current )?quota|исчерпан[аы]? (все )?ключ|"
+                r"tokens? per (day|minute)|daily limit|"
+                r"reached your [^\n]{0,40}limit|usage limit", low):
+            return "quota"
+        if re.search(r"not logged in|please run /login|invalid api key|"
+                     r"\bunauthorized\b|authentication (failed|error|required)|"
+                     r"\bhttp[ /]*40[13]\b|\b40[13]\b[^\n]{0,40}(unauthorized|forbidden|token|auth)",
+                     low):
+            return "auth"
+        return "error"
+    if not (out or "").strip():
+        return "empty"
+    return "ok"
+
 
 # ─────────────────────────────────────────────────────────────────────
 # Голоса. Каждый — две команды: НАЧАТЬ нить и ПРОДОЛЖИТЬ её.
@@ -692,7 +780,13 @@ CHARTER = """Вы — участник стола AiSandbox: несколько 
   а не отказ: пять голосов должны быть хором, а не унисоном.
 • Хотите высказаться следующим ходом — допишите отдельной строкой:
   ХОЧУ СЛОВО.
-""" + BRIEF_RULE + """• Вывод первой строкой, обоснование ниже.
+""" + BRIEF_RULE + ("""• Можно задать вопрос коллеге адресно: строка, начинающаяся с @имя
+  (claude, codex, grok, kimi, gemini, deepseek); два адресата — две
+  такие строки. Адресат ответит следующим ходом; остальные дополнят,
+  если поднимут руку. Пока ветка открыта, новый @адрес — просто текст.
+  Каждый такой вопрос — платный ход: спрашивайте, когда без ответа
+  коллеги не обойтись.
+""" if PEER else "") + """• Вывод первой строкой, обоснование ниже.
 • Ничего не записывайте на диск и не меняйте файлы: вы читаете и говорите.
 • По-русски. Термины и идентификаторы — как есть, латиницей.
 """
@@ -704,6 +798,9 @@ def build_prompt(name: str, st: dict, events: list[dict], first: bool,
     if first:
         parts.append(CHARTER)
         parts.append(f"Ваше имя за столом: {name}.\n")
+        goal = current_goal()
+        if goal:
+            parts.append(f"ЦЕЛЬ (целеполагатель — Автор): {goal}\n")
         if PROJECT:
             if VOICES[name].get("no_files"):
                 parts.append(
@@ -752,12 +849,18 @@ def build_prompt(name: str, st: dict, events: list[dict], first: bool,
     # диспетчеру (нашли codex, grok, kimi и субагент; у субагента замер:
     # 19 заметок на 6 реплик в одном прогоне).
     events = [e for e in events
-              if e.get("kind") in ("say", "pass", "error", "verdict")]
+              if e.get("kind") in ("say", "pass", "error", "verdict")
+              or (e.get("kind") == "goal" and not first)]
     if events:
         parts.append("Что сказали с вашего прошлого хода:\n")
         for e in events:
             who = "Автор (человек)" if e["author"] == HUMAN else f"Голос {e['author']}"
-            if e["kind"] == "pass":
+            if e["kind"] == "goal":
+                # Смена цели доезжает до начатых нитей дельтой, иначе
+                # старожил живёт со старой целью (нашли codex, claude).
+                parts.append(f"— Автор (целеполагатель) сменил цель: "
+                             f"{(e.get('goal') or '').strip() or '(цель снята)'}")
+            elif e["kind"] == "pass":
                 parts.append(f"— {who}: (промолчал)")
             elif e["kind"] == "error":
                 parts.append(f"— {who}: (выпал: {e.get('detail', '')[:80]})")
@@ -765,6 +868,12 @@ def build_prompt(name: str, st: dict, events: list[dict], first: bool,
                 parts.append(f"— {who}: {e['text']}")
         parts.append("")
 
+    if not first and st.get("peer") is not None and bool(st.get("peer")) != PEER:
+        # Опцию сняли или включили после начала нити: устав первого хода
+        # уже не говорит правды — называем перемену (нашёл claude).
+        parts.append("Адресные вопросы коллегам сейчас "
+                     + ("ВКЛЮЧЕНЫ: строка «@имя …» даст коллеге слово."
+                        if PEER else "ВЫКЛЮЧЕНЫ: «@имя» — просто текст.") + "\n")
     parts.append("Ваш ход. Если добавить нечего — одно слово: ПАС.")
     return "\n".join(parts)
 
@@ -855,6 +964,7 @@ def turn(name: str, prompt) -> dict:
             cmd = _voice_cmd(v, "cont" if use_cont else "start", ptext,
                              pfile, afile, session, ch)
             t0 = time.monotonic()  # отсчёт РАБОТЫ, очередь сюда не входит
+            wall_t0 = time.time()  # для пробы логов Кими (mtime файлов)
             vt = v.get("turn_timeout", TURN_TIMEOUT)
             r = subprocess.run(cmd, capture_output=True, text=True,
                                timeout=vt, cwd=str(cwd))
@@ -884,19 +994,23 @@ def turn(name: str, prompt) -> dict:
         err = full_err[-1500:]
         elapsed = round(time.monotonic() - t0, 1)
 
+        status = _status_of(rc, out, err, v.get("quota_exit"))
         if rc == v.get("quota_exit"):
             # Хвост stderr обязателен: фиксированная строка выдавала
             # «исчерпаны все ключи» и тогда, когда канал перебрал ключи
             # из-за лежащего шлюза — квота ни при чём (нашли grok и
             # субагент). Причина канала — рядом, не вместо.
             ev = {"author": name, "kind": "error", "text": "",
+                  "status": status, "returncode": rc,
                   "detail": "исчерпаны все ключи"
                             + (f"; канал: {err[-200:]}" if err else "")}
         elif rc != 0:
             ev = {"author": name, "kind": "error", "text": out,
+                  "status": status, "returncode": rc,
                   "detail": err or f"код {rc}"}
         elif not out:
             ev = {"author": name, "kind": "error", "text": "",
+                  "status": "empty", "returncode": rc,
                   "detail": "код 0, но ответ пуст"}
         elif PASS_RE.match(out):
             # ПАС значит «к этому витку добавить нечего», а не «согласен»,
@@ -921,11 +1035,26 @@ def turn(name: str, prompt) -> dict:
         tail = full_err[-300:]
         err = tail
         ev = {"author": name, "kind": "error", "text": "",
+              "status": "timeout", "returncode": None,
               "detail": f"не уложился в {v.get('turn_timeout', TURN_TIMEOUT)} с"
                         + (f"; последнее из канала: {tail}" if tail else "")}
     except Exception as e:                             # noqa: BLE001
         ev = {"author": name, "kind": "error", "text": "",
+              "status": "error", "returncode": None,
               "detail": f"{type(e).__name__}: {e}"}
+    if name == "kimi" and ev.get("kind") == "error" and ev.get("status") in (
+            "timeout", "error", "empty", "busy"):
+        # Правду о квоте Кими видно только в его логах: на исчерпанном
+        # TPD клиент молча повторяет 429 до снятия, снаружи — «завис»
+        # (та же проба, что у раундов; нашли все шестеро).
+        try:
+            import choir as _choir
+            q = _choir._kimi_quota(wall_t0, ch)
+        except Exception:                           # noqa: BLE001
+            q = None
+        if q:
+            ev["status"] = "quota"
+            ev["detail"] = q
 
     # Линия называется вслух и попадает в ленту. Без этого поля две
     # реплики Кими подряд через месяц прочтутся как загадка, а разница
@@ -1024,6 +1153,8 @@ def deliver(names: list[str], blind: bool = False) -> list[dict]:
         for f in as_completed(futs):
             n = futs[f]
             ev = f.result()
+            if THREAD is not None:
+                ev["thread"] = THREAD          # ответ в адресной ветке
             # Состояние перечитываем ПОСЛЕ хода, а не берём прочитанное до
             # него: turn() записал туда идентификатор нити и счётчик ходов,
             # и сохранение старого снимка их затирало — голос каждый раз
@@ -1037,6 +1168,7 @@ def deliver(names: list[str], blind: bool = False) -> list[dict]:
                        if c["name"] == ev.get("channel")), None)
             st = load_state(n, ch)
             st["cursor"] = top
+            st["peer"] = PEER           # с какой опцией шёл ход (для уведомления о смене)
             save_state(n, st, ch)
             mark = {"say": "●", "pass": "○", "error": "✗"}.get(ev["kind"], "?")
             print(f"{mark} {n:<8} {ev.get('elapsed_s', 0):>6.1f} с  "
@@ -1235,7 +1367,8 @@ def coverage(called: list[str], evs: list[dict]) -> str:
     return "возражений нет среди ответивших — " + "; ".join(bits)
 
 
-def pick_voices(ev: dict, roster: list[str]) -> tuple[list[str], str]:
+def pick_voices(ev: dict, roster: list[str],
+                allow_address: bool = True) -> tuple[list[str], str]:
     """Кого звать на эту реплику. Возвращает (голоса, объяснение).
 
     Порядок намеренно такой:
@@ -1249,10 +1382,22 @@ def pick_voices(ev: dict, roster: list[str]) -> tuple[list[str], str]:
     честно, что это решение дирижёра, а не воля стола (правило 10).
     """
     text = ev.get("text", "")
-    named = [m.lower() for m in ADDRESS_RE.findall(text)]
-    addressed = [v for v in roster if v in named]
+    if ev.get("author") == HUMAN:
+        named = [m.lower() for m in ADDRESS_RE.findall(text)]
+    elif PEER and allow_address:
+        # Адрес от ГОЛОСА — только строка с @имя в начале (как обещает
+        # устав) и только при включённой опции; внутри открытой ветки
+        # (allow_address=False) новый адрес — просто текст: иначе
+        # цепочка @A→@B→@C обходила «после ответа — только руки».
+        named = [m.lower() for m in PEER_ADDRESS_RE.findall(text)]
+    else:
+        named = []
+    # Самоадрес — не ход: «@claude» от claude слова не даёт никому
+    # (нашли kimi, gemini).
+    addressed = [v for v in roster if v in named and v != ev.get("author")]
     if addressed:
-        return addressed[:MAX_VOICES_PER_EVENT], "по адресу"
+        return (addressed[:MAX_VOICES_PER_EVENT],
+                "по адресу" if ev.get("author") == HUMAN else "по адресу коллеги")
 
     # Кто говорил только что — остывает, пока есть не сказавшие ни слова
     # или молчащие дольше. Фильтр применяется и к поднявшим руку: рука
@@ -1385,6 +1530,9 @@ def roster() -> list[str]:
 # ─────────────────────────────────────────────────────────────────────
 def cmd_ask(a) -> int:
     """Новая тема — слепым первым ходом (решение стола от 2026-08-14)."""
+    global THREAD, GOAL_SNAPSHOT
+    THREAD = None
+    GOAL_SNAPSHOT = _read_goal()      # одна цель на акт — всем одинаково
     names = a.voices.split(",") if a.voices else roster()
     post(HUMAN, "topic", a.text, topic=a.topic or "")
 
@@ -1448,7 +1596,8 @@ def hand_word(src_ev: dict, names: list[str], why: str,
         # действий склеивались в один глобальный список (нашли codex и
         # grok). Текст заметки — человеку, поля — машине.
         post("choir", "note", note, word_to=list(names),
-             act=os.environ.get("RT_ACT_ID", ""))
+             act=os.environ.get("RT_ACT_ID", ""),
+             **({"thread": THREAD} if THREAD is not None else {}))
         print(f"вступают ({why}): {', '.join(names)}\n")
         res = deliver(names)
         tried |= set(names)
@@ -1464,8 +1613,19 @@ def hand_word(src_ev: dict, names: list[str], why: str,
             post("choir", "note",
                  f"ход не состоялся: {fell}. {reason} — слово "
                  f"возвращается человеку", word_to=[],
-                 act=os.environ.get("RT_ACT_ID", ""))
+                 act=os.environ.get("RT_ACT_ID", ""),
+                 **({"thread": THREAD} if THREAD is not None else {}))
             print(f"ход не состоялся: {fell} ({reason})")
+            return res
+        if _since_human() >= MAX_TURNS_WITHOUT_HUMAN:
+            # Передача — тоже платный ход: потолок реплик без человека
+            # проверялся лишь в начале цикла, и передачи его обходили
+            # (нашёл codex).
+            post("choir", "note",
+                 f"ход не состоялся: {fell}. Потолок реплик без человека "
+                 f"({MAX_TURNS_WITHOUT_HUMAN}) — слово возвращается человеку",
+                 word_to=[], act=os.environ.get("RT_ACT_ID", ""))
+            print(f"ход не состоялся: {fell} (потолок реплик без человека)")
             return res
         handoffs += 1
         names = _quietest(rest)[:1]
@@ -1473,7 +1633,23 @@ def hand_word(src_ev: dict, names: list[str], why: str,
         note = f"{fell} — слово передаётся: {names[0]}"
 
 
+def _cap_group(names: list[str]) -> list[str]:
+    """Группа не длиннее остатка бюджета реплик без человека: два адресата
+    при пяти сказанных давали семь ходов при потолке шесть (нашёл codex)."""
+    left = MAX_TURNS_WITHOUT_HUMAN - _since_human()
+    return names[:max(1, left)]
+
+
+def _close_thread(thread: int, why: str) -> None:
+    post("choir", "note", f"ветка закрыта: {why} — слово возвращается человеку",
+         word_to=[], thread=thread, act=os.environ.get("RT_ACT_ID", ""))
+    print(f"ветка закрыта: {why} — слово у человека")
+
+
 def cmd_say(a) -> int:
+    global THREAD, GOAL_SNAPSHOT
+    THREAD = None                    # ветка живёт внутри одного акта
+    GOAL_SNAPSHOT = _read_goal()     # одна цель на акт — всем одинаково
     ev = post(HUMAN, "say", a.text)
     allowed = a.voices.split(",") if a.voices else roster()
     names, why = pick_voices(ev, allowed)
@@ -1483,8 +1659,9 @@ def cmd_say(a) -> int:
     once = bool(getattr(a, "once", False))
     # Адрес — выбор человека: подменять адресата передачей нельзя,
     # как и в --once (нашёл субагент). pool = сами names.
+    names = _cap_group(names)
     res = hand_word(ev, names, why,
-                    names if (once or why == "по адресу") else allowed)
+                    names if (once or why.startswith("по адресу")) else allowed)
 
     if once:
         # ОДИН ХОД И ВСЁ. Ради «быстрого вопроса» из окна: его подпись
@@ -1516,7 +1693,12 @@ def cmd_say(a) -> int:
         # grok). Свой res этих ловушек не видит.
         says = [e for e in res if e.get("kind") == "say"]
         if not says:
-            break                # наш ход реплики не дал — слово у человека
+            # ход реплики не дал — слово у человека; открытая ветка
+            # закрывается вслух, а не повисает (нашли grok, claude)
+            if THREAD is not None:
+                _close_thread(THREAD, "адресат промолчал или выпал")
+                THREAD = None
+            break
         last = says[-1]
         # Чужое разговорное событие НОВЕЕ наших — параллельный процесс
         # (второе окно, слепой ход с его topic) уже ведёт стол. Уступаем:
@@ -1528,12 +1710,36 @@ def cmd_say(a) -> int:
         if conv and conv[-1].get("id", 0) > my_top:
             print("в ленте параллельный разговор — этот процесс уступает")
             break
-        names, why = pick_voices(last, roster())
+        # ВЕТКА адресного вопроса: адресат отвечает в ней; после его
+        # ответа слово получают ТОЛЬКО поднявшие руку («если захотят»),
+        # новый @адрес внутри ветки — просто текст (цепочки не
+        # оплачиваются), иначе ветка закрывается и слово у человека.
+        in_thread = bool(last.get("thread"))
+        names, why = pick_voices(last, roster(), allow_address=not in_thread)
         names = [n for n in names if n != last["author"]]
         if not names:
+            if THREAD is not None:
+                _close_thread(THREAD, "продолжать некому")
+                THREAD = None
             break
-        res = hand_word(last, names, why,
-                        names if why == "по адресу" else roster())
+        if in_thread and why != "подняли руку":
+            _close_thread(last["thread"],
+                          "рука у уже говоривших — остывание" if "остывание" in why
+                          or why.startswith("рука") else "рук нет")
+            THREAD = None
+            break
+        if why == "по адресу коллеги":
+            THREAD = last["id"]
+        elif in_thread and why == "подняли руку":
+            THREAD = last["thread"]
+        else:
+            THREAD = None
+        names = _cap_group(names)
+        # Пул замен: при адресе и внутри ветки — только сами названные,
+        # чтобы отказ поднявшего руку не тянул в ветку молчавшего
+        # (нашли codex, claude).
+        pool = names if (why.startswith("по адресу") or THREAD is not None) else roster()
+        res = hand_word(last, names, why, pool)
     return 0
 
 
