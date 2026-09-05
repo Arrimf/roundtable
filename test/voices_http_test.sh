@@ -132,6 +132,7 @@ curl -s "$B/round_view?name=nope" | grep -q '"found": false' && pass "/round_vie
 # ── шаги раунда с ЗАГЛУШКОЙ дирижёра: argv в файл, сон 3 с, код 0 ──
 # (ревизия 2026-09-03: без стаба «проверка занятости мертва с рождения» и
 # «финал без поля round» проходили тесты — codex, grok, kimi, claude, субагент)
+cp "$W/choir/choir.py" "$W/choir/choir_real.py"   # живой дирижёр — для проверок его функций
 cat > "$W/choir/choir.py" <<'EOF'
 import sys, time, os
 open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "argv.log"), "a").write(" ".join(sys.argv[1:]) + "\n")
