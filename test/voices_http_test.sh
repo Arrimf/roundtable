@@ -42,7 +42,7 @@ EOF
 if ss -ltn 2>/dev/null | grep -q ":$PORT "; then
   echo "порт $PORT занят: $(ss -ltnp | grep ":$PORT ") — задайте RT_HTTP_TEST_PORT"; exit 2
 fi
-( cd "$RT_DIR" && ROUNDTABLE_CHAMBER="$W/chamber" ROUNDTABLE_JOURNAL="$W/journal" CHOIR_RT_VOICES="$W/rt-voices.json" \
+( cd "$RT_DIR" && ROUNDTABLE_CHAMBER="$W/chamber" ROUNDTABLE_JOURNAL="$W/journal" CHOIR_RT_VOICES="$W/rt-voices.json" CHOIR_RT_ACTS="$W/acts" CHOIR_LEASE_DIR="$W/leases" \
   CHOIR_RT_MODELS="$W/rt-models.json" CHOIR_RT_NO_DISCOVERY=1 CHOIR_DSH_PATCH_DIR="$W/dshp" \
   CHOIR_WT_DIR="$W/wt" ROUNDTABLE_PORT="$PORT" nohup python3 roundtable.py --no-project \
   > "$W/srv.log" 2>&1 ) &
@@ -255,6 +255,40 @@ m.snapshot_goal("зафиксированная"); assert m.goal_notice().starts
 print("goal_of_seed ok")
 EOF
 ) && pass "choir.py: goal_of_seed многострочная (поле goal и запасной разбор префикса), снимок цели" || fail "choir.py: goal_of_seed"
+
+# ── GET /act_log: хвост лога акта для вкладок вывода (раунд вкладки-вывода-v1) ──
+mkdir -p "$W/acts" "$W/leases"
+[ "$(curl -s -o /dev/null -w '%{http_code}' "$B/act_log?id=zz")" = 400 ] && pass "/act_log: кривой id → 400" || fail "/act_log id"
+[ "$(curl -s -o /dev/null -w '%{http_code}' "$B/act_log?id=deadbeef")" = 404 ] && pass "/act_log: лога нет → 404" || fail "/act_log 404"
+printf 'строка 1\n\033[31mкрасное\033[0m %s/секрет sk-ABCDEFGHIJKLMNOP key=abcdefghijklmnop\nстрока 3\n' "$HOME" > "$W/acts/deadbeef.log"
+curl -s "$B/act_log?id=deadbeef" | python3 -c '
+import json,sys; d=json.load(sys.stdin)
+assert "\x1b" not in d["text"] and "красное" in d["text"], d
+import os; assert os.path.expanduser("~") not in d["text"] and "~/секрет" in d["text"], d
+assert "sk-ABCDEFGHIJKLMNOP" not in d["text"] and "abcdefghijklmnop" not in d["text"] and "‹вырезано›" in d["text"], d
+assert d["done"] is True and d["source"]=="act" and d["next"]==d["size"] and not d["reset"], d
+print("scrub ok")' && pass "/act_log: ANSI, домашний путь и ключи вырезаны; done, next=size" || fail "/act_log: чистка/поля"
+curl -s "$B/act_log?id=deadbeef&since=999999" | python3 -c '
+import json,sys; d=json.load(sys.stdin); assert d["reset"] is True and d["text"].startswith("строка 1"), d' \
+  && pass "/act_log: смещение больше размера → reset, читаем с начала" || fail "/act_log reset"
+N=$(curl -s "$B/act_log?id=deadbeef" | python3 -c 'import json,sys; print(json.load(sys.stdin)["next"])'); printf 'строка 4\n' >> "$W/acts/deadbeef.log"
+curl -s "$B/act_log?id=deadbeef&since=$N" | python3 -c '
+import json,sys; d=json.load(sys.stdin); assert d["text"]=="строка 4\n" and not d["reset"], d' \
+  && pass "/act_log: дочитывание с смещения отдаёт только новое" || fail "/act_log tail"
+python3 -c 'open("'"$W"'/acts/deadbeef.log","w").write("x"*300000+"\nхвост\n")'
+curl -s "$B/act_log?id=deadbeef" | python3 -c '
+import json,sys; d=json.load(sys.stdin); assert d["skipped"] is True and d["text"]=="хвост\n", (d["skipped"], d["text"][:40])' \
+  && pass "/act_log: большой файл при первом чтении — только хвост, skipped" || fail "/act_log skipped"
+curl -s "$B/act_log?id=deadbeef&kind=raw" | python3 -c '
+import json,sys; d=json.load(sys.stdin); assert d["source"]=="act", d' && pass "/act_log kind=raw без сырого файла → лог акта" || fail "/act_log raw fallback"
+printf 'сырой вывод\n' > "$W/acts/deadbeef.raw.log"
+curl -s "$B/act_log?id=deadbeef&kind=raw" | python3 -c '
+import json,sys; d=json.load(sys.stdin); assert d["source"]=="raw" and d["text"]=="сырой вывод\n", d' && pass "/act_log kind=raw: сырой вывод CLI" || fail "/act_log raw"
+printf 'старая эпоха\n' > "$W/leases/edit-abc123def456.1.log"; sleep 0.02; printf 'кресло пишет\n' > "$W/leases/edit-abc123def456.2.log"
+curl -s "$B/act_log?id=deadbeef&kind=chair&edit=abc123def456" | python3 -c '
+import json,sys; d=json.load(sys.stdin); assert d["source"]=="chair" and d["text"]=="кресло пишет\n", d' && pass "/act_log kind=chair: лог CLI кресла, свежая эпоха" || fail "/act_log chair"
+curl -s "$B/" | grep -q "viewtabs" && pass "страница: вкладки вывода в скрипте" || fail "страница без вкладок вывода"
+
 grep -q "Traceback" "$W/srv.log" && fail "в логе сервера трейсбек: $(grep -A3 Traceback "$W/srv.log" | head -5)" || pass "трейсбеков в логе сервера нет"
 printf '\nvoices_http: PASS %d · FAIL %d\n' "$PASS" "$FAIL"
 [ "$FAIL" = 0 ]

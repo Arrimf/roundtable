@@ -1254,6 +1254,40 @@ class _FifoReader:
         return b"".join(self.chunks).decode("utf-8", errors="replace")
 
 
+# ЗАМЕТКИ О ХОДЕ В СЛЕПОЙ ФАЗЕ: очередь Кими, запасная линия, повторы —
+# поимённые и живые, они ложатся в лог акта на диске до закрытия фазы, а
+# лог читает любой агент под тем же пользователем (правило 8.5; нашёл kimi
+# в ревизии вкладок вывода). В слепой фазе они копятся здесь и печатаются
+# пачкой по закрытии; в открытых фазах печатаются сразу.
+BLIND_NOTES: list[str] = []
+_BLIND_NOTES_LOCK = threading.Lock()
+
+
+def _say(visibility: str, msg: str) -> None:
+    if visibility == "blind":
+        with _BLIND_NOTES_LOCK:
+            BLIND_NOTES.append(msg)
+    else:
+        print(msg, flush=True)
+
+
+_THOUGHTS_RE = re.compile(r"💭 мысли модели.*?💭 конец мыслей\n?", re.S)
+
+
+def strip_thoughts(text: str) -> str:
+    """Блоки рассуждений адаптеров (CHOIR_THOUGHTS) — не улика для
+    диагноза канала: модель, рассуждая о квотах стола, сама напишет
+    «429», и линия выключилась бы на сутки (ревьюер вкладок вывода)."""
+    return _THOUGHTS_RE.sub("", text or "")
+
+
+def flush_blind_notes() -> None:
+    with _BLIND_NOTES_LOCK:
+        notes, BLIND_NOTES[:] = list(BLIND_NOTES), []
+    for msg in notes:
+        print(msg, flush=True)
+
+
 def ask_one(name: str, prompt: str, round_id: str, phase: str,
             parent: str | None, visibility: str, use_role: bool = True) -> dict:
     """Спросить один голос. Возвращает запись для room.jsonl.
@@ -1368,12 +1402,10 @@ def ask_one(name: str, prompt: str, round_id: str, phase: str,
             # ошибка, из-за которой стол трое суток считал Кими медленным.
             def _wait_note(sec: int, who: str) -> None:
                 if sec == 0:
-                    print(f"  ⏳ {name}: ПОСТАВЛЕН В ОЧЕРЕДЬ — голос ещё не "
-                          f"отвечал, ждём освобождения (занято: {who})",
-                          flush=True)
+                    _say(visibility, f"  ⏳ {name}: ПОСТАВЛЕН В ОЧЕРЕДЬ — голос ещё не "
+                                     f"отвечал, ждём освобождения (занято: {who})")
                 elif sec % 15 == 0:
-                    print(f"  ⏳ {name}: всё ещё в очереди, {sec} с",
-                          flush=True)
+                    _say(visibility, f"  ⏳ {name}: всё ещё в очереди, {sec} с")
 
             # ВЫБОР ЛИНИИ. Основная — пока свободна; занята ею же (тот
             # же голос ведёт раунд и отвечает в нём, или рядом идёт живая
@@ -1399,25 +1431,25 @@ def ask_one(name: str, prompt: str, round_id: str, phase: str,
                     rec |= {"channel": ch["name"], "model": ch["model"],
                             "gate": ch["gate"]}
                     if ch is not chans[0]:
-                        print(f"  ⇄ {name}: основная линия занята — иду "
-                              f"запасной ({ch['model']}). Это ТОТ ЖЕ голос, "
-                              f"не второй участник", flush=True)
+                        _say(visibility, f"  ⇄ {name}: основная линия занята — иду "
+                                         f"запасной ({ch['model']}). Это ТОТ ЖЕ голос, "
+                                         f"не второй участник")
                 # Время в очереди — свойство КАНАЛА, а не участника, и в
                 # elapsed_s ему не место: иначе замеры «кто долго думает»
                 # снова начнут считать чужую занятость думаньем.
                 queued_s = round(time.monotonic() - gate_t0, 1)
                 if queued_s >= 1:
                     rec["queued_s"] = queued_s
-                    print(f"  ▶ {name}: очередь пройдена за {queued_s} с, "
-                          f"вызываю", flush=True)
+                    _say(visibility, f"  ▶ {name}: очередь пройдена за {queued_s} с, "
+                                     f"вызываю")
                 t0 = time.monotonic()          # отсчёт РАБОТЫ, не ожидания
                 run = with_retry(
                     lambda: _call(ch),
                     blob_of=lambda r: (r["stdout"] or "") + (r["stderr"] or ""),
-                    on_retry=lambda p: print(
+                    on_retry=lambda p: _say(
+                        visibility,
                         f"  ⏳ {name}: провайдер занят (concurrency), "
-                        f"повтор через {p} с — это НЕ ответ голоса",
-                        flush=True))
+                        f"повтор через {p} с — это НЕ ответ голоса"))
         else:
             run = _call()
         rec["returncode"] = run["returncode"]
@@ -1431,7 +1463,7 @@ def ask_one(name: str, prompt: str, round_id: str, phase: str,
             out = v["extract"](run["stdout"]).strip()
         else:
             out = (run["stdout"] or "").strip()
-        full_err = (run["stderr"] or "").strip()
+        full_err = strip_thoughts(run["stderr"] or "").strip()
         # ХВОСТ, а не голова: финальная причина канала стоит последней,
         # а при каскаде моделей Джемини начало забито перебором ключей
         # (нашёл kimi). Голова обрезки показывала середину перебора и
@@ -1448,7 +1480,7 @@ def ask_one(name: str, prompt: str, round_id: str, phase: str,
         #     уходил в `error`, то есть снова врал: не поломка канала, а
         #     отказ в обслуживании. Поймано на своде раунда `патент-v1`:
         #     «max organization concurrency: 1» упало за 17 секунд.
-        blob = (run["stdout"] or "") + (run["stderr"] or "")
+        blob = (run["stdout"] or "") + strip_thoughts(run["stderr"] or "")
         looks_429 = "429" in blob or "rate_limit" in blob or "rate limit" in blob
         quota_detail = None
         if probe and run["status"] in ("stalled", "timeout"):
@@ -1535,6 +1567,7 @@ def _run_phase(names: list[str], prompts: dict[str, str], round_id: str,
     with ThreadPoolExecutor(max_workers=len(names)) as ex:
         futs = {ex.submit(ask_one, n, prompts[n], round_id, phase, parent,
                           visibility): n for n in names}
+        deferred: list[str] = []
         for f in as_completed(futs):
             rec = f.result()
             results[rec["voice"]] = rec
@@ -1553,8 +1586,25 @@ def _run_phase(names: list[str], prompts: dict[str, str], round_id: str,
             # прогон, должен видеть, что голос ответил другим ключом.
             if rec.get("channel") and rec["channel"] != "main":
                 detail = f"  ⇄ канал {rec['channel']}" + detail
-            print(f"{mark} {rec['voice']:<8} {rec.get('elapsed_s', 0):>6.1f} с  "
-                  f"{len(rec['text']):>6} симв.{detail}")
+            line = (f"{mark} {rec['voice']:<8} {rec.get('elapsed_s', 0):>6.1f} с  "
+                    f"{len(rec['text']):>6} симв.{detail}")
+            if blind:
+                # СЛЕПАЯ ФАЗА: поимённая строка (кто, сколько думал, сколько
+                # написал, ПАС или нет, порядок готовности) ложится в лог
+                # акта на диске, а лог читает любой агент под тем же
+                # пользователем — и это смещает ещё отвечающих (правило
+                # 8.5; раунд вкладки-вывода-v1, все шесть голосов). Вживую
+                # печатается только обезличенный счётчик; поимённые строки
+                # выходят пачкой по закрытии фазы, по алфавиту.
+                deferred.append(line)
+                print(f"· готово {len(results)}/{len(names)}", flush=True)
+            else:
+                print(line, flush=True)
+        if deferred:
+            print("слепая фаза закрыта — поимённо:", flush=True)
+            flush_blind_notes()          # очередь, запасные линии, повторы
+            for line in sorted(deferred, key=lambda l: l.split()[1] if len(l.split()) > 1 else l):
+                print(line, flush=True)
 
     # Каскад: если ВСЕ упали, и упали мгновенно — это почти наверняка
     # общий сбой (сеть, шлюз), а не мнение стола. Молча записать четыре
@@ -2049,6 +2099,7 @@ def cmd_expand(a: argparse.Namespace) -> int:
 """
     print(f"затравку разворачивает: {who}\n")
     rec = ask_one(who, prompt, a.round, "expand", None, "blind", use_role=False)
+    flush_blind_notes()      # затравка — один голос, скрывать нечего; заметки сразу
     rec["role"] = "seed_expanded"
     rec["author_question"] = q
     rec["author_question_sha"] = _sha(q)
@@ -2876,6 +2927,7 @@ def cmd_catchup(a: argparse.Namespace) -> int:
                 continue
             rec = ask_one(voice, seed, d["round"], d["phase"], d["parent"],
                           "open")
+            flush_blind_notes()      # добор — поздний ответ, фаза давно закрыта
             rec["late"] = True
             rec["nonblind"] = True
             rec["catchup_of"] = d["id"]

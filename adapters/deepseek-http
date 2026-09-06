@@ -147,7 +147,16 @@ def main() -> int:
         log(f"не ответил после {RETRIES} попыток: {last}")
         return 1
 
-    text = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
+    _msg = (data.get("choices") or [{}])[0].get("message", {}) or {}
+    text = _msg.get("content", "") or ""
+    # МЫСЛИ МОДЕЛИ (правило 17, наказ Автора 2026-09-06): reasoning_content
+    # у моделей с рассуждением печатается в stderr — по флагу CHOIR_THOUGHTS=1
+    # (галочка «мысли» в окне стола). Ответ стола в stdout не меняется:
+    # мысли — для человека, который смотрит на ход, а не пакет голосам.
+    _think = _msg.get("reasoning_content")
+    if os.environ.get("CHOIR_THOUGHTS") == "1" and isinstance(_think, str) and _think.strip():
+        print(f"💭 мысли модели (reasoning_content, {len(_think)} симв.):\n"
+              f"{_think.rstrip()}\n💭 конец мыслей", file=sys.stderr, flush=True)
     if not text.strip():
         log("пустой ответ модели")
         return 1

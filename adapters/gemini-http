@@ -138,12 +138,22 @@ def extract_text(resp: dict) -> str:
     они не идут: правило 16 (краткость как условие работы стола), да и
     участники должны читать позицию, а не поток сознания."""
     out = []
+    thoughts = []
     for cand in resp.get("candidates", []):
         for part in (cand.get("content") or {}).get("parts", []):
             if part.get("thought"):
+                # Мысли модели (правило 17, наказ Автора 2026-09-06): в
+                # ответ стола по-прежнему не идут, но человеку, который
+                # смотрит на ход, печатаются в stderr по CHOIR_THOUGHTS=1.
+                if isinstance(part.get("text"), str):
+                    thoughts.append(part["text"])
                 continue
             if isinstance(part.get("text"), str):
                 out.append(part["text"])
+    if thoughts and os.environ.get("CHOIR_THOUGHTS") == "1":
+        joined = "".join(thoughts).strip()
+        print(f"💭 мысли модели (thought summaries, {len(joined)} симв.):\n"
+              f"{joined}\n💭 конец мыслей", file=sys.stderr, flush=True)
     return "".join(out).strip()
 
 
@@ -258,6 +268,11 @@ def ask(prompt: str, model: str, timeout: int, session: str | None,
     # вариант никуда не делся; low выбирают явно и ради скорости).
     payload["generationConfig"] = {"thinkingConfig":
                                    {"thinkingLevel": thinking}}
+    if os.environ.get("CHOIR_THOUGHTS") == "1":
+        # сводки мыслей просим только когда их будут смотреть: лишние
+        # байты в ответе никому не нужны, а отказ API по этому полю
+        # (если модель его не знает) не должен ронять голос вслепую
+        payload["generationConfig"]["thinkingConfig"]["includeThoughts"] = True
     if temperature is not None:
         payload["generationConfig"]["temperature"] = temperature
     if tools:

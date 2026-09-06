@@ -125,6 +125,20 @@ via the CLI's OAuth token, the codex and grok CLI caches, Moonshot
 feed) live in the side panel under the lottery buttons and appear only
 on the 🔧 tab; the dialog buttons at the bottom never move.
 
+**Watching the work, not waiting for it.** Above the feed sit three
+output tabs: 🎼 *conductor* streams the orchestration of a round as it
+runs (who was called, the Kimi queue, retries, statuses — in the blind
+phase only an anonymous counter, the per-voice lines come out together
+when the phase closes), 🔧 *executor* streams the CLI in the chair, and
+⚡ *quick answer* streams the raw output of the voice answering a quick
+question. The tabs poll the act log by byte offset, survive a reload,
+and scrub ANSI, home paths and key-shaped strings. The 💭 *thoughts*
+switch (on by default) asks every channel for the model's reasoning
+where it exists — Claude thinking blocks, Codex reasoning summaries,
+DeepSeek `reasoning_content`, Gemini thought summaries — and shows it
+in the tabs; each line says what it is. A quick question that starts
+with `#кресло` goes to a random executor's chair instead of the room.
+
 ## Design rules the code enforces
 
 - **Same question, same context for everyone** — otherwise opinions are
@@ -147,7 +161,7 @@ bash test/edit_test.sh         # 31 edit/recovery scenarios
 bash test/gate_test.sh         # 47 review/merge-gate scenarios
 python3 test/catalog_test.py   # 45 model-catalog scenarios (no network)
 python3 test/exec_argv_test.py # 29 executor argv / explicit-default checks
-bash test/voices_http_test.sh  # 49 HTTP checks of the tabs, round card, goal, addressed room (isolated window, no voice calls)
+bash test/voices_http_test.sh  # 59 HTTP checks of the tabs, round card, goal, addressed room, act log (isolated window, no voice calls)
 bash smoke.sh                  # window smoke, 16 checks
 ```
 

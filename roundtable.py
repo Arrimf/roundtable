@@ -434,7 +434,8 @@ def feed_append(kind: str, text: str, **extra) -> dict:
 # RUNNING — рестарт окна её терял. Теперь stdout+stderr каждого действия
 # собираются в файл по act_id, файл остаётся на диске для разбора.
 # Это диагностика, не вторая истина: итог (done/error + хвост) — в ленте.
-ACT_DIR = Path.home() / ".cache" / "choir" / "rt-acts"
+ACT_DIR = Path(os.environ.get("CHOIR_RT_ACTS")
+               or Path.home() / ".cache" / "choir" / "rt-acts")
 
 # Имя раунда — ОДНО правило на сервер и на страницу (константа, а не
 # литерал в обработчике): вторая копия правила живёт в PAGE (RE_ROUND),
@@ -465,6 +466,106 @@ def _log_tail(log_path: Path, limit: int = 400) -> str:
             "utf-8", errors="replace")[-limit:].strip()
     except OSError:
         return ""
+
+
+
+
+# ── ХВОСТ ЛОГА АКТА ДЛЯ ВКЛАДОК «ДИРИЖЁР / ИСПОЛНИТЕЛЬ / БЫСТРЫЙ ОТВЕТ» ──
+# Наказ Автора 2026-09-06: видеть работу стола «как в терминале», не ждать.
+# Раунд вкладки-вывода-v1 (все шесть голосов): опрос со смещением по байтам,
+# не SSE; порция до 64 КиБ; при первом чтении большого файла — только хвост
+# с пометкой skipped; смещение больше размера — файл начат заново, reset.
+# Чистка на выдаче: ANSI, домашний каталог → ~, строки, похожие на ключи.
+_ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]")
+_LOG_SECRET_RE = re.compile(r"(?i)(bearer\s+\S+|sk-[A-Za-z0-9_-]{8,}|AIza[0-9A-Za-z_-]{10,}|"
+                            r"gh[pousr]_[A-Za-z0-9]{10,}|github_pat_[A-Za-z0-9_]{10,}|xai-[A-Za-z0-9_-]{10,}|"
+                            r"xox[abpsr]-[A-Za-z0-9-]{10,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}|"
+                            r"(?:\b[A-Za-z0-9_-]*(?:x-api-key|api[_-]?key|token|secret|authorization)|\bkey)"
+                            r"[\"']?\s*[:=]\s*[\"']?[^\"'&\s]{8,})")
+ACT_LOG_CHUNK = 64 * 1024
+ACT_LOG_FIRST = 256 * 1024
+
+
+def _scrub_log(text: str) -> str:
+    text = _ANSI_RE.sub("", text).replace("\r\n", "\n").replace("\r", "\n")
+    text = text.replace(str(Path.home()), "~")
+    return _LOG_SECRET_RE.sub("‹вырезано›", text)
+
+
+def _act_log_path(aid: str, kind: str, edit: str = "") -> tuple[Path | None, str]:
+    """Файл лога по роду вкладки: act — stdout+stderr процесса акта; raw —
+    сырой вывод CLI голоса (быстрый вопрос, RT_RAW), иначе лог акта; chair —
+    лог CLI кресла из каталога аренд (edit-<акт правки>.<эпоха>.log, самая
+    свежая эпоха), иначе лог процесса-обёртки."""
+    if kind == "raw":
+        raw = ACT_DIR / f"{aid}.raw.log"
+        if raw.exists():
+            return raw, "raw"
+    if kind == "chair":
+        try:
+            cands = sorted(leases.LEASE_DIR.glob(f"edit-{edit or aid}.*.log"),
+                           key=lambda q: q.stat().st_mtime)
+        except OSError:              # файл аренды исчез между glob и stat (kimi)
+            cands = []
+        if cands:
+            return cands[-1], "chair"
+    act = ACT_DIR / f"{aid}.log"
+    return (act, "act") if act.exists() else (None, "")
+
+
+def _utf8_cut(b: bytes) -> bytes:
+    """Отрезать незавершённый хвост многобайтового символа (до 3 байт)."""
+    for k in range(1, min(4, len(b)) + 1):
+        c = b[-k]
+        if c & 0xC0 != 0x80:               # не байт продолжения — начало символа
+            need = 2 if c & 0xE0 == 0xC0 else 3 if c & 0xF0 == 0xE0 else 4 if c & 0xF8 == 0xF0 else 1
+            return b[:-k] if need > k else b
+    return b
+
+
+def _read_log_tail(path: Path, since: int, alive: bool = False) -> dict:
+    """Порция лога от since. Пока акт жив, отдаются только ЦЕЛЫЕ строки:
+    ключ, JSON-событие или многобайтовый символ, разрезанные границей
+    опроса, ускользнули бы от чистки и разбора (ревизия: codex, gemini).
+    Строка длиннее порции режется по границе символа UTF-8."""
+    size = path.stat().st_size
+    reset = skipped = False
+    start = since
+    if start > size:
+        start, reset = 0, True
+    if start == 0 and size > ACT_LOG_FIRST:
+        start, skipped = size - ACT_LOG_FIRST, True
+    with path.open("rb") as f:
+        if skipped:
+            # от начала строки: обрывок первой строки — мусор. Перевод
+            # строки ищется по всему хвосту, а не в первой порции: у
+            # болтливого CLI одна строка бывает длиннее порции.
+            f.seek(start)
+            scanned = 0
+            while scanned < ACT_LOG_FIRST:
+                blk = f.read(ACT_LOG_CHUNK)
+                if not blk:
+                    break
+                nl = blk.find(b"\n")
+                if nl >= 0:
+                    start += scanned + nl + 1
+                    break
+                scanned += len(blk)
+        f.seek(start)
+        chunk = f.read(ACT_LOG_CHUNK + 1)
+    more = len(chunk) > ACT_LOG_CHUNK
+    if more:
+        chunk = chunk[:ACT_LOG_CHUNK]
+        nl = max(chunk.rfind(b"\n"), chunk.rfind(b"\r"))
+        chunk = chunk[:nl + 1] if nl >= 0 else _utf8_cut(chunk)
+    elif alive and chunk and not chunk.endswith((b"\n", b"\r")):
+        # \r — тоже граница: прогресс grok/kimi через pty идёт возвратами
+        # каретки без \n, и вкладка молчала бы до конца хода (ревьюер)
+        nl = max(chunk.rfind(b"\n"), chunk.rfind(b"\r"))
+        chunk = chunk[:nl + 1] if nl >= 0 else b""      # недописанную строку — потом
+    return {"text": _scrub_log(chunk.decode("utf-8", errors="replace")),
+            "next": start + len(chunk), "size": size,
+            "reset": reset, "skipped": skipped, "more": more and len(chunk) > 0}
 
 
 def _act_fields(rec: dict | None) -> dict:
@@ -1001,8 +1102,8 @@ def _save_voice_cfg(name: str, vscope: str) -> None:
 
 
 def _spawn_env(voices: list[str]) -> dict:
-    """См. также CHOIR_NO_DING ниже: звонит окно, а не подпроцесс."""
     """os.environ плюс переопределения окна для этих голосов.
+    (См. также CHOIR_NO_DING ниже: звонит окно, а не подпроцесс.)
 
     Без этого POST /voices был бы декорацией: значение лежит в памяти
     сервера, а подпроцесс запускается с чистым окружением родителя и
@@ -1012,6 +1113,17 @@ def _spawn_env(voices: list[str]) -> dict:
     ровно потому, что live.py зовёт subprocess.run без env= и наследует
     окружение целиком."""
     env = dict(os.environ)
+    # PYTHONUNBUFFERED: stdout ребёнка идёт в файл акта, а файловый stdout
+    # у Python блочный — без этого лог акта пуст до самого конца хода
+    # (замер grok, раунд вкладки-вывода-v1: 0 байт до закрытия fd), и
+    # вкладки «дирижёр»/«исполнитель» показывали бы тишину. RT_ACT_DIR —
+    # чтобы комната знала, куда класть сырой вывод (RT_RAW, см. live.py).
+    env["PYTHONUNBUFFERED"] = "1"
+    env["RT_ACT_DIR"] = str(ACT_DIR)
+    # RT_RAW — только по явному решению обработчика (быстрый вопрос);
+    # унаследованная из оболочки «1» положила бы сырые ответы слепого
+    # такта на диск (нашёл grok).
+    env["RT_RAW"] = "0"
     # Такт, запущенный окном, НЕ звонит paplay сам: сокет звука он
     # наследует (окружение передаётся целиком), и без этой строки
     # каждый такт звонил дважды — paplay изнутри плюс WebAudio окна
@@ -2593,6 +2705,33 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-cache")
             self.end_headers()
             self._stream(after)
+        elif self.path.partition("?")[0] == "/act_log":
+            q = parse_qs(self.path.partition("?")[2])
+            aid = (q.get("id") or [""])[0].strip()
+            kind = (q.get("kind") or ["act"])[0]
+            edit = (q.get("edit") or [""])[0].strip()
+            try:
+                since = max(0, int((q.get("since") or ["0"])[0]))
+            except ValueError:
+                since = 0
+            if not re.fullmatch(r"[0-9a-f]{6,32}", aid) or (
+                    edit and not re.fullmatch(r"[0-9a-f]{6,32}", edit)):
+                return self._json(400, {"error": "id акта — 6–32 hex-символов"})
+            if kind not in ("act", "raw", "chair"):
+                return self._json(400, {"error": "kind: act | raw | chair"})
+            path, source = _act_log_path(aid, kind, edit)
+            if path is None:
+                return self._json(404, {"error": f"лога акта {aid} нет"})
+            with RUN_LOCK:
+                alive = aid in RUNNING or (
+                    bool(edit) and any(t.get("edit") == edit for t in RUNNING.values()))
+            try:
+                out = _read_log_tail(path, since, alive)
+            except OSError as e:
+                return self._json(500, {"error": f"лог не читается: {e}"})
+            out.update(done=not alive, source=source, id=aid)
+            return self._json(200, out)
+
         elif self.path == "/state":
             with RUN_LOCK:
                 # round/auto отдаём отдельными полями, а не оставляем
@@ -2602,6 +2741,7 @@ class Handler(BaseHTTPRequestHandler):
                             "label": t["label"], "voices": t["voices"],
                             "for_s": int(time.time() - t["since"]),
                             "round": t.get("round"),
+                            "edit": t.get("edit"),
                             "auto": bool(t.get("auto"))}
                            for aid, t in RUNNING.items()]
             with LOT_LOCK:
@@ -2819,7 +2959,13 @@ class Handler(BaseHTTPRequestHandler):
                               if picked_by_server else ""),
                         fields=acc_fields or None,
                         env_extra={"CHOIR_BRIEF": "1" if brief else "0",
-                                   "CHOIR_PEER": "1" if peer else "0"})
+                                   "CHOIR_PEER": "1" if peer else "0",
+                                   # Сырой вывод CLI на диск — ТОЛЬКО
+                                   # быстрому вопросу: один голос, слепоты
+                                   # нет. Слепой ход (ask) и разговор —
+                                   # без него (правило 8.5).
+                                   "RT_RAW": "1" if quick else "0",
+                                   "CHOIR_THOUGHTS": "1" if req.get("thoughts") else "0"})
             return self._json(200, {"act": act})
 
         if self.path == "/round":
@@ -2974,7 +3120,8 @@ class Handler(BaseHTTPRequestHandler):
             act = spawn(cmd, label, rvoices or VOICES, cwd=CHOIR,
                         meta={"round": name, "auto": auto},
                         note=note, fields=fields,
-                        env_extra={"CHOIR_BRIEF": "1" if brief else "0"})
+                        env_extra={"CHOIR_BRIEF": "1" if brief else "0",
+                                   "CHOIR_THOUGHTS": "1" if req.get("thoughts") else "0"})
             return self._json(200, {"act": act, "auto": auto,
                                     "rebuts": rebuts if auto else None,
                                     "question_file": qfile.name})
@@ -3083,7 +3230,8 @@ class Handler(BaseHTTPRequestHandler):
                       meta={"edit": act, "epoch": epoch,
                             "edit_project": str(ed["project"])},
                       note=picked_note,
-                      fields={"edit": act, "epoch": epoch, "voice": voice})
+                      fields={"edit": act, "epoch": epoch, "voice": voice},
+                      env_extra={"CHOIR_THOUGHTS": "1" if req.get("thoughts") else "0"})
             finally:
                 with RUN_LOCK:
                     _EDIT_RESERVED.discard(proj_key)
@@ -4485,7 +4633,7 @@ async function loadRound(name,box){
       b.disabled=true;
       let rr,jj={};
       try{rr=await fetch('/round_step',{method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({name:name,step:step,brief:briefOn()})});jj=await rr.json();}
+        body:JSON.stringify({name:name,step:step,brief:briefOn(),thoughts:thoughtsOn()})});jj=await rr.json();}
       catch(e){b.disabled=false;return acterr('сервер не ответил: '+e)}
       if(!rr.ok){b.disabled=false;return acterr((jj&&jj.error)||('ошибка '+rr.status))}
       // Кнопки гаснут до финала акта: карточка перечитается по событию.
@@ -4564,6 +4712,7 @@ const briefBox=document.getElementById('brief');
 try{briefBox.checked=localStorage.getItem('rt-brief')==='1'}catch(_){briefBox.checked=false}
 briefBox.onchange=function(){try{localStorage.setItem('rt-brief',briefBox.checked?'1':'0')}catch(_){}}
 function briefOn(){return !!(briefBox&&briefBox.checked)}
+function thoughtsOn(){return !!(document.getElementById('thoughts')||{}).checked}
 const peerBox=document.getElementById('peer');
 try{peerBox.checked=localStorage.getItem('rt-peer')==='1'}catch(_){peerBox.checked=false}
 peerBox.onchange=function(){try{localStorage.setItem('rt-peer',peerBox.checked?'1':'0')}catch(_){}}
@@ -5620,6 +5769,9 @@ async function state(){
 }
 setInterval(state,2000);state();
 async function send(blind){
+  // «#кресло …» первым словом — это задание, не реплика: Enter иначе
+  // рассылал бы его веером всем отмеченным голосам (ревьюер вкладок вывода)
+  if(/^#кресло(?:\s+|$)/iu.test(msg.value.trim()))return sendQuick();
   const text=msg.value.trim(); if(!text)return acterr('пустая реплика',true);
   const project=document.getElementById('project').value.trim();
   acterr('');
@@ -5629,7 +5781,7 @@ async function send(blind){
   // Автору набранной реплики, если снять его вслепую.
   try{
     r=await fetch('/act',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({text,blind,voices:picked('room'),project,brief:briefOn(),
+      body:JSON.stringify({text,blind,voices:picked('room'),project,brief:briefOn(),thoughts:thoughtsOn(),
         peer:peerOn()})});
   }catch(e){return acterr('сервер не ответил: '+e)}
   let j={};try{j=await r.json()}catch(_){}
@@ -5659,11 +5811,19 @@ async function send(blind){
 // Как только сервер объявит modes, случайный выбор уходит серверу
 // целиком, а окно перестаёт тянуть его само.
 async function sendQuick(){
-  const text=msg.value.trim(); if(!text)return acterr('пустая реплика',true);
+  // «#кресло …» первым словом (наказ Автора 2026-09-06; раунд
+  // вкладки-вывода-v1 — только первый токен, иначе цитата чужого текста
+  // угонит реплику в кресло): текст уходит ЗАДАНИЕМ случайному из умеющих,
+  // как с галочкой «coder», префикс срезается. Подтверждение остаётся тем
+  // же, что у галочки: стол разделился 3:3, а кресло платное.
+  const orig=msg.value.trim(); let text=orig;
+  const pm=text.match(/^#кресло(?:\s+|$)/iu); const viaPrefix=!!pm;   // и голый префикс — не вопрос
+  if(pm)text=text.slice(pm[0].length).trim();
+  if(!text)return acterr('пустая реплика',true);
   // Этап 4: галочка превращает быстрый вопрос в выдачу кресла тому же
   // голосу. Голос без рук (не умеет правки) — кресло случайному из
   // умеющих, и подмена называется в подтверждении, а не после.
-  if(document.getElementById('qexec').checked){
+  if(document.getElementById('qexec').checked||viaPrefix){
     const project=document.getElementById('project').value.trim();
     if(!project)return acterr('правке нужен проект: укажите путь к репозиторию');
     // Список умеющих — ОТ СЕРВЕРА (/state.edit_voices): копия в JS
@@ -5672,7 +5832,7 @@ async function sendQuick(){
     // старого сервера.
     const known=window.STATE&&window.STATE.edit_voices;
     const CAN=known||['codex','claude','grok','deepseek'];
-    const want=qsel.value||'';
+    const want=viaPrefix?'':(qsel.value||'');   // префикс = случайный исполнитель
     const voice=CAN.indexOf(want)>=0?want:null;
     // Без списка от сервера НЕ утверждаем «не умеет» — фолбэк мог
     // отстать от пула, и подпись лгала бы (нашёл deepseek).
@@ -5687,12 +5847,12 @@ async function sendQuick(){
     let r;
     try{
       r=await fetch('/edit',{method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({task:text,voice:voice,project:project})});
+        body:JSON.stringify({task:text,voice:voice,project:project,thoughts:thoughtsOn()})});
     }catch(e){return acterr('сервер не ответил: '+e)}
     let j={};try{j=await r.json()}catch(_){}
     if(!r.ok)return acterr('правка не открыта: '+((j&&j.error)||('ошибка '+r.status)));
     if(!j||!j.act)return acterr('сервер ответил 200 без акта — поле не чищу');
-    if(msg.value.trim()===text)msg.value='';
+    if(msg.value.trim()===orig)msg.value='';   // сравнение с исходником: после среза префикса поле иначе не чистилось (grok)
     try{document.getElementById('actid').value=j.act}catch(_){}
     acterr('кресло выдано: акт '+j.act+' ['+(j.voice||'?')+']'+
       (voice?'':' — исполнителя выбрал сервер')+', ветка act/'+j.act,true);
@@ -5707,7 +5867,7 @@ async function sendQuick(){
     voice=pool[Math.floor(Math.random()*pool.length)];here=true;
   }
   const body={text:text,mode:'quick',voice:voice,project:project,
-              brief:briefOn()};
+              brief:briefOn(),thoughts:thoughtsOn()};
   if(voice)body.voices=[voice];
   acterr('');
   let r;
@@ -5725,6 +5885,143 @@ async function sendQuick(){
 document.getElementById('say').onclick=()=>send(false);
 document.getElementById('blind').onclick=()=>send(true);
 document.getElementById('quick').onclick=()=>sendQuick();
+// ── ВКЛАДКИ ВЫВОДА: 🎼 дирижёр · 🔧 исполнитель · ⚡ быстрый ответ ──────
+// Наказ Автора 2026-09-06: видеть работу стола «как в терминале», а не
+// ждать. Раунд вкладки-вывода-v1 (шесть голосов): опрос хвоста лога акта
+// по смещению (GET /act_log), не SSE; у каждой вкладки свой акт и своё
+// смещение; переподключение — продолжить с того же места; мысли модели —
+// галочкой «💭 мысли» (Автор: «самое интересное»), умолчание включено.
+// Что показано — подписано словами (правило 17): печать процесса,
+// поток событий CLI, сводки рассуждений от провайдера.
+(function(){
+  const feed0=document.getElementById('feed'), top0=document.getElementById('feedtop');
+  if(!feed0||!top0||!document.createElement||!document.createDocumentFragment)return; // заглушка DOM в смоке
+  try{
+  const VIEWS=[['feed','💬 лента','Лента комнаты (как прежде)'],
+    ['cond','🎼 дирижёр','Ход оркестровки раунда и комнаты вживую: кого вызвал, очередь, повторы, статусы. В слепой фазе — только обезличенный счётчик; поимённые строки и сырые ответы — после закрытия фазы (правило 8.5).'],
+    ['chair','🔧 исполнитель','Вывод CLI в кресле исполнителя по мере работы: вызовы инструментов, правки, мысли (если канал их отдаёт).'],
+    ['quick','⚡ быстрый ответ','Сырой вывод CLI или HTTP-адаптера голоса на быстрый вопрос — по мере прихода, с мыслями модели, если галочка «мысли» стояла при отправке.']];
+  const KINDS={cond:['round','room'],chair:['chair'],quick:['quick']};
+  const LOGKIND={cond:'act',chair:'chair',quick:'raw'};
+  const css=document.createElement('style');
+  css.textContent='#viewtabs{display:flex;gap:.4rem;margin:.45rem 0 0}'
+   +'.vtab{background:var(--bg);border:1px solid var(--rule);color:var(--dim);border-radius:.4rem;padding:.2rem .6rem;cursor:pointer;font:inherit}'
+   +'.vtab:hover{border-color:var(--acc)}.vtab.on{background:var(--panel);color:var(--ink);border-color:var(--acc)}'
+   +'#feed.term>.ev{display:none}#termwrap{margin-top:.6rem}'
+   +'#termhead{display:flex;gap:.6rem;align-items:center;flex-wrap:wrap;color:var(--dim);font-size:.86rem;margin-bottom:.4rem}'
+   +'#termact{max-width:38ch;font:inherit;background:var(--bg);color:var(--ink);border:1px solid var(--rule);border-radius:.3rem}'
+   +'#term{white-space:pre-wrap;word-break:break-word;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.84rem;line-height:1.35;background:var(--bg);border:1px solid var(--rule);border-radius:.4rem;padding:.6rem .8rem;max-height:calc(100vh - 14rem);overflow:auto;margin:0}'
+   +'#term .think{color:var(--acc)}#term .tool{color:var(--me)}#term .meta{color:var(--dim)}#term .err{color:var(--err)}'
+   +'#term.nothink .think{display:none}';
+  (document.head||document.body||feed0).appendChild(css);
+  const feed=document.getElementById('feed'), top=document.getElementById('feedtop');
+  const qb=document.getElementById('quickbar');
+  // галочка «мысли»
+  const tl=document.createElement('label'); tl.id='thoughtslab';
+  tl.title='Мысли модели: thinking-блоки Claude, сводки рассуждений Codex, reasoning_content DeepSeek, thought summaries Gemini — там, где канал их отдаёт. Поставлена (умолчание) — адаптеры и CLI зовутся с их печатью, вкладки показывают. Снята — вкладки прячут мысли, адаптеры DeepSeek и Gemini их не печатают; у claude поток событий (stream-json) включён всегда, галочка решает только показ. Это печать канала, не «внутренний монолог»: что именно показано, подписано в строке.';
+  const tc=document.createElement('input'); tc.type='checkbox'; tc.id='thoughts';
+  try{tc.checked=(localStorage.getItem('rt-thoughts')||'1')==='1'}catch(_){tc.checked=true}
+  tc.onchange=function(){try{localStorage.setItem('rt-thoughts',tc.checked?'1':'0')}catch(_){}
+    const t=document.getElementById('term'); if(t)t.className=tc.checked?'':'nothink'};
+  tl.appendChild(tc); tl.appendChild(document.createTextNode(' 💭 мысли'));
+  if(qb)qb.appendChild(tl);
+  // вкладки
+  const bar=document.createElement('div'); bar.id='viewtabs'; const TABS=[];
+  VIEWS.forEach(function(v){const b=document.createElement('button'); b.className='vtab'+(v[0]==='feed'?' on':'');
+    b.setAttribute('data-view',v[0]); b.textContent=v[1]; b.title=v[2]; b.onclick=function(){setView(v[0])}; bar.appendChild(b); TABS.push([v[0],b])});
+  if(top)top.appendChild(bar);
+  const wrap=document.createElement('div'); wrap.id='termwrap'; wrap.hidden=true;
+  const head=document.createElement('div'); head.id='termhead';
+  const sel=document.createElement('select'); sel.id='termact'; sel.title='Какой акт показывать: идущие — первыми, потом завершённые (лог акта переживает окно)';
+  const pulse=document.createElement('span'); pulse.id='termpulse';
+  const fl=document.createElement('label'); const fc=document.createElement('input'); fc.type='checkbox'; fc.id='termfollow'; fc.checked=true;
+  fl.title='Прокручивать к новому выводу'; fl.appendChild(fc); fl.appendChild(document.createTextNode(' следить'));
+  const what=document.createElement('span'); what.id='termwhat'; what.className='meta';
+  head.appendChild(sel); head.appendChild(pulse); head.appendChild(fl); head.appendChild(what);
+  const pre=document.createElement('pre'); pre.id='term'; if(!tc.checked)pre.className='nothink';
+  wrap.appendChild(head); wrap.appendChild(pre);
+  try{if(top.parentNode===feed&&feed.insertBefore)feed.insertBefore(wrap,top.nextSibling); else feed.appendChild(wrap)}catch(_){feed.appendChild(wrap)}
+  // акты: из ленты (act_status) и из /state.running
+  const SEEN={}; let VIEW='feed'; const TERM={id:null,edit:'',next:0,timer:null,lastByte:0,lastSize:0,quiet:0,gen:0,source:''};
+  function classify(label){label=label||'';
+    if(/^round:/.test(label))return 'round'; if(/^edit:/.test(label))return 'chair';
+    if(/^быстрый:/.test(label))return 'quick'; return 'room'}
+  function noteAct(id,label,extra){if(!id)return; const o=SEEN[id]||(SEEN[id]={id:id,ts:Date.now()});
+    if(label&&!o.label){o.label=label;o.kind=classify(label)} if(extra&&extra.edit)o.edit=extra.edit;
+    if(extra&&extra.status)o.status=extra.status; if(extra&&extra.running!==undefined)o.running=extra.running}
+  const add0=add;
+  add=function(ev){try{if(ev&&ev.kind==='act_status'&&ev.act_id){
+      const m=/^act [0-9a-f]+ (?:принят|done|error|прерван|отвязан|abort)[^:]*: (.*)$/s.exec(ev.text||'');
+      noteAct(ev.act_id,m?m[1].split('\n')[0]:'',{edit:ev.edit,status:ev.status,running:ev.status==='accepted'})}}catch(_){}
+    return add0(ev)};
+  function syncRunning(){const r=(window.STATE&&window.STATE.running)||[]; const live={};
+    r.forEach(function(t){live[t.id]=1; noteAct(t.id,t.label,{edit:t.edit,running:true})});
+    Object.keys(SEEN).forEach(function(id){if(!live[id]&&SEEN[id].running&&window.STATE)SEEN[id].running=false})}
+  function actsFor(view){syncRunning(); const ks=KINDS[view]||[];
+    return Object.keys(SEEN).map(function(k){return SEEN[k]}).filter(function(a){return ks.indexOf(a.kind)>=0})
+      .sort(function(a,b){return (b.running?1:0)-(a.running?1:0)||b.ts-a.ts})}
+  function fillActs(){const acts=actsFor(VIEW); const cur=sel.value; sel.innerHTML='';
+    acts.forEach(function(a){const o=document.createElement('option'); o.value=a.id;
+      o.textContent=(a.running?'● ':'■ ')+a.id+' · '+(a.label||'').slice(0,40); sel.appendChild(o)});
+    if(acts.length&&acts.some(function(a){return a.id===cur}))sel.value=cur;
+    const pick=sel.value||(acts[0]&&acts[0].id)||null;
+    if(!pick){if(TERM.id!==null||pre.textContent)startTerm(null);return}
+    if(pick!==TERM.id)startTerm(pick)}
+  function startTerm(id){TERM.id=id; TERM.edit=(SEEN[id]&&SEEN[id].edit)||''; TERM.next=0; TERM.lastByte=0; TERM.lastSize=0; TERM.quiet=0; TERM.gen++; TERM.source='';
+    pre.textContent=''; what.textContent=''; inThink=false; pulse.textContent=id?'…':'актов этого рода пока нет';
+    if(id)tick()}
+  sel.onchange=function(){startTerm(sel.value)};
+  function line(cls,text){const s=document.createElement('span'); if(cls)s.className=cls; s.textContent=text+'\n'; return s}
+  let inThink=false;   // сбрасывается в startTerm: стиль мыслей не должен утекать в следующий акт
+  function render(text){const frag=document.createDocumentFragment();
+    text.split('\n').forEach(function(l,i,arr){if(i===arr.length-1&&l==='')return;
+      if(l.charAt(0)==='{'){let d=null; try{d=JSON.parse(l)}catch(_){}
+        if(d&&d.type){ // claude --output-format stream-json
+          if(d.type==='assistant'&&d.message&&d.message.content){(d.message.content||[]).forEach(function(b){
+            if(b.type==='thinking')frag.appendChild(line('think','💭 '+(b.thinking||'')));
+            else if(b.type==='text')frag.appendChild(line('','📝 '+(b.text||'')));
+            else if(b.type==='tool_use')frag.appendChild(line('tool','🔧 '+b.name+' '+JSON.stringify(b.input||{}).slice(0,300)))});return}
+          if(d.type==='user'&&d.message&&d.message.content){(d.message.content||[]).forEach(function(b){
+            if(b.type==='tool_result'){const c=typeof b.content==='string'?b.content:JSON.stringify(b.content||''); frag.appendChild(line('meta','↩ результат инструмента, '+c.length+' симв.'))}});return}
+          if(d.type==='result'){frag.appendChild(line('meta','■ итог'+(d.is_error?' (ошибка)':'')+(d.total_cost_usd!==undefined?' · $'+Number(d.total_cost_usd).toFixed(4):'')+(d.duration_ms?' · '+Math.round(d.duration_ms/1000)+' с':'')));return}
+          if(d.type==='system'){frag.appendChild(line('meta','· '+(d.subtype||'system')+(d.model?' '+d.model:'')));return}
+        }}
+      if(/^💭 мысли модели/.test(l)){inThink=true;frag.appendChild(line('think',l));return}
+      if(/^💭 конец мыслей/.test(l)){inThink=false;frag.appendChild(line('think',l));return}
+      if(inThink){frag.appendChild(line('think',l));return}
+      if(/^(Traceback|Error|ошибка|✗)/.test(l))frag.appendChild(line('err',l)); else frag.appendChild(line('',l))});
+    return frag}
+  async function tick(){if(VIEW==='feed'||!TERM.id)return; const gen=TERM.gen; const id=TERM.id;
+    if(document.hidden){if(!(TERM.done&&TERM.quiet>2))TERM.timer=setTimeout(tick,3000);return}
+    let j=null;
+    try{const r=await fetch('/act_log?id='+encodeURIComponent(id)+'&kind='+LOGKIND[VIEW]+'&since='+TERM.next+(TERM.edit?'&edit='+encodeURIComponent(TERM.edit):''));
+      j=await r.json(); if(!r.ok){pulse.textContent=(j&&j.error)||('ошибка '+r.status); TERM.timer=setTimeout(tick,r.status===404?3000:5000); return}}
+    catch(e){pulse.textContent='сервер не ответил'; TERM.timer=setTimeout(tick,3000); return}
+    if(gen!==TERM.gen||id!==TERM.id)return;
+    if(TERM.source&&j.source!==TERM.source){ // источник сменился (лог акта → сырой): читать заново
+      TERM.source=j.source;TERM.next=0;pre.textContent='';TERM.timer=setTimeout(tick,10);return}
+    TERM.source=j.source;
+    if(j.reset){pre.textContent='';TERM.next=0}
+    if(j.skipped&&!pre.textContent)pre.appendChild(line('meta','… начало лога пропущено (показан хвост 256 КиБ)'));
+    if(j.text){const atBottom=pre.scrollTop+pre.clientHeight>=pre.scrollHeight-8; pre.appendChild(render(j.text)); TERM.lastByte=Date.now(); TERM.quiet=0;
+      if(document.getElementById('termfollow').checked||atBottom)pre.scrollTop=pre.scrollHeight}
+    TERM.next=j.next; TERM.lastSize=j.size; TERM.done=!!j.done;
+    const src={act:'печать процесса акта',raw:'сырой вывод CLI/HTTP голоса',chair:'вывод CLI в кресле'}[j.source]||j.source;
+    what.textContent='показано: '+src+' · '+Math.round(j.size/1024)+' КБ';
+    const ago=TERM.lastByte?Math.round((Date.now()-TERM.lastByte)/1000):null;
+    pulse.textContent=(j.done?'■ завершён':'● идёт')+(ago!==null?' · последний байт '+ago+' с назад':'');
+    if(j.more){TERM.timer=setTimeout(tick,50);return}
+    if(j.done){TERM.quiet++; if(TERM.quiet>2)return}   // дочитали: опрос останавливается
+    TERM.timer=setTimeout(tick,j.done?1000:1500)}
+  function setView(v){VIEW=v; clearTimeout(TERM.timer);
+    TABS.forEach(function(t){t[1].className='vtab'+(t[0]===v?' on':'')});
+    feed.className=(feed.className||'').replace(/\bterm\b/g,'').trim()+(v!=='feed'?' term':''); wrap.hidden=(v==='feed');
+    if(v!=='feed'){TERM.id=null;fillActs()}}
+  window.setView=setView;
+  setInterval(function(){if(VIEW!=='feed'){const before=sel.value;fillActs();if(sel.value!==before&&!TERM.id)startTerm(sel.value)}},2500);
+  }catch(e){try{console.error('вкладки вывода не построены: '+e)}catch(_){}}
+})();
+
 // ── ПРЕРВАТЬ ВСЁ ─────────────────────────────────────────────────────
 // Подтверждение обязательно и на кнопке, и на Esc: Автор ждал этого
 // именно от Esc, а Esc жмут не думая — чтобы убрать фокус, закрыть
@@ -5790,7 +6087,7 @@ document.getElementById('round').onclick=async()=>{
       rebuts+' → summarize, без остановки. Голоса: '+rvoices.join(', ')+
       ' — платно. Пускаем?'))return;
   const r=await fetch('/round',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({question,name,auto,rebuts,brief:briefOn(),
+    body:JSON.stringify({question,name,auto,rebuts,brief:briefOn(),thoughts:thoughtsOn(),
                          voices:rvoices,
                          project:document.getElementById('project').value.trim()})});
   if(r.ok)msg.value='';

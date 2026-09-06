@@ -51,6 +51,7 @@ import random
 import re
 import shlex
 import subprocess
+import signal
 import sys
 import threading
 import time
@@ -451,16 +452,25 @@ VOICES: dict[str, dict] = {
         # «You've reached your Fable 5 limit» вместо реплики. Голос,
         # молча зависящий от чужой настройки, ломает правило 1: вопрос
         # одинаковый, условия — нет.
+        # --output-format stream-json --verbose (2026-09-06, правило 17):
+        # в потоке видны thinking-блоки, вызовы инструментов и текст по
+        # мере хода; ответ вынимается из события result (_claude_result).
+        # С форматом text CLI молчит до конца и отдаёт только итог.
         "start": lambda p, f, a, s, d: ["claude", "-p", *_add_dir(d),
                                         "--permission-mode", "plan",
                                         "--model", CLAUDE_MODEL,
                                         "--effort", CLAUDE_EFFORT,
+                                        "--output-format", "stream-json",
+                                        "--verbose",
                                         "--session-id", s, p],
         "cont": lambda p, f, a, s, d: ["claude", "-p", *_add_dir(d),
                                        "--permission-mode", "plan",
                                        "--model", CLAUDE_MODEL,
                                        "--effort", CLAUDE_EFFORT,
+                                       "--output-format", "stream-json",
+                                       "--verbose",
                                        "--resume", s, p],
+        "extract": lambda out: _claude_result(out),
         "new_session": lambda: str(uuid.uuid4()),
         "bin": "claude",
         "neutral_cwd": str(Path.home() / ".cache" / "choir-voices" / "claude"),
@@ -896,6 +906,220 @@ def build_prompt(name: str, st: dict, events: list[dict], first: bool,
 # ─────────────────────────────────────────────────────────────────────
 # Ход одного голоса
 # ─────────────────────────────────────────────────────────────────────
+
+# ── СЫРОЙ ВЫВОД CLI ДЛЯ ВКЛАДКИ «БЫСТРЫЙ ОТВЕТ» (наказ Автора 2026-09-06) ──
+# Автор хочет видеть ход работы голоса, как в терминале: мысли модели,
+# вызовы инструментов, печать канала — по мере прихода, а не разом в конце
+# (правило 17). Окно задаёт RT_RAW=1 ТОЛЬКО быстрому вопросу: там один
+# голос и слепой фазы нет; для слепого хода переменной нет, и сырой вывод
+# на диск не ложится (правило 8.5: файл под тем же пользователем читает
+# любой агент). Путь — <RT_ACT_DIR>/<RT_ACT_ID>.raw.log, его хвост отдаёт
+# GET /act_log?kind=raw.
+# ЗАМЕТКИ ХОДА В СЛЕПОМ ПЕРВОМ ХОДЕ: поимённые «● grok 12.3 с 512 симв.»,
+# очередь, запасная линия, откат модели — ложатся в лог акта на диске, пока
+# другие голоса ещё думают, а лог читает любой агент под тем же
+# пользователем (правило 8.5; нашёл grok в ревизии вкладок вывода). В слепом
+# ходе они копятся и печатаются пачкой по закрытии; иначе — сразу.
+HOLD_NOTES: list[str] | None = None
+_HOLD_LOCK = threading.Lock()
+
+
+def _note(msg: str) -> None:
+    with _HOLD_LOCK:
+        if HOLD_NOTES is not None:
+            HOLD_NOTES.append(msg)
+            return
+    print(msg, flush=True)
+
+
+_THOUGHTS_RE = re.compile(r"💭 мысли модели.*?💭 конец мыслей\n?", re.S)
+
+
+def strip_thoughts(text: str) -> str:
+    """Убрать блоки рассуждений адаптеров (CHOIR_THOUGHTS) из текста, по
+    которому ставится диагноз каналу: модель, рассуждая о столе, сама
+    напишет «429» или «rate limit» — и линия выключилась бы на сутки
+    (ревьюер)."""
+    return _THOUGHTS_RE.sub("", text or "")
+
+
+def _raw_log_path() -> Path | None:
+    if os.environ.get("RT_RAW") != "1":
+        return None
+    d, a = os.environ.get("RT_ACT_DIR"), os.environ.get("RT_ACT_ID")
+    if not d or not a:
+        return None
+    return Path(d) / f"{a}.raw.log"
+
+
+# Группы CLI, запущенных тройником: окно прерывает акт SIGTERM'ом в группу
+# live.py, а CLI с тройником сидит в СВОЕЙ группе (иначе на таймауте не
+# достать внуков Node). Чтобы «прервать всё» и закрытие окна по-прежнему
+# гасили голос (урок переезд-v1, нашёл grok), live.py перебрасывает SIGTERM
+# в эти группы сам. Обработчик ставится в главной нити при импорте.
+_CHILD_PGIDS: set[int] = set()
+_CHILD_LOCK = threading.Lock()
+
+
+def _on_term(signum, frame) -> None:                      # noqa: ARG001
+    with _CHILD_LOCK:
+        pgids = list(_CHILD_PGIDS)
+    for pg in pgids:
+        try:
+            os.killpg(pg, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+    signal.signal(signum, signal.SIG_DFL)
+    os.kill(os.getpid(), signum)
+
+
+try:
+    if threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGTERM, _on_term)
+except (ValueError, OSError):
+    pass
+
+
+def _run_capture(cmd: list[str], cwd, timeout: float,
+                 raw: Path | None) -> subprocess.CompletedProcess:
+    """subprocess.run(capture_output=True, text=True) с тройником.
+
+    Без raw — прежний вызов, бит-в-бит. С raw — Popen и два читателя:
+    каждая порция stdout/stderr дописывается в файл по мере прихода и
+    копится в память, чтобы разбор ответа остался прежним. Таймаут
+    поднимает тот же TimeoutExpired с накопленным stderr — ветка
+    обработки в turn() не меняется."""
+    if raw is None:
+        return subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=timeout, cwd=str(cwd))
+    raw.parent.mkdir(parents=True, exist_ok=True)
+    bufs: dict[str, list[bytes]] = {"out": [], "err": []}
+    lock = threading.Lock()
+    closed = False           # файл закрыт — читатель больше не пишет в него
+    deadline = time.monotonic() + timeout
+    with raw.open("ab") as rf:
+        # Своя группа процессов: CLI плодит внуков (script/pty, узлы
+        # Node), и kill() одного родителя оставлял их сиротами с открытым
+        # pipe — читатели висели, квота горела (ревизия: codex, gemini).
+        # process_group=0: своя группа (та же сессия), setpgid делает libc
+        # до exec — preexec_fn из рабочей нити ThreadPoolExecutor мог бы
+        # заклинить ребёнка до exec (документированный дедлок; ревьюер).
+        proc = subprocess.Popen(cmd, cwd=str(cwd), stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                process_group=0)
+        pgid = proc.pid                      # == pid при process_group=0
+        with _CHILD_LOCK:
+            _CHILD_PGIDS.add(pgid)
+
+        def _put(data: bytes) -> None:
+            with lock:
+                if not closed:
+                    try:
+                        rf.write(data)
+                        rf.flush()
+                    except OSError as e:          # диск кончился — ответ важнее файла
+                        print(f"raw-лог не пишется: {e}", file=sys.stderr)
+
+        def pump(stream, key: str) -> None:
+            # В файл — только ЦЕЛЫМИ строками: два читателя пишут в один
+            # файл, и порция stderr, вклиненная посреди строки stdout,
+            # рвала маркеры «💭 мысли модели» и разметку вкладки (ревьюер).
+            # В память — как пришло, разбор ответа этого не касается.
+            rest = b""
+            while True:
+                chunk = stream.read1(4096) if hasattr(stream, "read1") \
+                    else stream.read(4096)
+                if not chunk:
+                    if rest:
+                        _put(rest + b"\n")
+                    return
+                bufs[key].append(chunk)
+                rest += chunk
+                cut = max(rest.rfind(b"\n"), rest.rfind(b"\r"))
+                if cut >= 0:
+                    _put(rest[:cut + 1])
+                    rest = rest[cut + 1:]
+
+        def _killpg() -> None:
+            # По pgid, снятому сразу после Popen; группа живёт, пока в
+            # ней есть хоть один процесс, и её номер не переиспользуется.
+            # Пустая группа даёт ESRCH — сигнал в чужое дерево не уйдёт.
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            proc.wait()
+
+        ts = [threading.Thread(target=pump, args=(proc.stdout, "out"), daemon=True),
+              threading.Thread(target=pump, args=(proc.stderr, "err"), daemon=True)]
+        for t in ts:
+            t.start()
+        timed_out = False
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+        else:
+            # Как communicate(): ждать EOF обоих pipe в остатке бюджета —
+            # внук, унаследовавший stdout, держит их после выхода CLI.
+            for t in ts:
+                t.join(max(1.0, deadline - time.monotonic()))   # ≥1 с: не объявлять ложный таймаут
+            timed_out = any(t.is_alive() for t in ts)
+        if timed_out:
+            _killpg()
+            for t in ts:
+                t.join(5)
+        with _CHILD_LOCK:
+            _CHILD_PGIDS.discard(pgid)
+        with lock:
+            closed = True
+
+    def _text(key: str) -> str:
+        # как text=True у subprocess.run: universal newlines, иначе \r\n
+        # из pty (grok, kimi) уехали бы в ленту (ревьюер)
+        return (b"".join(bufs[key]).decode("utf-8", "replace")
+                .replace("\r\n", "\n").replace("\r", "\n"))
+
+    if timed_out:
+        raise subprocess.TimeoutExpired(cmd, timeout, output=_text("out"),
+                                        stderr=_text("err"))
+    return subprocess.CompletedProcess(cmd, proc.returncode, _text("out"), _text("err"))
+
+
+def _claude_result(out: str) -> str:
+    """Ответ голоса claude из stream-json: поле result последнего события
+    type=result; если его нет (оборвано) — склейка текстовых блоков
+    assistant. Поток нужен ради мыслей: с --output-format text CLI отдаёт
+    только итог, а thinking-блоки и вызовы инструментов пропадают."""
+    result = None
+    texts: list[str] = []
+    for line in (out or "").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            d = json.loads(line)
+        except Exception:                                   # noqa: BLE001
+            continue
+        if d.get("type") == "result":
+            if d.get("is_error"):
+                # лимит, авторизация, обрыв — это отказ канала, а не
+                # реплика голоса; turn() запишет kind=error с причиной
+                # (ревизия: gemini, codex, grok)
+                raise RuntimeError(f"claude: {str(d.get('result') or d.get('error') or 'is_error')[:300]}")
+            if isinstance(d.get("result"), str):
+                result = d["result"]
+        elif d.get("type") == "assistant":
+            for blk in (d.get("message") or {}).get("content") or []:
+                if isinstance(blk, dict) and blk.get("type") == "text":
+                    texts.append(str(blk.get("text") or ""))
+    if result is None:
+        # поток оборван до события result: черновики tool-loop — не реплика
+        raise RuntimeError("claude: поток оборван без события result"
+                           + (f" (текст {len(''.join(texts))} симв. отброшен)" if texts else ""))
+    return result
+
+
 def turn(name: str, prompt) -> dict:
     """Один ход голоса в его нити. Возвращает событие для ленты.
 
@@ -919,9 +1143,9 @@ def turn(name: str, prompt) -> dict:
     # реально шёл вызов (правило 8.5).
     gate = (first_free_gate(alive_gates([c["gate"] for c in chans] or [name]),
                             wait_limit=GATE_WAIT,
-                            on_wait=lambda sec, who: print(
+                            on_wait=lambda sec, who: _note(
                                 f"  ⏳ {name}: в очереди {sec} с — ещё не "
-                                f"отвечал (занято: {who})", flush=True)
+                                f"отвечал (занято: {who})")
                             if sec % 15 == 0 else None)
             if (chans or v.get("serial")) else contextlib.nullcontext())
     t0 = time.monotonic()
@@ -981,11 +1205,22 @@ def turn(name: str, prompt) -> dict:
             t0 = time.monotonic()  # отсчёт РАБОТЫ, очередь сюда не входит
             wall_t0 = time.time()  # для пробы логов Кими (mtime файлов)
             vt = v.get("turn_timeout", TURN_TIMEOUT)
-            r = subprocess.run(cmd, capture_output=True, text=True,
-                               timeout=vt, cwd=str(cwd))
+            r = _run_capture(cmd, cwd, vt, _raw_log_path())
         rc = r.returncode
         if v.get("answer_file") and afile.exists():
             out = afile.read_text(encoding="utf-8").strip()
+        elif v.get("extract"):
+            try:
+                out = v["extract"](r.stdout or "").strip()
+            except RuntimeError as e:
+                # is_error / оборванный поток — пустой ответ плюс причина
+                # в stderr-хвосте: дальше обычные ветки rc и _status_of,
+                # иначе квота у claude читалась бы как «error» без причины
+                # (ревьюер)
+                out = ""
+                r = subprocess.CompletedProcess(
+                    r.args, r.returncode or 1, r.stdout,
+                    (r.stderr or "") + f"\n{e}")
         else:
             out = (r.stdout or "").strip()
 
@@ -1002,7 +1237,7 @@ def turn(name: str, prompt) -> dict:
                     session = d["thread_id"]
                     break
 
-        full_err = (r.stderr or "").strip()
+        full_err = strip_thoughts(r.stderr or "").strip()   # мысли — не улика
         # ХВОСТ: исход канала стоит последним, а при каскаде голова
         # забита перебором ключей — обрезка с начала показывала бы
         # середину перебора и прятала причину (нашёл kimi).
@@ -1046,7 +1281,7 @@ def turn(name: str, prompt) -> dict:
         tail = e.stderr or b""
         if isinstance(tail, bytes):
             tail = tail.decode("utf-8", errors="replace")
-        full_err = tail.strip()
+        full_err = strip_thoughts(tail).strip()
         tail = full_err[-300:]
         err = tail
         ev = {"author": name, "kind": "error", "text": "",
@@ -1090,18 +1325,18 @@ def turn(name: str, prompt) -> dict:
             # объявляло бы подмену в штатном случае (нашёл kimi).
             if act != _gemini_models().split(",")[0]:
                 ev["model_fallback"] = True
-                print(f"  ⇄ gemini: {_gemini_models().split(',')[0]} не "
+                _note(f"  ⇄ gemini: {_gemini_models().split(',')[0]} не "
                       f"ответила — ход ушёл "
                       f"запасной модели {act}. Это ТОТ ЖЕ голос, но другая "
-                      f"модель", flush=True)
+                      f"модель")
 
     if ch:
         ev["channel"] = ch["name"]
         ev["model"] = ch["model"]
         if ch is not chans[0]:
-            print(f"  ⇄ {name}: основная линия была занята — ход ушёл "
+            _note(f"  ⇄ {name}: основная линия была занята — ход ушёл "
                   f"запасной ({ch['model']}). Это ТОТ ЖЕ голос, не второй "
-                  f"участник", flush=True)
+                  f"участник")
 
     # Отпечаток ТОГО, ЧТО ГОЛОС РЕАЛЬНО ВИДЕЛ. Нашёл голос claude на первом
     # живом прогоне: в раундах затравка одна на всех и её sha лежит в
@@ -1163,6 +1398,11 @@ def deliver(names: list[str], blind: bool = False) -> list[dict]:
     # Одному голосу разыгрывать нечего — печатаем сразу, чтобы разговор
     # оставался живым. Копим только там, где очередь имеет смысл.
     solo = len(names) == 1 and not blind
+    global HOLD_NOTES
+    if blind:
+        with _HOLD_LOCK:
+            HOLD_NOTES = []
+    done_n = 0
     with ThreadPoolExecutor(max_workers=max(1, len(names))) as ex:
         futs = {ex.submit(turn, n, prompts[n]): n for n in names}
         for f in as_completed(futs):
@@ -1186,14 +1426,25 @@ def deliver(names: list[str], blind: bool = False) -> list[dict]:
             st["peer"] = PEER           # с какой опцией шёл ход (для уведомления о смене)
             save_state(n, st, ch)
             mark = {"say": "●", "pass": "○", "error": "✗"}.get(ev["kind"], "?")
-            print(f"{mark} {n:<8} {ev.get('elapsed_s', 0):>6.1f} с  "
+            done_n += 1
+            _note(f"{mark} {n:<8} {ev.get('elapsed_s', 0):>6.1f} с  "
                   f"{len(ev.get('text', '')):>5} симв."
                   f"{'' if ev['kind'] != 'error' else '  ' + ev.get('detail', '')[:70]}")
+            if blind:
+                print(f"· готово {done_n}/{len(names)}", flush=True)
             if solo:
                 results.append(post(**ev))
             else:
                 held.append(ev)
 
+    if blind:
+        # ход закрыт — только теперь поимённые строки и заметки очереди
+        with _HOLD_LOCK:
+            notes, HOLD_NOTES = list(HOLD_NOTES or []), None
+        if notes:
+            print("слепой ход закрыт — поимённо:", flush=True)
+            for msg in notes:
+                print(msg, flush=True)
     if not held:
         return results
 
