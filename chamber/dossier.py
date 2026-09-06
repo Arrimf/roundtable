@@ -31,7 +31,7 @@
 
 Использование:
     python3 dossier.py --project ../Film --out ДОСЬЕ-film.md
-    python3 dossier.py --project . --paths 'Choir/*.py' --canary
+    python3 chamber/dossier.py --project . --paths 'chamber/*.py' --canary   # из RoundTable/
     python3 dossier.py --project ../Film --check ОТВЕТ.md   # клюнул ли кто
 """
 from __future__ import annotations

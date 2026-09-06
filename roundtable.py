@@ -86,9 +86,10 @@ CHOIR = CHAMBER                      # прежнее имя: каталог к�
 # перекрыл бы явный ROUNDTABLE_JOURNAL тестового окна, и дирижёр писал бы в
 # живой журнал (ревизия переезда, grok 2026-09-06).
 os.environ["CHOIR_JOURNAL"] = str(JOURNAL)
-# Относительный --project считается от корня песочницы (родителя RoundTable/):
-# раньше «относительно Choir/» совпадало с корнем случайно, теперь CHAMBER
-# лежит на уровень глубже, и `Film` превратился бы в chamber/Film (grok).
+# Относительный --project считается от корня песочницы (родителя RoundTable/).
+# Раньше он считался от каталога стола (Choir/), то есть `Film` означал
+# Choir/Film — никто этим не пользовался; после переезда база chamber/ была
+# бы ещё на уровень глубже (grok), поэтому база названа явно: SANDBOX.
 SANDBOX = _abs(os.environ.get("ROUNDTABLE_SANDBOX") or _HERE.parent)
 FEED = JOURNAL / "live.jsonl"
 PORT = int(os.environ.get("ROUNDTABLE_PORT", "8770"))
@@ -2174,7 +2175,7 @@ def _lim_kimi(room: dict) -> dict:
                 "max_token_quota": org.get("max_token_quota")}
             extra["ceilings_source"] = f"{KIMI_API}/users/me"
             # Расхождение с каноном называем вслух, а НЕ чиним молча:
-            # в Choir/CLAUDE.md и в шапке serial_gate.py записано
+            # в chamber/CLAUDE.md и в шапке serial_gate.py записано
             # «concurrency = 1», сервер сейчас отвечает другое. Проверить
             # это может только живой параллельный вызов, а не наш GET, —
             # поэтому очередь трогать нельзя, а промолчать нельзя тем
@@ -2182,7 +2183,7 @@ def _lim_kimi(room: dict) -> dict:
             if org.get("max_concurrency") not in (None, 1):
                 extra["canon_mismatch"] = (
                     f"сервер отвечает max_concurrency="
-                    f"{org.get('max_concurrency')}, а в Choir/CLAUDE.md и "
+                    f"{org.get('max_concurrency')}, а в chamber/CLAUDE.md и "
                     f"serial_gate.py записано 1. Не проверено живым "
                     f"параллельным вызовом — очередь оставлена как есть")
     else:
@@ -2868,7 +2869,7 @@ class Handler(BaseHTTPRequestHandler):
             raw_rv = req.get("voices")
             rvoices = sorted({v for v in (raw_rv or []) if v in VOICES})
             # Проект раунда (2026-09-03): без него раунд из окна,
-            # запущенного в Cursor_W, шёл про каталог Choir/ — «первый
+            # запущенного в Cursor_W, шёл про каталог стола (тогда Choir/) — «первый
             # боевой вызов» Автора. Та же проверка, что у комнаты.
             # Ключ есть, но пуст — Автор ОЧИСТИЛ поле: без проекта.
             # Ключа нет (старый клиент, curl) — проект окна, и это
