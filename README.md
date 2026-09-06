@@ -1,5 +1,7 @@
 # RoundTable — стол, за которым сидят шесть ИИ
 
+**English** · [Русский](README.ru.md)
+
 *Окно, в котором модели разных компаний обсуждают, ревьюят и правят код
 вместе с человеком — как соавторы, а не как опрашиваемые по очереди
 ассистенты.*
@@ -27,7 +29,7 @@ append-only.
 
 ## What it does
 
-**Live room** (`choir/live.py`) — one shared feed, each voice holds its
+**Live room** (`chamber/live.py`) — one shared feed, each voice holds its
 own thread and receives only the delta of events it has not seen. Turn
 order follows the protocol, not the fastest channel: a publication
 lottery over the public [drand](https://drand.love) randomness beacon
@@ -42,7 +44,7 @@ one feed. Channel failures in the room carry a typed `status`
 (`quota`, `auth`, `timeout`, `empty`, `error`), and the goal set by the
 goal-keeper (the human, for now) travels with every packet.
 
-**Table rounds** (`choir/choir.py`) — the full protocol: a
+**Table rounds** (`chamber/choir.py`) — the full protocol: a
 commit-reveal drand lottery picks the leader *before* the beacon's
 signature exists (the choice cannot be fitted to the question); the
 leader expands the question into a seed; every voice answers **blind**
@@ -95,11 +97,18 @@ HTTP adapters put API keys where the adapter README/headers say
 Voices you don't have simply fail honestly and are recorded as absent.
 
 ```bash
-: > choir/live.jsonl                  # a fresh, empty feed
-python3 choir/live.py ask "привет, стол"   # first blind move
-python3 roundtable.py                  # window on http://127.0.0.1:8770
-bash smoke.sh                          # integration smoke, 16 checks
+mkdir -p journal && : > journal/live.jsonl   # a fresh, empty feed
+python3 chamber/live.py ask "привет, стол"   # first blind move
+python3 roundtable.py                        # window on http://127.0.0.1:8770
+bash smoke.sh                                # integration smoke, 16 checks
 ```
+
+Layout: `chamber/` is the table's code (room, conductor, serial gate),
+`journal/` is its data — the feed, the round journal, per-voice
+threads, and rounds filed per project under `journal/rounds/<project>/`.
+The public repository carries the code, `docs/`, the rounds about the
+table itself (`journal/rounds/RoundTable/`) and the code reviews
+(`journal/reviews/`); the live feed and other projects' rounds stay home.
 
 The window has three tabs — 💬 room, 🎼 rounds, 🔧 coder — with the
 same content: the six voices, each with its own checkbox, model and
@@ -138,7 +147,7 @@ bash test/edit_test.sh         # 31 edit/recovery scenarios
 bash test/gate_test.sh         # 47 review/merge-gate scenarios
 python3 test/catalog_test.py   # 45 model-catalog scenarios (no network)
 python3 test/exec_argv_test.py # 29 executor argv / explicit-default checks
-bash test/voices_http_test.sh  # 21 HTTP checks of the three tabs (isolated window, no voice calls)
+bash test/voices_http_test.sh  # 49 HTTP checks of the tabs, round card, goal, addressed room (isolated window, no voice calls)
 bash smoke.sh                  # window smoke, 16 checks
 ```
 

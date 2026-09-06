@@ -1,6 +1,15 @@
 # Журналы стола — ЛИЧНОЕ: живая переписка голосов не публикуется.
-live.jsonl
-room.jsonl
-voices/
+# Наружу едут только раунды о самом столе (journal/rounds/RoundTable/),
+# ревизии его кода (journal/reviews/) и проектные документы (docs/).
+journal/live.jsonl
+journal/room.jsonl
+journal/debts.jsonl
+journal/voices/
+journal/notes/
+journal/inbox/
+journal/archive/
+journal/ДОСЬЕ-*
+journal/rounds/*
+!journal/rounds/RoundTable/
 __pycache__/
 *.pyc

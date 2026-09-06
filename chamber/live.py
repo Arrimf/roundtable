@@ -63,8 +63,23 @@ from channels import by_gate, kimi_channels
 from serial_gate import serial_gate, first_free_gate, alive_gates
 
 HERE = Path(__file__).resolve().parent
-LIVE = HERE / "live.jsonl"                 # лента комнаты, append-only
-VOICEDIR = HERE / "voices"                 # рабочий каталог на голос
+# Журнал — в journal/ рядом с chamber/ (переезд 2026-09-06); CHOIR_JOURNAL
+# переопределяет (тесты, чужая комната).
+# Старая раскладка «код и лента в одной папке» (тесты копируют chamber/*.py в
+# tmp-комнату рядом с пустым live.jsonl) распознаётся по ленте рядом с кодом.
+def _journal_dir(here: Path) -> Path:
+    env = os.environ.get("CHOIR_JOURNAL") or os.environ.get("ROUNDTABLE_JOURNAL")
+    if env:                                      # явно и абсолютно (от cwd запуска)
+        return Path(env).expanduser().absolute()
+    if (here / "live.jsonl").exists() or (here / "room.jsonl").exists():
+        print(f"live: старая раскладка — лента взята из {here}", file=sys.stderr)
+        return here                              # старая раскладка: лента рядом с кодом
+    return here.parent / "journal"
+
+
+JOURNAL = _journal_dir(HERE)
+LIVE = JOURNAL / "live.jsonl"              # лента комнаты, append-only
+VOICEDIR = JOURNAL / "voices"              # рабочий каталог на голос
 KIMI_BIN = Path.home() / ".kimi-code" / "bin" / "kimi"
 
 # Линии связи Кими: ОДИН голос, два ключа в разных организациях. Почему

@@ -17,8 +17,8 @@ set -euo pipefail
 PORT="${ROUNDTABLE_PORT:-8771}"
 BASE="http://127.0.0.1:${PORT}"
 RT_DIR="$(cd "$(dirname "$0")" && pwd)"
-CHOIR="${ROUNDTABLE_CHOIR:-$HOME/AiSandbox/Choir}"
-FEED="$CHOIR/live.jsonl"
+JOURNAL="${ROUNDTABLE_JOURNAL:-$RT_DIR/journal}"     # журналы стола (переезд 2026-09-06)
+FEED="$JOURNAL/live.jsonl"
 LOT_SAFE="$HOME/.cache/choir/roundtable-lot.json"
 WORK="$(mktemp -d /tmp/rt-smoke.XXXXXX)"
 SPID=""
@@ -62,7 +62,7 @@ http() { # method path body_file_or_- outfile
     fi
 }
 
-[ -f "$FEED" ] || die "нет ленты $FEED — сначала python3 live.py ask …"
+[ -f "$FEED" ] || die "нет ленты $FEED — сначала: mkdir -p journal && : > journal/live.jsonl (или python3 chamber/live.py ask …)"
 
 # ── шаг 0: расчистка (идемпотентность) ───────────────────────────────
 step 0 "расчистка порта $PORT и сейфа жребия"
@@ -87,7 +87,7 @@ step 1 "старт сервера (ROUNDTABLE_PORT=$PORT)"
 # Каталог моделей — БЕЗ разведки и в свой файл: смок не должен ходить
 # в сеть с живыми учётками и переписывать кэш Автора (ревизия 2026-09-02).
 ( cd "$RT_DIR" && ROUNDTABLE_PORT="$PORT" CHOIR_RT_NO_DISCOVERY=1 \
-  CHOIR_RT_MODELS="$WORK/rt-models.json" nohup python3 roundtable.py \
+  ROUNDTABLE_JOURNAL="$JOURNAL" CHOIR_RT_MODELS="$WORK/rt-models.json" nohup python3 roundtable.py \
       >"$WORK/server.log" 2>&1 & echo $! >"$WORK/pid" )
 SPID="$(cat "$WORK/pid")"
 up=""

@@ -6,7 +6,7 @@ set -euo pipefail
 RT="$(cd "$(dirname "$0")/.." && pwd)"
 W="$(mktemp -d /tmp/edtest.XXXXXX)"
 trap 'rm -rf "$W"' EXIT
-mkdir -p "$W/room"; cp "$RT/../Choir/"*.py "$W/room/"; : > "$W/room/live.jsonl"
+mkdir -p "$W/room"; cp "$RT/chamber/"*.py "$W/room/"; : > "$W/room/live.jsonl"
 git init -q "$W/proj"
 git -C "$W/proj" -c user.name=t -c user.email=t@t commit -q --allow-empty -m base
 export CHOIR_LEASE_DIR="$W/leases" CHOIR_WT_DIR="$W/wts" ROUNDTABLE_CHOIR="$W/room"

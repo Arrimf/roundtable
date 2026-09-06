@@ -971,7 +971,7 @@ def acts_summary(limit: int = 12) -> list[dict]:
 
     stage: opening/working → closed/crashed/adopted → merged. Кнопка
     окна существует только на легальной стадии (идея голоса claude)."""
-    live_path = edits.CHOIR / "live.jsonl"
+    live_path = edits.JOURNAL / "live.jsonl"
     try:
         st_f = live_path.stat()
         key = (st_f.st_size, st_f.st_mtime_ns, limit)

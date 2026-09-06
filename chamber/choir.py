@@ -61,8 +61,29 @@ CHOIR_VERSION = "0.3"
 # не меняется. Прогонять тесты гейта на настоящем каноне нельзя (журнал
 # только дописывается, стереть тестовые строки потом уже не выйдет), а
 # ронять их вовсе — значит проверять валидатор на честном слове.
-ROOM = Path(os.environ.get("CHOIR_ROOM")
-            or Path(__file__).resolve().parent / "room.jsonl").resolve()
+# РАСКЛАДКА (переезд 2026-09-06, решение Автора): код стола — chamber/,
+# журналы и раунды — journal/ рядом (CHOIR_JOURNAL переопределяет),
+# раунды раскладываются по проектам: journal/rounds/<проект>/.
+HERE = Path(__file__).resolve().parent
+def _journal_dir(here: Path) -> Path:
+    """CHOIR_JOURNAL (или ROUNDTABLE_JOURNAL окна) — явно и абсолютно; иначе
+    старая раскладка «журнал рядом с кодом», если лента лежит рядом; иначе
+    ../journal. Относительное значение переменной берётся от cwd запуска —
+    до любой смены каталога, поэтому absolute() здесь, а не при использовании."""
+    env = os.environ.get("CHOIR_JOURNAL") or os.environ.get("ROUNDTABLE_JOURNAL")
+    if env:
+        return Path(env).expanduser().absolute()
+    if (here / "room.jsonl").exists() or (here / "live.jsonl").exists():
+        print(f"choir: старая раскладка — журнал взят из {here}", file=sys.stderr)
+        return here
+    return here.parent / "journal"
+
+
+JOURNAL = _journal_dir(HERE)
+ROOM = Path(os.environ.get("CHOIR_ROOM") or JOURNAL / "room.jsonl").resolve()
+# Песочница — родитель каталога стола: затравки ссылаются на её файлы
+# (--add-dir голоса claude). Вне песочницы это родитель каталога стола.
+SANDBOX = Path(os.environ.get("ROUNDTABLE_SANDBOX") or HERE.parent.parent)
 KIMI_BIN = Path.home() / ".kimi-code" / "bin" / "kimi"
 
 # ПРОЕКТ РАУНДА (--project; 2026-09-03). До этого раунд, запущенный из
@@ -91,7 +112,7 @@ def _claude_dirs() -> list[str]:
     на её файлы) и проект раунда, если он не внутри неё. Флаг принимает
     НЕСКОЛЬКО каталогов, поэтому стоит до промпта и закрыт следующим
     флагом (см. порядок в лямбде)."""
-    root = ROOM.parent.parent.resolve()
+    root = SANDBOX.resolve()
     dirs = [root]
     if PROJECT and not PROJECT.resolve().is_relative_to(root):
         dirs.append(PROJECT)
@@ -126,7 +147,7 @@ def _kimi_dirs() -> list[str]:
     если проект вне её — затравки ссылаются на файлы Choir/ (субагент)."""
     if not PROJECT:
         return []
-    root = ROOM.parent.parent.resolve()
+    root = SANDBOX.resolve()
     out = ["--add-dir", str(PROJECT)]
     if not PROJECT.resolve().is_relative_to(root):
         out += ["--add-dir", str(root)]
@@ -144,7 +165,7 @@ GOAL_LINE = "ЦЕЛЬ (целеполагатель — Автор): "
 
 def _read_goal_now() -> str:
     try:
-        live = ROOM.parent / "live.jsonl"
+        live = JOURNAL / "live.jsonl"
         goal = ""
         with live.open(encoding="utf-8") as f:
             for line in f:
@@ -194,13 +215,59 @@ def goal_notice() -> str:
     return f"{GOAL_LINE}{goal}\n\n" if goal else ""
 
 
+def rounds_dir(create: bool = False) -> Path:
+    """Каталог файлов раунда (ВОПРОС/ЗАТРАВКА/СВОД): journal/rounds/<проект>;
+    без проекта — раунд о самом столе (RoundTable). Каталог создаётся только
+    по create=True перед записью: читающие команды (show, catchup, run без
+    затравки) не должны оставлять пустых папок — опечатка в --project или
+    read-only комната иначе всплывают как PermissionError или мусор
+    (ревизия переезда, kimi/gemini/codex 2026-09-06)."""
+    name = (PROJECT.name or "root") if PROJECT else "RoundTable"
+    d = JOURNAL / "rounds" / name
+    if create:
+        d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def find_round_file(path_or_name) -> Path:
+    """Файл раунда по записи журнала: путь как есть; иначе в каталоге
+    текущего проекта; иначе поиск по имени в journal/rounds/*/ (раунды
+    переехали по проектам 2026-09-06). Одно имя в нескольких проектах —
+    ошибка, а не первый попавшийся: catchup иначе отдал бы голосу чужую
+    затравку (ревизия переезда, все три голоса)."""
+    p = Path(str(path_or_name))
+    rounds = JOURNAL / "rounds"
+    def _inside_journal(q: Path) -> bool:
+        try:
+            return q.is_absolute() and q.resolve().is_relative_to(rounds.resolve())
+        except OSError:
+            return False
+    # Путь как записан — только если он уже внутри journal/rounds/: старые
+    # записи указывают в Choir/…, и воскресший каталог (копия, mount) иначе
+    # подсунул бы устаревшую затравку вместо переехавшей (grok).
+    if _inside_journal(p) and p.exists():
+        return p
+    if PROJECT:
+        own = rounds / PROJECT.name / p.name
+        if own.exists():
+            return own
+    found = sorted(rounds.glob(f"*/{p.name}"))
+    if len(found) == 1:
+        return found[0]
+    if len(found) > 1:
+        raise SystemExit(f"файл раунда {p.name} есть в нескольких проектах: "
+                         + ", ".join(str(f) for f in found) + " — укажи --project")
+    return p            # внешний или относительный путь: как дан (проверит читающий)
+
+
 def voice_cwd(name: str) -> str:
     """Рабочий каталог процесса голоса: claude — нейтральный (см. выше),
-    остальные — проект раунда, иначе Choir/."""
+    остальные — проект раунда, иначе каталог стола (RoundTable/, родитель
+    chamber/; до переезда это был Choir/ — не корень песочницы)."""
     if name == "claude":
         CLAUDE_VOICE_CWD.mkdir(parents=True, exist_ok=True)
         return str(CLAUDE_VOICE_CWD)
-    return str(PROJECT) if PROJECT else str(ROOM.parent)
+    return str(PROJECT) if PROJECT else str(HERE.parent)
 
 
 def project_notice() -> str:
@@ -983,8 +1050,7 @@ def _append(rec: dict, target: Path | None = None) -> None:
         f.flush()
 
 
-DEBTS = Path(os.environ.get("CHOIR_DEBTS")
-             or Path(__file__).resolve().parent / "debts.jsonl").resolve()
+DEBTS = Path(os.environ.get("CHOIR_DEBTS") or JOURNAL / "debts.jsonl").resolve()
 
 
 def _say_where() -> None:
@@ -1130,13 +1196,11 @@ def current_roles() -> dict[str, str]:
 
 
 def role_preamble(name: str) -> str:
-    """Напоминание о взятой роли — уходит в промпт перед вопросом."""
-    r = current_roles().get(name)
-    if not r:
-        return ""
-    return (f"Ранее вы взяли на этом столе роль: **{r}**. Действуйте в её "
-            f"рамках. Если роль больше не подходит — объявите новую "
-            f"строкой «РОЛЬ: …» в своём ответе.\n\n")
+    """Правило 14 снято (решение Автора 2026-09-06): роли в промпт не
+    уходят. Объявленные ранее роли остаются в журнале (`roles`) как
+    история; детектор ROLE_RE ниже продолжает их записывать, если голос
+    объявит роль сам, — запись честнее умолчания."""
+    return ""
 
 
 class _FifoReader:
@@ -1747,11 +1811,6 @@ def cmd_rebut(a: argparse.Namespace) -> int:
 - **Право промолчать есть.** Если добавить действительно нечего,
   ответьте одним словом: ПАС. Это полноценный ответ, а не отказ —
   вежливый пинг-понг «согласен с коллегой» хуже молчания.
-- **Роль.** Если по ходу спора вам ясно, какую роль вы на этом столе
-  занимаете (скептик, фактчекер, синтезатор, конструктор, архивариус,
-  адвокат дьявола — или своя формулировка), объявите её отдельной
-  строкой: `РОЛЬ: <название>`. Дальше вас будут звать в этой роли,
-  пока вы сами не объявите другую. Не обязательно.
 """
 
     # ОПОЗДАВШИЕ (наказ arr, раунд noch-dizain-v1): голос, выпавший в
@@ -2007,7 +2066,8 @@ def cmd_expand(a: argparse.Namespace) -> int:
     # момент ответа, и подмена вопроса перестаёт быть незаметной. Правило
     # 11.5 требует «не сужать вопрос Автора»; требование, которое некому
     # проверить в момент нарушения, — не требование, а пожелание.
-    out = Path(a.out) if a.out else ROOM.parent / f"ЗАТРАВКА-{a.round}.md"
+    out = Path(a.out) if a.out else rounds_dir(create=True) / f"ЗАТРАВКА-{a.round}.md"
+    out.parent.mkdir(parents=True, exist_ok=True)   # первый run нового проекта: каталога ещё нет (grok)
     out.write_text(
         f"# Вопрос Автора, дословно\n\n"
         f"> sha256: `{_sha(q)}` — сверяйте с журналом раунда\n\n"
@@ -2379,7 +2439,7 @@ def cmd_run(a: argparse.Namespace) -> int:
     if halted_by_author("expand"):
         return finish("stopped", "остановлен Автором перед фазой expand", 0)
     print(f"\n── 2. затравка: разворачивает {conductor} ──")
-    zt = ROOM.parent / f"ЗАТРАВКА-{a.round}.md"
+    zt = rounds_dir() / f"ЗАТРАВКА-{a.round}.md"
     if cmd_expand(argparse.Namespace(round=a.round, seed=str(seed_path),
                                      by=None, out=str(zt),
                                      effort=a.effort)) != 0 or not zt.is_file():
@@ -2473,7 +2533,7 @@ def cmd_run(a: argparse.Namespace) -> int:
     # ── фаза: СВОД (правило 11: ведущий сводит; отказал — новый жребий)
     if halted_by_author("summarize"):
         return finish("stopped", "остановлен Автором перед сводом", 0)
-    card = Path(a.out) if a.out else ROOM.parent / f"СВОД-{a.round}.md"
+    card = Path(a.out) if a.out else rounds_dir(create=True) / f"СВОД-{a.round}.md"
     answered = sorted({r["voice"] for r in read_round(a.round)
                        if r.get("role") == "answer" and r.get("status") == "ok"})
 
@@ -2794,17 +2854,18 @@ def cmd_catchup(a: argparse.Namespace) -> int:
                   f"{': ' + pr['quota'] if pr.get('quota') else ''}) — долги ждут")
             continue
         for d in items:
+            # Проект — у каждого долга свой раунд (нашёл codex): без
+            # этого поздний ответ шёл из Choir/ и без строки о проекте —
+            # другой пакет, чем у ответивших вовремя. Ставится ДО поиска
+            # затравки: find_round_file ищет в каталоге проекта (grok).
+            global PROJECT
+            PROJECT = _project_of_round(d["round"])
             try:
-                seed = Path(d["seed_file"]).read_text(encoding="utf-8")
+                seed = find_round_file(d["seed_file"]).read_text(encoding="utf-8")
             except Exception as e:                                  # noqa: BLE001
                 print(f"  {voice}/{d['round']}: затравка недоступна ({e})")
                 continue
             print(f"  {voice} ← {d['round']} ({d['phase']})", flush=True)
-            # Проект — у каждого долга свой раунд (нашёл codex): без
-            # этого поздний ответ шёл из Choir/ и без строки о проекте —
-            # другой пакет, чем у ответивших вовремя.
-            global PROJECT
-            PROJECT = _project_of_round(d["round"])
             snapshot_goal(goal_of_seed(d["round"]))   # цель ТОГО раунда
             lp = next((r.get("project") for r in reversed(read_round(d["round"]))
                        if r.get("role") == "lot"), None)
@@ -4059,7 +4120,7 @@ def cmd_show(a: argparse.Namespace) -> int:
     return 0
 
 
-INBOX = Path(__file__).resolve().parent / "inbox"
+INBOX = Path(os.environ.get("CHOIR_INBOX") or JOURNAL / "inbox")   # переехал в journal/ (ревьюер дифа)
 INBOX_CAP = 40          # строк на голос; остальное — счётчиком
 
 

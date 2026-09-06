@@ -50,14 +50,32 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import leases                                            # noqa: E402
 
-# Комната ищется: env → каталог choir/ рядом с этим файлом (раскладка
-# публичного репозитория) → путь песочницы Автора. Порядок важен для
-# публикации: свежий клон работает без настройки.
-CHOIR = Path(os.environ.get("ROUNDTABLE_CHOIR")
-             or (Path(__file__).resolve().parent / "choir"
-                 if (Path(__file__).resolve().parent / "choir"
-                     / "live.py").exists()
-                 else Path.home() / "AiSandbox" / "Choir"))
+# Раскладка (переезд 2026-09-06): код стола — chamber/, журналы — journal/
+# рядом; ROUNDTABLE_CHAMBER / ROUNDTABLE_JOURNAL переопределяют каждый.
+_HERE = Path(__file__).resolve().parent
+# ROUNDTABLE_CHOIR — прежнее имя и старая раскладка «код и журнал в одной
+# папке»: значит и код, и журнал там, независимо от того, родилась ли уже
+# лента (ревизия переезда 2026-09-06: проверка «есть ли live.jsonl» делала
+# выбор зависимым от момента запуска). Явные ROUNDTABLE_CHAMBER/JOURNAL
+# сильнее. Пути делаются абсолютными сразу: дочерние процессы стартуют с
+# другим cwd, и относительная переменная означала бы там другое место.
+_legacy = os.environ.get("ROUNDTABLE_CHOIR")
+if _legacy and not (Path(_legacy).expanduser() / "live.py").is_file():
+    # переменная пережила переезд, а каталог — нет: молча вести окно в
+    # пустоту хуже предупреждения (ревизия переезда, deepseek 2026-09-06)
+    print(f"ROUNDTABLE_CHOIR={_legacy!r} не содержит live.py — переменная "
+          "проигнорирована, раскладка chamber/ + journal/", file=sys.stderr)
+    _legacy = ""
+_abs = lambda p: Path(p).expanduser().absolute()
+CHAMBER = _abs(os.environ.get("ROUNDTABLE_CHAMBER") or _legacy or _HERE / "chamber")
+JOURNAL = _abs(os.environ.get("ROUNDTABLE_JOURNAL") or os.environ.get("CHOIR_JOURNAL")
+               or _legacy or CHAMBER.parent / "journal")
+CHOIR = CHAMBER
+# live.py/choir.py в дочерних процессах обязаны видеть ТОТ ЖЕ журнал, что
+# окно: присваивание, не setdefault — унаследованный CHOIR_JOURNAL иначе
+# перекрыл бы явный ROUNDTABLE_JOURNAL тестового окна, и дирижёр писал бы в
+# живой журнал (ревизия переезда, grok 2026-09-06).
+os.environ["CHOIR_JOURNAL"] = str(JOURNAL)
 
 
 def post(kind: str, text: str, **extra):

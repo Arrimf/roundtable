@@ -58,17 +58,39 @@ import edits                             # правки: worktree + вердик
 import leases                            # аренды кресла исполнителя
 import merge_gate                        # этап 3: ревизия дифа + приёмка
 
-# Комната остаётся в Choir — RoundTable лишь окно в неё. Путь можно
-# переопределить (ROUNDTABLE_CHOIR), чтобы окно смотрело в другую комнату.
-# Комната ищется: env → каталог choir/ рядом с этим файлом (раскладка
-# публичного репозитория) → путь песочницы Автора. Порядок важен для
-# публикации: свежий клон работает без настройки.
-CHOIR = Path(os.environ.get("ROUNDTABLE_CHOIR")
-             or (Path(__file__).resolve().parent / "choir"
-                 if (Path(__file__).resolve().parent / "choir"
-                     / "live.py").exists()
-                 else Path.home() / "AiSandbox" / "Choir"))
-FEED = CHOIR / "live.jsonl"
+# Комната остаётся в chamber/ — RoundTable лишь окно в неё. РАСКЛАДКА
+# (переезд 2026-09-06): код стола — chamber/ (live.py, choir.py), журналы и
+# раунды — journal/ рядом; свежий публичный клон работает без настройки.
+# ROUNDTABLE_CHAMBER и ROUNDTABLE_JOURNAL переопределяют каждый каталог.
+_HERE = Path(__file__).resolve().parent
+# ROUNDTABLE_CHOIR — прежнее имя и старая раскладка «код и журнал в одной
+# папке»: значит и код, и журнал там, независимо от того, родилась ли уже
+# лента (ревизия переезда 2026-09-06: проверка «есть ли live.jsonl» делала
+# выбор зависимым от момента запуска). Явные ROUNDTABLE_CHAMBER/JOURNAL
+# сильнее. Пути делаются абсолютными сразу: дочерние процессы стартуют с
+# другим cwd, и относительная переменная означала бы там другое место.
+_legacy = os.environ.get("ROUNDTABLE_CHOIR")
+if _legacy and not (Path(_legacy).expanduser() / "live.py").is_file():
+    # переменная пережила переезд, а каталог — нет: молча вести окно в
+    # пустоту хуже предупреждения (ревизия переезда, deepseek 2026-09-06)
+    print(f"ROUNDTABLE_CHOIR={_legacy!r} не содержит live.py — переменная "
+          "проигнорирована, раскладка chamber/ + journal/", file=sys.stderr)
+    _legacy = ""
+_abs = lambda p: Path(p).expanduser().absolute()
+CHAMBER = _abs(os.environ.get("ROUNDTABLE_CHAMBER") or _legacy or _HERE / "chamber")
+JOURNAL = _abs(os.environ.get("ROUNDTABLE_JOURNAL") or os.environ.get("CHOIR_JOURNAL")
+               or _legacy or CHAMBER.parent / "journal")
+CHOIR = CHAMBER                      # прежнее имя: каталог кода стола
+# live.py/choir.py в дочерних процессах обязаны видеть ТОТ ЖЕ журнал, что
+# окно: присваивание, не setdefault — унаследованный CHOIR_JOURNAL иначе
+# перекрыл бы явный ROUNDTABLE_JOURNAL тестового окна, и дирижёр писал бы в
+# живой журнал (ревизия переезда, grok 2026-09-06).
+os.environ["CHOIR_JOURNAL"] = str(JOURNAL)
+# Относительный --project считается от корня песочницы (родителя RoundTable/):
+# раньше «относительно Choir/» совпадало с корнем случайно, теперь CHAMBER
+# лежит на уровень глубже, и `Film` превратился бы в chamber/Film (grok).
+SANDBOX = _abs(os.environ.get("ROUNDTABLE_SANDBOX") or _HERE.parent)
+FEED = JOURNAL / "live.jsonl"
 PORT = int(os.environ.get("ROUNDTABLE_PORT", "8770"))
 # Каталог, о котором идёт разговор. Умолчание — ТОТ, ИЗ КОТОРОГО ОКНО
 # ЗАПУСТИЛИ: Автор набирает `roundtable` в папке проекта и ждёт, что
@@ -323,7 +345,7 @@ def round_view(name: str) -> dict:
     стадий для кнопок. Отсутствие записи — честное отсутствие поля."""
     # Тот же путь, что у choir.py: CHOIR_ROOM переопределяет журнал
     # (тесты, чужая комната) — окно не должно читать не тот файл (deepseek).
-    room = Path(os.environ.get("CHOIR_ROOM") or (CHOIR / "room.jsonl"))
+    room = Path(os.environ.get("CHOIR_ROOM") or (JOURNAL / "room.jsonl"))
     recs: list[dict] = []
     needle = json.dumps(name, ensure_ascii=False)
     try:
@@ -1444,7 +1466,7 @@ def voice_report(name: str, limit: dict) -> dict:
 LIMITS_TTL = 180.0
 FIRST_WAIT = 1.5            # сколько ждёт САМЫЙ ПЕРВЫЙ запрос, потом ноль
 NET_TIMEOUT = 6.0           # короткий: шкала не стоит того, чтобы ждать
-ROOM = CHOIR / "room.jsonl"
+ROOM = JOURNAL / "room.jsonl"
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 # Где лежат ключи и токены. ЧИТАЮТСЯ НА КАЖДОМ ЗАМЕРЕ, а не один раз при
@@ -2745,7 +2767,7 @@ class Handler(BaseHTTPRequestHandler):
                 # смотрят в разные места, а файл проходил как «путь есть».
                 p = Path(project).expanduser()
                 if not p.is_absolute():
-                    p = (CHOIR / p)
+                    p = (SANDBOX / p)
                 p = p.resolve()
                 if not p.is_dir():
                     return self._json(400,
@@ -2861,7 +2883,7 @@ class Handler(BaseHTTPRequestHandler):
             if rproject:
                 rp = Path(rproject).expanduser()
                 if not rp.is_absolute():
-                    rp = CHOIR / rp
+                    rp = SANDBOX / rp
                 rp = rp.resolve()
                 if not rp.is_dir():
                     return self._json(400, {"error": f"не каталог: {rp}"})
@@ -2874,13 +2896,15 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(400, {"error": "раунд — минимум два "
                                         "разных голоса (жребий ведущего и "
                                         "слепая фаза из одного бессмысленны)"})
-            qfile = CHOIR / f"ВОПРОС-{name}.md"
+            rdir = JOURNAL / "rounds" / ((rp.name or "root") if rp else "RoundTable")
+            qfile = rdir / f"ВОПРОС-{name}.md"
             # Не переписываем молча: в room.jsonl уже лежит pick с
             # question_sha от старого текста, и файл разошёлся бы с
             # журналом беззвучно (нашёл ревьюер дифа).
             if qfile.exists() and not req.get("force"):
                 return self._json(409, {"error": f"{qfile.name} уже есть — "
                                         "выберите другое имя раунда"})
+            rdir.mkdir(parents=True, exist_ok=True)   # после 409: отказ не оставляет пустой папки
             qfile.write_text(question + "\n", encoding="utf-8")
             # Флаг-стоп с прошлого раза снимаем ЗДЕСЬ и ВСЛУХ. Файл живёт
             # дольше раунда: забытый стоп остановил бы новый такт с тем
@@ -2898,8 +2922,8 @@ class Handler(BaseHTTPRequestHandler):
             if auto:
                 # Аргументы списком, без bash -c: имя уже проверено, но
                 # лишний слой кавычек — лишний способ ошибиться.
-                cmd = [sys.executable, "choir.py", "run", "--round", name,
-                       "--seed", qfile.name, "--rebuts", str(rebuts),
+                cmd = [sys.executable, str(CHAMBER / "choir.py"), "run", "--round", name,
+                       "--seed", str(qfile), "--rebuts", str(rebuts),
                        *(["--voices", ",".join(rvoices)] if rvoices else []),
                        *pflag]
                 label = f"round: {name} [авто, витков: {rebuts}]"
@@ -2910,8 +2934,8 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 py = shlex.quote(sys.executable)
                 rn = shlex.quote(name)
-                seed = shlex.quote(qfile.name)
-                zt = shlex.quote(f"ЗАТРАВКА-{name}.md")  # его создаст expand
+                seed = shlex.quote(str(qfile))
+                zt = shlex.quote(str(rdir / f"ЗАТРАВКА-{name}.md"))  # его создаст expand
                 # --voices у pick и ask (expand его не знает: ведущий
                 # уже выбран жребием среди названных).
                 vs = (" --voices " + shlex.quote(",".join(rvoices))
@@ -3686,12 +3710,18 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 # --by не шлём: choir.py сам берёт запасной жребий
                 # (lot_summary) или ведущего — окно не решает, кто сводит.
-                cmd = [sys.executable, "choir.py", step, "--round", name]
+                cmd = [sys.executable, str(CHAMBER / "choir.py"), step, "--round", name]
                 if step == "summarize":
                     # Карточка свода — файлом, как у автопрогона (у run
                     # умолчание СВОД-<раунд>.md); без --out summarize
                     # пишет свод только в журнал (поймано на «Канбан1»).
-                    cmd += ["--out", f"СВОД-{name}.md"]
+                    # Путь АБСОЛЮТНЫЙ, в journal/rounds/<проект жребия>/:
+                    # относительный при cwd=chamber/ уходил бы в каталог
+                    # кода (ревизия переезда, grok 2026-09-06).
+                    proj = view.get("project")
+                    rdir = JOURNAL / "rounds" / ((Path(proj).name or "root") if proj else "RoundTable")
+                    rdir.mkdir(parents=True, exist_ok=True)
+                    cmd += ["--out", str(rdir / f"СВОД-{name}.md")]
                 who = view.get("summarizer") or view["conductor"]
                 label = (f"round: {name} [виток критики "
                          f"№{view.get('rebuts', 0) + 1}]" if step == "rebut"

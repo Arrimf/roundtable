@@ -5,7 +5,7 @@ set -euo pipefail
 RT="$(cd "$(dirname "$0")/.." && pwd)"
 W="$(mktemp -d /tmp/gatetest.XXXXXX)"
 trap 'rm -rf "$W"' EXIT
-mkdir -p "$W/room"; cp "$RT/../Choir/"*.py "$W/room/"; : > "$W/room/live.jsonl"
+mkdir -p "$W/room"; cp "$RT/chamber/"*.py "$W/room/"; : > "$W/room/live.jsonl"
 git init -q -b main "$W/proj"
 cd "$W/proj"
 printf 'x = 1\n' > a.py

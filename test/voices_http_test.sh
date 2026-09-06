@@ -6,7 +6,7 @@
 # Ничего живого не трогает и денег не тратит: ни одного вызова голоса.
 set -u
 RT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-SRC_CHOIR="${ROUNDTABLE_CHOIR:-$HOME/AiSandbox/Choir}"
+SRC_CHAMBER="${ROUNDTABLE_CHAMBER:-$RT_DIR/chamber}"
 PORT="${RT_HTTP_TEST_PORT:-8779}"
 W="$(mktemp -d /tmp/rt-http.XXXXXX)"
 PASS=0; FAIL=0
@@ -16,13 +16,13 @@ B="http://127.0.0.1:$PORT"
 post() { curl -s -X POST "$B$1" -H 'Content-Type: application/json' -d "$2"; }
 code() { curl -s -o /dev/null -w '%{http_code}' -X POST "$B$1" -H 'Content-Type: application/json' -d "$2"; }
 
-mkdir -p "$W/choir"
-cp "$SRC_CHOIR"/*.py "$W/choir/" || { echo "нет $SRC_CHOIR/*.py"; exit 2; }
-: > "$W/choir/live.jsonl"; : > "$W/choir/room.jsonl"
+mkdir -p "$W/chamber" "$W/journal/rounds"
+cp "$SRC_CHAMBER"/*.py "$W/chamber/" || { echo "нет $SRC_CHAMBER/*.py"; exit 2; }
+: > "$W/journal/live.jsonl"; : > "$W/journal/room.jsonl"
 # Кэш каталога с лестницами ПО МОДЕЛЯМ — детерминированно и без сети.
 cat > "$W/rt-models.json" <<'EOF'
-{"codex": {"models": ["gpt-5.6-sol", "gpt-5.4"], "efforts": ["low","medium","high","xhigh","max","ultra"],
-  "efforts_by_model": {"gpt-5.6-sol": ["low","medium","high","xhigh","max","ultra"], "gpt-5.4": ["low","medium","high","xhigh"]},
+{"codex": {"models": ["gpt-6-astra", "gpt-5.6-sol", "gpt-5.4"], "efforts": ["low","medium","high","xhigh","max","ultra"],
+  "efforts_by_model": {"gpt-6-astra": ["low","medium","high","xhigh","max","ultra"], "gpt-5.6-sol": ["low","medium","high","xhigh","max","ultra"], "gpt-5.4": ["low","medium","high","xhigh"]},
   "default_effort_by_model": {"gpt-5.6-sol": "low"}, "source": "тест", "fetched_at": "2026-09-02T00:00:00+00:00"},
  "grok": {"models": ["grok-4.6", "grok-4.5"], "efforts": ["low","medium","high","xhigh"],
   "efforts_by_model": {"grok-4.6": ["low","medium","high","xhigh"], "grok-4.5": ["low","medium","high"]},
@@ -42,7 +42,7 @@ EOF
 if ss -ltn 2>/dev/null | grep -q ":$PORT "; then
   echo "порт $PORT занят: $(ss -ltnp | grep ":$PORT ") — задайте RT_HTTP_TEST_PORT"; exit 2
 fi
-( cd "$RT_DIR" && ROUNDTABLE_CHOIR="$W/choir" CHOIR_RT_VOICES="$W/rt-voices.json" \
+( cd "$RT_DIR" && ROUNDTABLE_CHAMBER="$W/chamber" ROUNDTABLE_JOURNAL="$W/journal" CHOIR_RT_VOICES="$W/rt-voices.json" \
   CHOIR_RT_MODELS="$W/rt-models.json" CHOIR_RT_NO_DISCOVERY=1 CHOIR_DSH_PATCH_DIR="$W/dshp" \
   CHOIR_WT_DIR="$W/wt" ROUNDTABLE_PORT="$PORT" nohup python3 roundtable.py --no-project \
   > "$W/srv.log" 2>&1 ) &
@@ -89,14 +89,17 @@ R="$(post /voices '{"voice":"codex","scope":"room","model":""}')"
 echo "$R" | grep -q '"reset": true' && pass "сброс модели → 200" || fail "сброс модели: $R"
 curl -s "$B/voices" | python3 -c '
 import json,sys; d=json.load(sys.stdin); t=[v for v in d["voices"] if v["name"]=="codex"][0]["tabs"]["room"]
-sys.exit(0 if t["set_model"] is None and t["set_effort"] in (None,"ultra") and (t["set_effort"] is None or t["default_model"]=="gpt-5.6-sol") else 1)' \
+# умолчание codex берётся из ~/.codex/config.toml ЭТОЙ машины (было gpt-5.6-sol,
+# с 2026-09-06 gpt-6-astra) — проверяем свойство, а не имя: оставшееся усилие
+# либо снято, либо входит в лестницу модели умолчания.
+sys.exit(0 if t["set_model"] is None and (t["set_effort"] is None or t["set_effort"] in (t.get("efforts") or [])) else 1)' \
   && pass "после сброса усилие сверено с моделью умолчания" || fail "сброс: усилие не сверено"
 [ "$(code /voices '{"voice":"kimi","scope":"room","model":"kimi-k9-new"}')" = 200 ] && fail "kimi без алиаса принят как известный" || pass "kimi: имя без алиаса — не «известное» (принято лишь по форме или отклонено)"
-grep -q '"voice_config"' "$W/choir/live.jsonl" && grep -q '\[кресло\]' "$W/choir/live.jsonl" && pass "событие кресла подписано [кресло]" || fail "событие кресла подписано не как кресло"
-grep -c 'живая комната' "$W/choir/live.jsonl" | grep -q '^0$' || { grep '\[кресло\]' "$W/choir/live.jsonl" | grep -q 'живая комната' && fail "у события кресла комнатная область" || pass "у события кресла нет комнатной области"; }
+grep -q '"voice_config"' "$W/journal/live.jsonl" && grep -q '\[кресло\]' "$W/journal/live.jsonl" && pass "событие кресла подписано [кресло]" || fail "событие кресла подписано не как кресло"
+grep -c 'живая комната' "$W/journal/live.jsonl" | grep -q '^0$' || { grep '\[кресло\]' "$W/journal/live.jsonl" | grep -q 'живая комната' && fail "у события кресла комнатная область" || pass "у события кресла нет комнатной области"; }
 [ "$(code /round '{"question":"q","name":"dup","voices":["claude","claude"]}')" = 400 ] && pass "/round: дубли — не два голоса" || fail "/round дубли"
 [ "$(code /round '{"question":"q","name":"none","voices":[]}')" = 400 ] && pass "/round: пустой список → 400" || fail "/round пусто"
-[ ! -e "$W/choir/ВОПРОС-dup.md" ] && pass "/round: отказ до записи файла вопроса" || fail "/round: файл вопроса записан при отказе"
+[ ! -e "$W/journal/rounds/RoundTable/ВОПРОС-dup.md" ] && pass "/round: отказ до записи файла вопроса" || fail "/round: файл вопроса записан при отказе"
 [ "$(code /lot '{"candidates":["grok","grok"]}')" = 400 ] && pass "/lot: дубли кандидатов → 400" || fail "/lot дубли"
 R="$(post /models_refresh '{"voices":["claude","claude","claude","nope"]}')"
 echo "$R" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if list(d["report"].keys())==["claude"] else 1)' \
@@ -108,7 +111,7 @@ mkdir -p "$W/proj" && git -C "$W/proj" init -q && git -C "$W/proj" -c user.name=
 R="$(post /edit "{\"task\":\"t\",\"voice\":\"random\",\"project\":\"$W/proj\"}")"
 echo "$R" | grep -q 'пул random пуст' && pass "/edit: повтор — снова «пул пуст», а не «проект занят» (резерв не завис)" || fail "/edit: резерв завис: $R"
 # карточка раунда: /round_view читает room.jsonl, /round_step — шаги по человеку
-cat >> "$W/choir/room.jsonl" <<'EOF'
+cat >> "$W/journal/room.jsonl" <<'EOF'
 {"id":"a1","ts":"2026-09-03T10:00:00+00:00","round":"t1","phase":"pick","voice":"choir","role":"lot","text":"grok","conductor":"grok","candidates":["claude","grok"],"drand_round":1,"project":"/tmp"}
 {"id":"a2","ts":"2026-09-03T10:00:01+00:00","round":"t1","phase":"expand","voice":"grok","role":"seed_expanded","status":"ok","text":"# затравка"}
 {"id":"a3","ts":"2026-09-03T10:00:02+00:00","round":"t1","phase":"blind","voice":"claude","role":"answer","status":"ok","text":"ответ клода","elapsed_s":12.5}
@@ -128,12 +131,12 @@ curl -s "$B/round_view?name=nope" | grep -q '"found": false' && pass "/round_vie
 [ "$(code /round_step '{"name":"t2","step":"rebut"}')" = 409 ] && pass "/round_step: без слепой фазы → 409" || fail "/round_step без ответов"
 [ "$(code /round_step '{"name":"t9","step":"summarize"}')" = 409 ] && pass "/round_step: без жребия → 409" || fail "/round_step без жребия"
 [ "$(code /round '{"question":"q","name":"pj","project":"/nonexistent/dir"}')" = 400 ] && pass "/round: проект не каталог → 400 до записи файла" || fail "/round проект"
-[ ! -e "$W/choir/ВОПРОС-pj.md" ] && pass "/round: файл вопроса при отказе не создан" || fail "/round: файл вопроса создан при отказе"
+[ ! -e "$W/journal/rounds/RoundTable/ВОПРОС-pj.md" ] && pass "/round: файл вопроса при отказе не создан" || fail "/round: файл вопроса создан при отказе"
 # ── шаги раунда с ЗАГЛУШКОЙ дирижёра: argv в файл, сон 3 с, код 0 ──
 # (ревизия 2026-09-03: без стаба «проверка занятости мертва с рождения» и
 # «финал без поля round» проходили тесты — codex, grok, kimi, claude, субагент)
-cp "$W/choir/choir.py" "$W/choir/choir_real.py"   # живой дирижёр — для проверок его функций
-cat > "$W/choir/choir.py" <<'EOF'
+cp "$W/chamber/choir.py" "$W/chamber/choir_real.py"   # живой дирижёр — для проверок его функций
+cat > "$W/chamber/choir.py" <<'EOF'
 import sys, time, os
 open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "argv.log"), "a").write(" ".join(sys.argv[1:]) + "\n")
 time.sleep(3 if sys.argv[1] in ("rebut", "summarize") else 0)
@@ -142,18 +145,18 @@ R="$(post /round_step '{"name":"t1","step":"rebut"}')"
 echo "$R" | grep -q '"act"' && pass "/round_step rebut → 200 (стаб дирижёра)" || fail "/round_step 200: $R"
 [ "$(code /round_step '{"name":"t1","step":"summarize"}')" = 409 ] && pass "/round_step: второй шаг того же раунда во время первого → 409" || fail "/round_step: занятость не видна"
 sleep 5
-grep -q "^rebut --round t1$" "$W/choir/argv.log" && pass "/round_step: argv «rebut --round t1» без --by и без лишнего" || fail "argv rebut: $(cat "$W/choir/argv.log")"
-tail -n 3 "$W/choir/live.jsonl" | grep -q '"status": "done"' && tail -n 3 "$W/choir/live.jsonl" | grep '"status": "done"' | grep -q '"round": "t1"' && pass "финал акта несёт round (карточка появится)" || fail "финал акта без round: $(tail -n 2 "$W/choir/live.jsonl" | cut -c1-200)"
-tail -n 3 "$W/choir/live.jsonl" | grep '"status": "done"' | grep -q '"step": "rebut"' && pass "финал акта несёт step" || fail "финал без step"
+grep -q "^rebut --round t1$" "$W/chamber/argv.log" && pass "/round_step: argv «rebut --round t1» без --by и без лишнего" || fail "argv rebut: $(cat "$W/chamber/argv.log")"
+tail -n 3 "$W/journal/live.jsonl" | grep -q '"status": "done"' && tail -n 3 "$W/journal/live.jsonl" | grep '"status": "done"' | grep -q '"round": "t1"' && pass "финал акта несёт round (карточка появится)" || fail "финал акта без round: $(tail -n 2 "$W/journal/live.jsonl" | cut -c1-200)"
+tail -n 3 "$W/journal/live.jsonl" | grep '"status": "done"' | grep -q '"step": "rebut"' && pass "финал акта несёт step" || fail "финал без step"
 [ "$(code /round_step '{"name":"t1","step":"summarize"}')" = 200 ] && pass "/round_step summarize после витка → 200" || fail "/round_step summarize"
 sleep 5
-grep -q "^summarize --round t1 --out СВОД-t1.md$" "$W/choir/argv.log" && pass "summarize: без --by (сводчика выбирает choir.py), с --out СВОД-<раунд>.md" || fail "argv summarize: $(cat "$W/choir/argv.log")"
+grep -q "^summarize --round t1 --out $W/journal/rounds/tmp/СВОД-t1.md$" "$W/chamber/argv.log" && pass "summarize: без --by (сводчика выбирает choir.py), --out абсолютный в journal/rounds/<проект жребия>/" || fail "argv summarize: $(cat "$W/chamber/argv.log")"
 mkdir -p "$W/proj2" && git -C "$W/proj2" init -q
 R="$(post /round "{\"question\":\"q\",\"name\":\"pj2\",\"project\":\"$W/proj2\"}")"
 echo "$R" | grep -q '"act"' && pass "/round с проектом → 200" || fail "/round с проектом: $R"
 sleep 2
-grep -q "^pick --round pj2 --seed .* --project $W/proj2$" "$W/choir/argv.log" && pass "/round: --project уходит в pick (цепочка по шагам)" || fail "argv pick без --project: $(grep pick "$W/choir/argv.log")"
-grep -q "^ask --round pj2 --seed" "$W/choir/argv.log" && ! grep "^ask --round pj2" "$W/choir/argv.log" | grep -q -- "--project" && pass "/round: ask без --project (берёт из жребия)" || fail "argv ask: $(grep '^ask' "$W/choir/argv.log")"
+grep -q "^pick --round pj2 --seed .* --project $W/proj2$" "$W/chamber/argv.log" && pass "/round: --project уходит в pick (цепочка по шагам)" || fail "argv pick без --project: $(grep pick "$W/chamber/argv.log")"
+grep -q "^ask --round pj2 --seed" "$W/chamber/argv.log" && ! grep "^ask --round pj2" "$W/chamber/argv.log" | grep -q -- "--project" && pass "/round: ask без --project (берёт из жребия)" || fail "argv ask: $(grep '^ask' "$W/chamber/argv.log")"
 # ── цель целеполагателя и адресная опция комнаты ──────────────────
 R="$(post /goal '{"text":"Довести окно до релиза 0.2"}')"
 echo "$R" | grep -q '"goal": "Довести окно до релиза 0.2"' && pass "/goal → событие goal" || fail "/goal: $R"
@@ -161,7 +164,7 @@ curl -s "$B/state" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.ex
 post /goal '{"text":""}' > /dev/null; curl -s "$B/state" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get("goal")=="" else 1)' && pass "пустая цель снимает цель" || fail "цель не снялась"
 [ "$(code /goal "{\"text\":\"$(python3 -c 'print("x"*2001)')\"}")" = 400 ] && pass "/goal: длиннее 2000 → 400" || fail "/goal длина"
 [ "$(code /goal '{"text":["a"]}')" = 400 ] && pass "/goal: не строка → 400" || fail "/goal тип"
-( cd "$W/choir" && python3 - <<'EOF'
+( cd "$W/chamber" && python3 - <<'EOF'
 import sys; sys.path.insert(0, "."); import live
 f = live._status_of
 assert f(3, "", "", 3) == "quota" and f(1, "", "HTTP 429 Too Many Requests: rate limit", None) == "quota"
@@ -189,7 +192,7 @@ EOF
 ) && pass "live.py: типы отказов (без ложных), адресная опция: начало строки, самоадрес, ветка" || fail "live.py: статусы/адресация"
 # цель: окно и голоса читают одно и то же, и старая цель не теряется за хвостом
 post /goal '{"text":"Цель-А для проверки"}' > /dev/null
-python3 - "$W/choir/live.jsonl" <<'EOF'
+python3 - "$W/journal/live.jsonl" <<'EOF'
 import json, sys
 # 600 КБ балласта после цели — хвост в 512 КБ её терял
 with open(sys.argv[1], "a", encoding="utf-8") as f:
@@ -197,9 +200,9 @@ with open(sys.argv[1], "a", encoding="utf-8") as f:
         f.write(json.dumps({"id": 900000 + i, "ts": "2026-09-06T00:00:00+00:00", "author": "choir", "kind": "note", "text": "x" * 900}, ensure_ascii=False) + "\n")
 EOF
 curl -s "$B/state" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get("goal")=="Цель-А для проверки" else 1)' && pass "/state.goal не теряется за 600 КБ балласта (весь файл, не хвост)" || fail "/state.goal потерялся за хвостом"
-( cd "$W/choir" && python3 -c 'import sys; sys.path.insert(0,"."); import live; assert live._read_goal()=="Цель-А для проверки"' ) && pass "live.current_goal видит ту же цель, что окно" || fail "live/окно расходятся в цели"
+( cd "$W/chamber" && python3 -c 'import sys; sys.path.insert(0,"."); import live; assert live._read_goal()=="Цель-А для проверки"' ) && pass "live.current_goal видит ту же цель, что окно" || fail "live/окно расходятся в цели"
 # сценарий комнаты с ПОДДЕЛЬНЫМИ голосами (turn подменён): адрес → ответ адресата → рук нет → ветка закрыта
-( cd "$W/choir" && CHOIR_PEER=1 python3 - <<'EOF'
+( cd "$W/chamber" && CHOIR_PEER=1 python3 - <<'EOF'
 import sys, json, argparse
 sys.path.insert(0, "."); import live
 calls = []
@@ -214,7 +217,7 @@ live.turn = fake_turn
 live.available = lambda n: True
 live.PEER = True
 live.cmd_say(argparse.Namespace(text="@claude что скажешь про цифру 142?", voices="claude,deepseek,grok", once=False))
-evs = [json.loads(l) for l in open("live.jsonl", encoding="utf-8")]
+evs = [json.loads(l) for l in open("../journal/live.jsonl", encoding="utf-8")]
 tail = evs[-12:]
 say = [e for e in tail if e.get("kind") == "say"]
 by = {e["author"]: e for e in say if e["author"] != "arr"}
@@ -237,13 +240,13 @@ assert "Адресные вопросы коллегам сейчас ВЫКЛЮ
 print("peer-switch ok")
 EOF
 ) && pass "комната (фальшивые голоса): адрес коллеги → ответ в ветке → рук нет → ветка закрыта, третий не оплачен; смена опции доезжает до нити" || fail "сценарий адресной ветки"
-( cd "$W/choir" && python3 - <<'EOF'
+( cd "$W/chamber" && python3 - <<'EOF'
 import sys, json, importlib.util
 # choir.py здесь заглушка — читаем ЖИВОЙ дирижёр по абсолютному пути
 spec = importlib.util.spec_from_file_location("choir_live", "choir_real.py")
 m = importlib.util.module_from_spec(spec); sys.modules["choir_live"] = m; spec.loader.exec_module(m)
 import os
-m.ROOM = __import__("pathlib").Path(os.getcwd()) / "room.jsonl"
+m.ROOM = __import__("pathlib").Path(os.getcwd()).parent / "journal" / "room.jsonl"
 m._append({"id": "s1", "ts": "2026-09-06T00:00:00+00:00", "round": "g1", "phase": "blind", "voice": "arr", "role": "seed", "text": "q", "packet_prefix": "ЦЕЛЬ (целеполагатель — Автор): строка 1\nстрока 2\n\n", "goal": None})
 m._append({"id": "s2", "ts": "2026-09-06T00:00:01+00:00", "round": "g2", "phase": "blind", "voice": "arr", "role": "seed", "text": "q", "packet_prefix": "ЦЕЛЬ (целеполагатель — Автор): a\nb\n\n", "goal": "a\nb"})
 assert m.goal_of_seed("g1") == "строка 1\nстрока 2", m.goal_of_seed("g1")

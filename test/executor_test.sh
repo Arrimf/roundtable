@@ -7,7 +7,7 @@ set -euo pipefail
 RT="$(cd "$(dirname "$0")/.." && pwd)"
 W="$(mktemp -d /tmp/extest.XXXXXX)"
 trap 'chmod u+w "$W/room/live.jsonl" 2>/dev/null || true; rm -rf "$W"' EXIT
-mkdir -p "$W/room" && cp "$RT/../Choir/"*.py "$W/room/" && : > "$W/room/live.jsonl"
+mkdir -p "$W/room" && cp "$RT/chamber/"*.py "$W/room/" && : > "$W/room/live.jsonl"
 # Дерево акта — ПРИСТЁГНУТЫЙ worktree, как в спеке: обёртка отличает
 # его от главного checkout'а и в главный писать отказывается.
 git init -q "$W/base"
