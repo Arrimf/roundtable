@@ -42,6 +42,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -114,6 +115,99 @@ def _git_at(wt: Path, *args) -> str | None:
               f"{r.stderr.strip()[:200]}", file=sys.stderr)
         return None
     return r.stdout
+
+
+def _durable_log() -> Path | None:
+    """Стенограф CLI в каталоге актов окна (<RT_ACT_DIR>/<RT_ACT_ID>.chair.log),
+    если кресло выдано окном; иначе None (лог — рядом с арендой)."""
+    d, i = os.environ.get("RT_ACT_DIR"), os.environ.get("RT_ACT_ID")
+    if d and i and re.fullmatch(r"[0-9a-f]{6,32}", i) and Path(d).is_dir():
+        return Path(d) / f"{i}.chair.log"      # каталог обязан существовать (ревьюер)
+    return None
+
+
+# Файлы, которым не место в ветке акта: секреты и ключи, оставленные CLI в
+# дереве, уехали бы в диф и разлетелись бы шести провайдерам через пакет
+# ревизии (ревьюер дифа воспроизвёл с .env). Такие пути и симлинки
+# (ссылка на ~/.ssh/id_rsa в main) снимаются с индекса, коммит идёт без них.
+# Узко и по форме имени: широкие маски («*secret*») исключили бы из ветки
+# честный исходник вроде secret_store.py, и приёмка потеряла бы файл молча.
+_SECRET_PATH_RE = re.compile(
+    r"(?i)(^|/)(\.env(\..*)?|[^/]*\.(pem|key|p12|pfx|keystore)|id_(rsa|ed25519|ecdsa)(\.pub)?|"
+    r"[^/]*credentials[^/]*\.json)$")
+
+
+def _autocommit(wt: Path, voice: str, act: str) -> tuple[str | None, list[str]]:
+    """Правки, оставленные исполнителем без коммита, — в коммит на ветке
+    акта от имени голоса. Гейт видит только ветку (спека п.5): работа в
+    рабочем дереве для ревизии не существовала бы, а Автор велел
+    ревизовать каждую правку, даже быструю (2026-09-06: «спотыкались об
+    это не раз»). Коммит помечен как сделанный обёрткой — авторство
+    содержимого у голоса, авторство коммита названо честно. Возвращает
+    sha нового HEAD или None, если git отказал (причина — в stderr)."""
+    # HEAD обязан стоять на ветке акта: CLI мог уйти в detached HEAD, и
+    # коммит там был бы недостижим — а лента сказала бы «закоммичено»
+    # (ревьюер дифа воспроизвёл). Отказ вслух.
+    ref = _git_at(wt, "symbolic-ref", "-q", "HEAD")
+    if not ref or ref.strip() != f"refs/heads/act/{act}":
+        print(f"автокоммит отказан: HEAD не на ветке act/{act} "
+              f"({(ref or '').strip() or 'detached'})", file=sys.stderr)
+        return None, []
+    if _git_at(wt, "add", "-A") is None:
+        return None, []
+    # Вложенный репозиторий уехал бы gitlink'ом: в дифе одна строка
+    # «Subproject commit», содержимое — мимо ревизии, в main — битая
+    # ссылка (ревизия: kimi, grok, codex). Отказ, индекс назад.
+    # --no-renames: у переименования в --raw ДВА пути, и разбор парами
+    # «мета, путь» сбился бы; здесь важен состав, не история имён
+    staged = _git_at(wt, "diff", "--cached", "--raw", "-z", "--no-renames")
+    if staged is None:
+        _git_at(wt, "reset", "-q")
+        return None, []
+    excluded: list[str] = []
+    fields = staged.split("\0")
+    i = 0
+    while i + 1 < len(fields) and fields[i]:
+        meta, path = fields[i], fields[i + 1]
+        i += 2
+        parts = meta.split()
+        mode = parts[1] if len(parts) > 1 else ""
+        if mode == "160000":
+            print("автокоммит отказан: в дереве вложенный git-репозиторий "
+                  "(gitlink) — его содержимое было бы невидимо ревизии",
+                  file=sys.stderr)
+            _git_at(wt, "reset", "-q")
+            return None, []
+        if mode == "120000" or _SECRET_PATH_RE.search(path):
+            excluded.append(path)
+    if excluded:
+        if _git_at(wt, "reset", "-q", "--", *excluded) is None:
+            _git_at(wt, "reset", "-q")
+            return None, []
+        print("автокоммит: оставлены ВНЕ коммита (симлинки и похожие на "
+              "секреты): " + ", ".join(excluded), file=sys.stderr)
+        left = _git_at(wt, "diff", "--cached", "--name-only")
+        if left is None:
+            return None, excluded
+        if not left.strip():
+            return "", excluded                # коммитить нечего: остались только исключённые
+    msg = (f"{act}: правки исполнителя {voice}, оставленные без коммита\n\n"
+           f"Закоммичены обёрткой кресла (executor_run) при закрытии акта: "
+           f"гейт ревизует только ветку, а работа вне коммита для стола "
+           f"невидима.")
+    # Автор — голос (содержимое его), коммиттер — обёртка (коммит её):
+    # git-мета не врёт (kimi, grok, codex). Подпись и хуки выключены:
+    # gpgsign на машине с ключом молча ронял бы коммит, и дерево
+    # оставалось бы грязным (grok). Провал — индекс назад.
+    if _git_at(wt, "-c", "user.name=executor_run",
+               "-c", "user.email=chair@roundtable.local",
+               "-c", "commit.gpgsign=false",
+               "commit", "-q", "--no-verify",
+               f"--author={voice} <{voice}@roundtable.local>", "-m", msg) is None:
+        _git_at(wt, "reset", "-q")
+        return None, excluded
+    head = _git_at(wt, "rev-parse", "HEAD")
+    return (head.strip() if head else None), excluded
 
 
 def _close_act(a, *, status: str, rc: int, text: str, **extra):
@@ -247,8 +341,14 @@ def main() -> int:
     # ошибётся числом. Ошибка должна быть ГРОМКОЙ: маркер или стенограф
     # этой же эпохи означают, что такой ход уже был, и второй запуск
     # затёр бы его следы (нашёл субагент-ревьюер).
+    # Долговечный стенограф этого акта окна — тоже улика прошлого хода:
+    # без него защита от повторной эпохи ослепла бы после переезда лога
+    # (kimi, grok, deepseek). Границу называем честно: повтор эпохи под
+    # ДРУГИМ актом окна ловится только маркером close, а его удачный
+    # close снимает; эпохи чеканит окно, это защита в глубину.
     stale = ([leases.LEASE_DIR / f"{a.act}.{a.epoch}.close.json"]
-             + [leases.LEASE_DIR / f"edit-{a.act}.{a.epoch}.log"])
+             + [leases.LEASE_DIR / f"edit-{a.act}.{a.epoch}.log"]
+             + ([_durable_log()] if _durable_log() else []))
     busy = [f for f in stale if f.exists()]
     if busy:
         print(f"эпоха {a.epoch} акта {a.act} уже использована: "
@@ -290,7 +390,15 @@ def _run(a, wt: Path, cmd: list, lease) -> int:
     # Стенограф — тоже с эпохой: «продолжить» после вылета затирало
     # единственную улику того, что делал упавший CLI, ровно в момент
     # разбора вылета (субагент).
-    log_path = leases.LEASE_DIR / f"edit-{a.act}.{a.epoch}.log"
+    # Стенограф CLI — в каталог актов окна (<RT_ACT_DIR>/<акт окна>.chair.log),
+    # когда кресло выдано окном: лог в каталоге аренд уборка leases.sweep
+    # стирает после закрытия, и вкладка «исполнитель» пустела, едва ход
+    # кончался (Автор, 2026-09-06). Без окна — по-прежнему рядом с арендой.
+    log_path = _durable_log()
+    if log_path is not None:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        log_path = leases.LEASE_DIR / f"edit-{a.act}.{a.epoch}.log"
 
     my_pid = os.getpid()
 
@@ -440,14 +548,40 @@ def _run(a, wt: Path, cmd: list, lease) -> int:
     # наблюдатель увидит close и поверит штатности: это честно, работа
     # записана.
     note = ""
+    autocommit = False
+    excluded: list[str] = []
     if dirty:
-        note = "; в worktree НЕзакоммиченные правки"
+        new_head, excluded = _autocommit(wt, a.voice, a.act)
+        if new_head is not None:
+            # "" — коммитить было нечего: остались только исключённые
+            if new_head:
+                head, autocommit = new_head, True
+                note = ("; исполнитель коммит не сделал — правки закоммичены "
+                        "обёрткой кресла, ревизии есть что смотреть")
+            else:
+                note = "; в дереве только симлинки/секреты — в ветку не идут"
+            # грязь — ТОЛЬКО то, что не исключено намеренно: иначе .env,
+            # оставленный CLI, блокировал бы ревизию честной ветки.
+            # Молчащий git — неизвестность, не чистота (codex).
+            st2 = _git_at(wt, "status", "--porcelain", "-z", "--no-renames")
+            if st2 is None:
+                dirty = None
+                note += "; состояние дерева после коммита неизвестно (git не ответил)"
+            else:
+                rest = [f[3:] for f in st2.split("\0") if len(f) > 3]
+                dirty = any(pth not in excluded for pth in rest)
+            if excluded:
+                note += ("; вне коммита оставлены (симлинки/секреты): "
+                         + ", ".join(excluded[:6]))
+        else:
+            note = "; в worktree НЕзакоммиченные правки (автокоммит не удался — причина в логе)"
     elif dirty is None:
         note = "; состояние worktree неизвестно (git не ответил)"
     _close_act(a, status="done" if rc == 0 else "error", rc=rc,
                text=f"правка {a.act} [{a.voice}]: CLI завершился rc={rc}"
                     f" за {el} с{note}",
-               head=head, dirty=dirty,
+               head=head, dirty=dirty, autocommit=autocommit,
+               excluded=excluded or None,
                elapsed_s=el, tail=out[-1500:] if out else "")
     return 0 if rc == 0 else 1
 

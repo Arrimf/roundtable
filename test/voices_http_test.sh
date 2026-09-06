@@ -42,7 +42,7 @@ EOF
 if ss -ltn 2>/dev/null | grep -q ":$PORT "; then
   echo "порт $PORT занят: $(ss -ltnp | grep ":$PORT ") — задайте RT_HTTP_TEST_PORT"; exit 2
 fi
-( cd "$RT_DIR" && ROUNDTABLE_CHAMBER="$W/chamber" ROUNDTABLE_JOURNAL="$W/journal" CHOIR_RT_VOICES="$W/rt-voices.json" CHOIR_RT_ACTS="$W/acts" CHOIR_LEASE_DIR="$W/leases" \
+( cd "$RT_DIR" && ROUNDTABLE_CHAMBER="$W/chamber" ROUNDTABLE_JOURNAL="$W/journal" CHOIR_RT_VOICES="$W/rt-voices.json" CHOIR_RT_ACTS="$W/acts" CHOIR_LEASE_DIR="$W/leases" CHOIR_RT_NO_AUTOREVIEW=1 \
   CHOIR_RT_MODELS="$W/rt-models.json" CHOIR_RT_NO_DISCOVERY=1 CHOIR_DSH_PATCH_DIR="$W/dshp" \
   CHOIR_WT_DIR="$W/wt" ROUNDTABLE_PORT="$PORT" nohup python3 roundtable.py --no-project \
   > "$W/srv.log" 2>&1 ) &

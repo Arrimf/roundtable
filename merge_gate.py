@@ -266,6 +266,14 @@ def last_reviewed_sha(st: dict, head: str) -> str | None:
     return None
 
 
+_DIFF_SECRET_RE = re.compile(
+    r"(?i)(bearer\s+\S+|sk-[A-Za-z0-9_-]{8,}|AIza[0-9A-Za-z_-]{10,}|"
+    r"gh[pousr]_[A-Za-z0-9]{10,}|github_pat_[A-Za-z0-9_]{10,}|xai-[A-Za-z0-9_-]{10,}|"
+    r"xox[abpsr]-[A-Za-z0-9-]{10,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}|"
+    r"(?:\b[A-Za-z0-9_-]*(?:x-api-key|api[_-]?key|token|secret|authorization)|\bkey)"
+    r"[\"']?\s*[:=]\s*[\"']?[^\"'&\s]{8,})")
+
+
 def _review_prompt(act: str, st: dict, diff: str, head: str,
                    delta: str | None = None,
                    prev_sha: str | None = None,
@@ -283,7 +291,26 @@ def _review_prompt(act: str, st: dict, diff: str, head: str,
 
 ── ДЕЛЬТА ДОПРАВКИ ─────────────────────────────────────────────────
 {delta}"""
-    return f"""РЕВИЗИЯ ПРАВКИ ЗА СТОЛОМ (merge-гейт, этап 3). Вы — ревьюер.{delta_block}
+    cl = st.get("close") or {}
+    warn = ""
+    if cl.get("autocommit"):
+        warn += ("\n\nВНИМАНИЕ: исполнитель НЕ сделал коммит — остатки рабочего дерева "
+                 "закоммичены обёрткой кресла (autocommit). Состав коммита не "
+                 "выбирал никто: проверьте, нет ли в дифе мусора, временных файлов "
+                 "и забытых правок.")
+    if cl and (cl.get("status") != "done" or (cl.get("rc") or 0) != 0):
+        warn += (f"\n\nВНИМАНИЕ: CLI исполнителя завершился с ошибкой "
+                 f"(status={cl.get('status')}, rc={cl.get('rc')}): работа могла "
+                 f"остаться недоделанной — судите диф как черновик.")
+    # Ключи и токены, попавшие в диф (CLI оставил .env, автокоммит его
+    # исключает, но не всё имеет предсказуемое имя), не должны уехать в
+    # пакет шести провайдерам: чистка по форме ключей (ревьюер). Не по
+    # длине: 40-hex sha в дифе документации — не секрет, и ревьюеру он
+    # нужен целым.
+    diff = _DIFF_SECRET_RE.sub("‹вырезано›", diff)
+    if delta_block:
+        delta_block = _DIFF_SECRET_RE.sub("‹вырезано›", delta_block)
+    return f"""РЕВИЗИЯ ПРАВКИ ЗА СТОЛОМ (merge-гейт, этап 3). Вы — ревьюер.{delta_block}{warn}
 
 Акт {act}; исполнитель {op.get('voice')}; ветка act/{act} проекта
 {op.get('project')}; база {base_sha[:12]} (после rebase — эффективная,

@@ -139,6 +139,22 @@ DeepSeek `reasoning_content`, Gemini thought summaries — and shows it
 in the tabs; each line says what it is. A quick question that starts
 with `#кресло` goes to a random executor's chair instead of the room.
 
+**No edit without review.** When a chair act closes — cleanly or with
+an error — the window sends the diff to the table by itself (every
+voice except the executor); if a review is already running, the act
+waits in a queue and goes next; if main has moved, it waits for the
+rebase. The merge gate still needs two approvals and zero refusals.
+Changes the executor left uncommitted are committed on the act branch
+with the voice as author and the wrapper as committer — the gate
+reviews branches, and work outside a commit would be invisible to it.
+Symlinks and secret-looking files (`.env`, keys, credentials) stay out
+of that commit and are named in the close event; a nested repository or
+a detached HEAD refuses the auto-commit outright. The executor's CLI log lives with the act log and
+survives the close, so the 🔧 tab can be reopened later; the tab follows
+new output like a terminal (scroll up to pause, back to the bottom to
+resume, End/Home keys, a "↓ new: N lines" button), and the act id can
+be copied from a text field.
+
 ## Design rules the code enforces
 
 - **Same question, same context for everyone** — otherwise opinions are
@@ -161,6 +177,7 @@ bash test/edit_test.sh         # 31 edit/recovery scenarios
 bash test/gate_test.sh         # 47 review/merge-gate scenarios
 python3 test/catalog_test.py   # 45 model-catalog scenarios (no network)
 python3 test/exec_argv_test.py # 29 executor argv / explicit-default checks
+python3 test/autoreview_test.py # 27 auto-review / auto-commit / chair-log scenarios (isolated git, no voice calls)
 bash test/voices_http_test.sh  # 59 HTTP checks of the tabs, round card, goal, addressed room, act log (isolated window, no voice calls)
 bash smoke.sh                  # window smoke, 16 checks
 ```

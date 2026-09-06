@@ -495,13 +495,18 @@ def _scrub_log(text: str) -> str:
 def _act_log_path(aid: str, kind: str, edit: str = "") -> tuple[Path | None, str]:
     """Файл лога по роду вкладки: act — stdout+stderr процесса акта; raw —
     сырой вывод CLI голоса (быстрый вопрос, RT_RAW), иначе лог акта; chair —
-    лог CLI кресла из каталога аренд (edit-<акт правки>.<эпоха>.log, самая
-    свежая эпоха), иначе лог процесса-обёртки."""
+    долговечный стенограф кресла <акт>.chair.log в каталоге актов (пишет
+    executor_run, когда кресло выдано окном), иначе лог из каталога аренд
+    (edit-<акт правки>.<эпоха>.log, самая свежая эпоха; его стирает уборка),
+    иначе лог процесса-обёртки."""
     if kind == "raw":
         raw = ACT_DIR / f"{aid}.raw.log"
         if raw.exists():
             return raw, "raw"
     if kind == "chair":
+        durable = ACT_DIR / f"{aid}.chair.log"
+        if durable.exists():         # executor_run пишет сюда, когда кресло выдано окном
+            return durable, "chair"
         try:
             cands = sorted(leases.LEASE_DIR.glob(f"edit-{edit or aid}.*.log"),
                            key=lambda q: q.stat().st_mtime)
@@ -566,6 +571,121 @@ def _read_log_tail(path: Path, since: int, alive: bool = False) -> dict:
     return {"text": _scrub_log(chunk.decode("utf-8", errors="replace")),
             "next": start + len(chunk), "size": size,
             "reset": reset, "skipped": skipped, "more": more and len(chunk) > 0}
+
+
+def _spawn_review(act: str, *, auto: bool = False,
+                  queue_if_busy: bool = False) -> str | None:
+    """Ревизия дифа акта столом — один резерв на все формы (кнопка,
+    пачка, авто): акт не должен ревизоваться двумя веерами сразу.
+    Возвращает act_id; None — ревизия уже идёт (при queue_if_busy акт
+    поставлен в очередь ПОД ТЕМ ЖЕ замком: между проверкой занятости и
+    постановкой веер иначе мог освободиться, и очередь зависла бы —
+    ревизия второго круга, codex)."""
+    with RUN_LOCK:
+        if _STOPPING:
+            return None          # finally окна уже забрал RUNNING себе (ревьюер дифа)
+        dup = ([t for t in RUNNING.values() if t.get("gate") == "review"]
+               or ("review" in _EDIT_RESERVED))
+        if dup and queue_if_busy and act not in _REVIEW_QUEUE:
+            _REVIEW_QUEUE.append(act)
+        if not dup:
+            _EDIT_RESERVED.add("review")
+    if dup:
+        return None
+    try:
+        return spawn([sys.executable,
+                      str(Path(__file__).resolve().parent / "merge_gate.py"),
+                      "review", act],
+                     f"review: акт {act}" + (" (авто)" if auto else ""), VOICES,
+                     meta={"edit": act, "gate": "review"},
+                     fields={"edit": act, "gate": "review",
+                             **({"auto": True} if auto else {})},
+                     note=("АВТОРЕВИЗИЯ: диф кресла ушёл столу сам. Правка "
+                           "без ревизии не принимается — наказ Автора "
+                           "2026-09-06 и устав («bypassV2 — пол, а не опция»)."
+                           if auto else ""))
+    finally:
+        with RUN_LOCK:
+            _EDIT_RESERVED.discard("review")
+
+
+_REVIEW_QUEUE: list[str] = []          # акты, ждущие свободного веера ревизии
+_STOPPING = False                       # окно закрывается: авторевизий больше не спавнить
+
+
+def _drain_review_queue() -> None:
+    """Веер освободился (акт ревизии закончился) — следующий из очереди.
+    Пропущенные (уже ревизованы кнопкой, диф пуст) не занимают веер:
+    идём дальше по очереди, пока кто-то не запустится."""
+    while True:
+        with RUN_LOCK:
+            nxt = _REVIEW_QUEUE.pop(0) if _REVIEW_QUEUE else None
+        if not nxt or _auto_review(nxt) != "skipped":
+            return
+
+
+def _auto_review(act: str) -> str:
+    """После закрытия кресла ревизия запускается САМА — и после done, и
+    после error: работа закоммичена обёрткой в обоих случаях, а агентные
+    CLI нередко выходят с 1 после нормальных правок (grok).
+    Возвращает "spawned" | "queued" | "skipped".
+
+    Наказ Автора 2026-09-06: «любая правка, даже быстрая, должна
+    ревьюиться столом — спотыкались об это не раз». Кресло по быстрому
+    вопросу закрылось, правка легла в worktree, и следующим шагом была
+    кнопка, которую человек обязан был помнить. Теперь помнит окно.
+    Диф пуст — ревизии нет, и это сказано в ленте; ревизия уже идёт —
+    второй веер не запускается — акт встаёт в очередь и запускается,
+    когда веер освободится."""
+    if os.environ.get("CHOIR_RT_NO_AUTOREVIEW") == "1" or _STOPPING:
+        return "skipped"      # окно закрывается: очередь никто не разберёт (kimi)
+    try:
+        st = merge_gate.act_state(act)
+        if not st["open"] or st.get("merge"):
+            return "skipped"
+        if not st["close"]:
+            feed_append("note", f"правка {act}: авторевизия не запущена — "
+                        f"в ленте нет edit_close (маркер закрытия подберёт "
+                        f"recover, тогда ревизию запустит кнопка)", act=act)
+            return "skipped"
+        if st["close"].get("dirty"):
+            # автокоммит не удался (например, вложенный git): ветка
+            # неполна, и ревизия неполного дифа врала бы (deepseek)
+            feed_append("note", f"правка {act}: остатки в worktree без "
+                        f"коммита — ветка неполна, ревизия не запущена; "
+                        f"причина в логе кресла", act=act)
+            return "skipped"
+        c = merge_gate.checks(act)
+        if c.get("stale_base"):
+            # одобрения на уехавшей базе сгорят при rebase (gate_test):
+            # веер жечь бессмысленно, сначала rebase кнопкой «Принять»
+            feed_append("note", f"правка {act}: main уехал с момента "
+                        f"открытия — авторевизия отложена до rebase "
+                        f"(кнопка «Принять» сделает его и запросит "
+                        f"ревизию дельты)", act=act)
+            return "skipped"
+        base = merge_gate._effective_base(st)
+        diff, head, _psha = merge_gate.act_diff(
+            Path(st["open"].get("project", "")), act, base)
+    except Exception as e:                                  # noqa: BLE001
+        feed_append("note", f"правка {act}: авторевизия не запущена — {e}",
+                    act=act)
+        return "skipped"
+    if not diff.strip():
+        feed_append("note", f"правка {act}: диф пуст — ревизовать нечего "
+                    f"(исполнитель ничего не изменил)", act=act)
+        return "skipped"
+    if any(r.get("sha") == head for r in st.get("reviews") or []):
+        return "skipped"   # на этой голове ревизия уже есть (кнопка успела) — второй веер не нужен (kimi)
+    if _spawn_review(act, auto=True, queue_if_busy=True) is None:
+        with RUN_LOCK:
+            pos = (_REVIEW_QUEUE.index(act) + 1) if act in _REVIEW_QUEUE else 0
+        if not pos:
+            return "skipped"      # окно закрывается — в очередь не встал
+        feed_append("note", f"правка {act}: ревизия другого акта ещё идёт — "
+                    f"этот в очереди (№{pos}), запустится следом сам", act=act)
+        return "queued"
+    return "spawned"
 
 
 def _act_fields(rec: dict | None) -> dict:
@@ -647,6 +767,21 @@ def spawn(cmd: list[str], label: str, voices: list[str],
     # процессу — сигнал уйдёт постороннему дереву, вплоть до оболочки
     # Автора (нашёл ревьюер дифа 2026-08-25).
     with RUN_LOCK:
+        if _STOPPING:
+            # finally окна уже забрал RUNNING себе: акт, зарегистрированный
+            # сейчас, никто бы не завершил — платный веер без итога
+            # (ревизия второго круга: codex, deepseek). Гасим сразу и
+            # пишем итог сами, под тем же замком.
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+            log.close()
+            feed_append("act_status",
+                        f"act {act_id} прерван: {label} — окно закрывается",
+                        act_id=act_id, status="interrupted", rc=-15,
+                        **_act_fields({"fields": fields}))
+            return act_id
         # meta первым: свои поля должны ПЕРЕКРЫВАТЬ переданные, иначе
         # случайный ключ "proc" в meta подменит объект процесса, и
         # killpg при закрытии окна пойдёт мимо.
@@ -683,6 +818,13 @@ def spawn(cmd: list[str], label: str, voices: list[str],
                     + (f"\n{tail}" if tail else ""),
                     act_id=act_id, status="error", rc=rc,
                     **_act_fields(mine))
+            # Кресло закрылось (done ИЛИ error) — диф столу сам; веер
+            # ревизии закончился — следующий акт из очереди.
+            if (mine.get("edit") and mine["edit"] != "batch"
+                    and not mine.get("gate")):
+                _auto_review(mine["edit"])
+            elif mine.get("gate") == "review":
+                _drain_review_queue()
         except Exception as e:              # noqa: BLE001
             # статус не записался — хотя бы след в терминале, не молча
             print(f"act {act_id}: статус не записан: {e}", file=sys.stderr)
@@ -2749,10 +2891,18 @@ class Handler(BaseHTTPRequestHandler):
                 winner = lot_winner(lot) if lot else None
             try:
                 acts = merge_gate.acts_summary()
+                pending = len(merge_gate.pending_acts())
             except Exception as e:              # noqa: BLE001
                 print(f"/state acts: {e}", file=sys.stderr)
                 acts = None                     # None ≠ [] — «не собралось»
+                pending = None
+            with RUN_LOCK:
+                queued = len(_REVIEW_QUEUE)
             self._json(200, {"voices": VOICES, "running": running,
+                             # ждут ревизии / в очереди на веер: дыры
+                             # автоматики должны быть видны (kimi)
+                             "pending_reviews": pending,
+                             "review_queue": queued,
                              "goal": _last_goal(),
                              "edit_voices": sorted(edits.EDIT_VOICES),
                              "exec_pool": edits.random_pool(),
@@ -2885,8 +3035,9 @@ class Handler(BaseHTTPRequestHandler):
                 # всё, что фаза прячет (нашёл codex: прежний барьер был
                 # односторонним).
                 with RUN_LOCK:
-                    editing = ([t for t in RUNNING.values() if t.get("edit")]
-                               or _EDIT_RESERVED)
+                    editing = ([t for t in RUNNING.values()
+                                if t.get("edit") and not t.get("gate")]
+                               or (_EDIT_RESERVED - {"review"}))
                 if editing:
                     return self._json(409, {"error": "идёт правка — "
                                             "слепой ход не начинается, "
@@ -3263,33 +3414,29 @@ class Handler(BaseHTTPRequestHandler):
             # атомарны — двойной клик в щель между ними спавнил второй
             # веер (нашёл codex). Резерв снимается в finally: к этому
             # моменту spawn уже положил запись в RUNNING.
-            with RUN_LOCK:
-                dup = ([t for t in RUNNING.values()
-                        if t.get("gate") == "review"]
-                       or ("review" in _EDIT_RESERVED))
-                if not dup:
-                    _EDIT_RESERVED.add("review")
-            if dup:
-                return self._json(409, {"error": "ревизия уже идёт — "
-                                        "дождитесь вердиктов"})
-            try:
-                if batch:
+            if batch:
+                with RUN_LOCK:
+                    dup = ([t for t in RUNNING.values()
+                            if t.get("gate") == "review"]
+                           or ("review" in _EDIT_RESERVED))
+                    if not dup:
+                        _EDIT_RESERVED.add("review")
+                if dup:
+                    return self._json(409, {"error": "ревизия уже идёт — "
+                                            "дождитесь вердиктов"})
+                try:
                     spawn([sys.executable,
                            str(Path(__file__).resolve().parent
                                / "merge_gate.py"), "review-batch"],
                           "review: пачка ждущих актов", VOICES,
                           meta={"edit": "batch", "gate": "review"},
                           fields={"gate": "review", "batch": True})
-                else:
-                    spawn([sys.executable,
-                           str(Path(__file__).resolve().parent
-                               / "merge_gate.py"), "review", act],
-                          f"review: акт {act}", VOICES,
-                          meta={"edit": act, "gate": "review"},
-                          fields={"edit": act, "gate": "review"})
-            finally:
-                with RUN_LOCK:
-                    _EDIT_RESERVED.discard("review")
+                finally:
+                    with RUN_LOCK:
+                        _EDIT_RESERVED.discard("review")
+            elif _spawn_review(act) is None:
+                return self._json(409, {"error": "ревизия уже идёт — "
+                                        "дождитесь вердиктов"})
             return self._json(200, {"batch": batch, "act": act or None,
                                     "started": True})
 
@@ -5901,8 +6048,13 @@ document.getElementById('quick').onclick=()=>sendQuick();
     ['cond','🎼 дирижёр','Ход оркестровки раунда и комнаты вживую: кого вызвал, очередь, повторы, статусы. В слепой фазе — только обезличенный счётчик; поимённые строки и сырые ответы — после закрытия фазы (правило 8.5).'],
     ['chair','🔧 исполнитель','Вывод CLI в кресле исполнителя по мере работы: вызовы инструментов, правки, мысли (если канал их отдаёт).'],
     ['quick','⚡ быстрый ответ','Сырой вывод CLI или HTTP-адаптера голоса на быстрый вопрос — по мере прихода, с мыслями модели, если галочка «мысли» стояла при отправке.']];
-  const KINDS={cond:['round','room'],chair:['chair'],quick:['quick']};
-  const LOGKIND={cond:'act',chair:'chair',quick:'raw'};
+  const KINDS={cond:['round','room'],chair:['chair','review'],quick:['quick']};
+  // род лога — по роду АКТА, не вкладки: ревизия дифа живёт во вкладке
+  // исполнителя, но её вывод — печать обёртки merge_gate (kind=act)
+  function logKind(a){if(!a)return 'act'; const k=a.kind||(a.edit?'chair':''); return k==='chair'?'chair':k==='quick'?'raw':'act'}
+  const EMPTY={cond:'актов раунда или комнаты пока нет',
+    chair:'актов кресла пока нет',
+    quick:'актов быстрого ответа пока нет. Быстрый вопрос с галочкой «coder» — это кресло: его вывод во вкладке 🔧 исполнитель'};
   const css=document.createElement('style');
   css.textContent='#viewtabs{display:flex;gap:.4rem;margin:.45rem 0 0}'
    +'.vtab{background:var(--bg);border:1px solid var(--rule);color:var(--dim);border-radius:.4rem;padding:.2rem .6rem;cursor:pointer;font:inherit}'
@@ -5912,7 +6064,11 @@ document.getElementById('quick').onclick=()=>sendQuick();
    +'#termact{max-width:38ch;font:inherit;background:var(--bg);color:var(--ink);border:1px solid var(--rule);border-radius:.3rem}'
    +'#term{white-space:pre-wrap;word-break:break-word;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.84rem;line-height:1.35;background:var(--bg);border:1px solid var(--rule);border-radius:.4rem;padding:.6rem .8rem;max-height:calc(100vh - 14rem);overflow:auto;margin:0}'
    +'#term .think{color:var(--acc)}#term .tool{color:var(--me)}#term .meta{color:var(--dim)}#term .err{color:var(--err)}'
-   +'#term.nothink .think{display:none}';
+   +'#term.nothink .think{display:none}'
+   +'#termid{width:14ch;font:inherit;font-family:ui-monospace,monospace;background:var(--bg);color:var(--ink);border:1px solid var(--rule);border-radius:.3rem;padding:0 .3rem}'
+   +'#termcopy,#termnew{font:inherit;background:var(--bg);color:var(--ink);border:1px solid var(--rule);border-radius:.3rem;padding:0 .45rem;cursor:pointer}'
+   +'#termbox{position:relative}#termnew{position:absolute;right:.9rem;bottom:.7rem;background:var(--panel);border-color:var(--acc)}'
+   +'#termpend{color:var(--acc)}';
   (document.head||document.body||feed0).appendChild(css);
   const feed=document.getElementById('feed'), top=document.getElementById('feedtop');
   const qb=document.getElementById('quickbar');
@@ -5935,16 +6091,40 @@ document.getElementById('quick').onclick=()=>sendQuick();
   const sel=document.createElement('select'); sel.id='termact'; sel.title='Какой акт показывать: идущие — первыми, потом завершённые (лог акта переживает окно)';
   const pulse=document.createElement('span'); pulse.id='termpulse';
   const fl=document.createElement('label'); const fc=document.createElement('input'); fc.type='checkbox'; fc.id='termfollow'; fc.checked=true;
-  fl.title='Прокручивать к новому выводу'; fl.appendChild(fc); fl.appendChild(document.createTextNode(' следить'));
+  fl.title='Следить за новым выводом (как терминал): отмотали вверх — слежение само выключается, вернулись к последней строке — включается. End — к концу, Home — к началу.'; fl.appendChild(fc); fl.appendChild(document.createTextNode(' следить'));
+  // идентификатор — текстом, который выделяется и копируется (из списка
+  // выпадашки скопировать нельзя — Автор, 2026-09-06)
+  const idbox=document.createElement('input'); idbox.id='termid'; idbox.readOnly=true;
+  idbox.title='Идентификатор: у кресла — номер правки (его ждёт поле «акт» на вкладке 🔧), у остальных — номер акта. Выделяется; кнопка ⎘ копирует.';
+  const cp=document.createElement('button'); cp.id='termcopy'; cp.textContent='⎘'; cp.title='Скопировать идентификатор';
+  cp.onclick=async function(){const v=idbox.value; if(!v)return; let ok=false;
+    try{await navigator.clipboard.writeText(v);ok=true}catch(_){try{idbox.select();ok=!!document.execCommand('copy')}catch(__){ok=false}}
+    pulse.textContent=ok?('скопировано: '+v):'скопировать не вышло — выделите поле и Ctrl+C'};
   const what=document.createElement('span'); what.id='termwhat'; what.className='meta';
-  head.appendChild(sel); head.appendChild(pulse); head.appendChild(fl); head.appendChild(what);
-  const pre=document.createElement('pre'); pre.id='term'; if(!tc.checked)pre.className='nothink';
-  wrap.appendChild(head); wrap.appendChild(pre);
+  head.appendChild(sel); head.appendChild(idbox); head.appendChild(cp); head.appendChild(pulse); head.appendChild(fl); head.appendChild(what);
+  const pre=document.createElement('pre'); pre.id='term'; pre.tabIndex=0; if(!tc.checked)pre.className='nothink';
+  const newer=document.createElement('button'); newer.id='termnew'; newer.hidden=true; newer.title='Новые строки ниже — перейти к ним';
+  const box=document.createElement('div'); box.id='termbox'; box.appendChild(pre); box.appendChild(newer);
+  const pend=document.createElement('span'); pend.id='termpend'; pend.title='Закрытые акты кресла без принятого решения гейта (ревизия идёт, ждёт вердиктов или очереди)'; head.appendChild(pend);
+  wrap.appendChild(head); wrap.appendChild(box);
+  // СЛЕЖЕНИЕ КАК В ТЕРМИНАЛЕ (наказ Автора 2026-09-06): отмотал вверх —
+  // автопрокрутка выключена и не мешает читать; довёл до последней
+  // строки — включена снова. Новые строки при выключенном слежении
+  // считаются кнопкой «↓ новое: N строк».
+  let FOLLOW=true, PENDING=0;
+  function atBottom(){return pre.scrollTop+pre.clientHeight>=pre.scrollHeight-8}
+  function toBottom(){pre.scrollTop=pre.scrollHeight; FOLLOW=true; fc.checked=true; PENDING=0; newer.hidden=true}
+  pre.addEventListener('scroll',function(){if(atBottom()){if(!FOLLOW){FOLLOW=true;fc.checked=true} PENDING=0; newer.hidden=true}
+    else if(FOLLOW){FOLLOW=false;fc.checked=false}});
+  fc.onchange=function(){if(fc.checked)toBottom(); else FOLLOW=false};
+  newer.onclick=toBottom;
+  pre.addEventListener('keydown',function(e){if(e.key==='End'){e.preventDefault();toBottom()} else if(e.key==='Home'){e.preventDefault();pre.scrollTop=0}});
   try{if(top.parentNode===feed&&feed.insertBefore)feed.insertBefore(wrap,top.nextSibling); else feed.appendChild(wrap)}catch(_){feed.appendChild(wrap)}
   // акты: из ленты (act_status) и из /state.running
   const SEEN={}; let VIEW='feed'; const TERM={id:null,edit:'',next:0,timer:null,lastByte:0,lastSize:0,quiet:0,gen:0,source:''};
   function classify(label){label=label||'';
     if(/^round:/.test(label))return 'round'; if(/^edit:/.test(label))return 'chair';
+    if(/^review:/.test(label))return 'review';
     if(/^быстрый:/.test(label))return 'quick'; return 'room'}
   function noteAct(id,label,extra){if(!id)return; const o=SEEN[id]||(SEEN[id]={id:id,ts:Date.now()});
     if(label&&!o.label){o.label=label;o.kind=classify(label)} if(extra&&extra.edit)o.edit=extra.edit;
@@ -5965,10 +6145,12 @@ document.getElementById('quick').onclick=()=>sendQuick();
       o.textContent=(a.running?'● ':'■ ')+a.id+' · '+(a.label||'').slice(0,40); sel.appendChild(o)});
     if(acts.length&&acts.some(function(a){return a.id===cur}))sel.value=cur;
     const pick=sel.value||(acts[0]&&acts[0].id)||null;
-    if(!pick){if(TERM.id!==null||pre.textContent)startTerm(null);return}
+    if(!pick){if(TERM.id!==null||pre.textContent||!pulse.textContent)startTerm(null);return}
     if(pick!==TERM.id)startTerm(pick)}
-  function startTerm(id){TERM.id=id; TERM.edit=(SEEN[id]&&SEEN[id].edit)||''; TERM.next=0; TERM.lastByte=0; TERM.lastSize=0; TERM.quiet=0; TERM.gen++; TERM.source='';
-    pre.textContent=''; what.textContent=''; inThink=false; pulse.textContent=id?'…':'актов этого рода пока нет';
+  function startTerm(id){clearTimeout(TERM.timer); TERM.id=id; TERM.edit=(SEEN[id]&&SEEN[id].edit)||''; TERM.next=0; TERM.lastByte=0; TERM.lastSize=0; TERM.quiet=0; TERM.gen++; TERM.source=''; TERM.done=false;
+    pre.textContent=''; what.textContent=''; inThink=false; PENDING=0; newer.hidden=true; FOLLOW=true; fc.checked=true;
+    idbox.value=id?(TERM.edit||id):''; idbox.title=(id?('акт '+id+(TERM.edit?' · правка '+TERM.edit:'')+'. '):'')+'Выделяется; кнопка ⎘ копирует.';
+    pulse.textContent=id?'…':(EMPTY[VIEW]||'актов этого рода пока нет');
     if(id)tick()}
   sel.onchange=function(){startTerm(sel.value)};
   function line(cls,text){const s=document.createElement('span'); if(cls)s.className=cls; s.textContent=text+'\n'; return s}
@@ -5994,17 +6176,18 @@ document.getElementById('quick').onclick=()=>sendQuick();
   async function tick(){if(VIEW==='feed'||!TERM.id)return; const gen=TERM.gen; const id=TERM.id;
     if(document.hidden){if(!(TERM.done&&TERM.quiet>2))TERM.timer=setTimeout(tick,3000);return}
     let j=null;
-    try{const r=await fetch('/act_log?id='+encodeURIComponent(id)+'&kind='+LOGKIND[VIEW]+'&since='+TERM.next+(TERM.edit?'&edit='+encodeURIComponent(TERM.edit):''));
+    const lk=logKind(SEEN[id]);
+    try{const r=await fetch('/act_log?id='+encodeURIComponent(id)+'&kind='+lk+'&since='+TERM.next+((lk==='chair'&&TERM.edit)?'&edit='+encodeURIComponent(TERM.edit):''));
       j=await r.json(); if(!r.ok){pulse.textContent=(j&&j.error)||('ошибка '+r.status); TERM.timer=setTimeout(tick,r.status===404?3000:5000); return}}
     catch(e){pulse.textContent='сервер не ответил'; TERM.timer=setTimeout(tick,3000); return}
     if(gen!==TERM.gen||id!==TERM.id)return;
     if(TERM.source&&j.source!==TERM.source){ // источник сменился (лог акта → сырой): читать заново
       TERM.source=j.source;TERM.next=0;pre.textContent='';TERM.timer=setTimeout(tick,10);return}
     TERM.source=j.source;
-    if(j.reset){pre.textContent='';TERM.next=0}
+    if(j.reset){pre.textContent='';TERM.next=0;PENDING=0;newer.hidden=true}
     if(j.skipped&&!pre.textContent)pre.appendChild(line('meta','… начало лога пропущено (показан хвост 256 КиБ)'));
-    if(j.text){const atBottom=pre.scrollTop+pre.clientHeight>=pre.scrollHeight-8; pre.appendChild(render(j.text)); TERM.lastByte=Date.now(); TERM.quiet=0;
-      if(document.getElementById('termfollow').checked||atBottom)pre.scrollTop=pre.scrollHeight}
+    if(j.text){const n=(j.text.match(/\n/g)||[]).length; pre.appendChild(render(j.text)); TERM.lastByte=Date.now(); TERM.quiet=0;
+      if(FOLLOW)pre.scrollTop=pre.scrollHeight; else {PENDING+=n; newer.textContent='↓ новое: '+PENDING+' строк'; newer.hidden=false}}
     TERM.next=j.next; TERM.lastSize=j.size; TERM.done=!!j.done;
     const src={act:'печать процесса акта',raw:'сырой вывод CLI/HTTP голоса',chair:'вывод CLI в кресле'}[j.source]||j.source;
     what.textContent='показано: '+src+' · '+Math.round(j.size/1024)+' КБ';
@@ -6013,12 +6196,24 @@ document.getElementById('quick').onclick=()=>sendQuick();
     if(j.more){TERM.timer=setTimeout(tick,50);return}
     if(j.done){TERM.quiet++; if(TERM.quiet>2)return}   // дочитали: опрос останавливается
     TERM.timer=setTimeout(tick,j.done?1000:1500)}
-  function setView(v){VIEW=v; clearTimeout(TERM.timer);
+  // Прокрутка ленты переживает уход во вкладку вывода: события ленты на
+  // время прячутся, высота схлопывается и позиция терялась — возврат
+  // отбрасывал в самый верх (Автор, 2026-09-06). Запоминаем позицию и
+  // «был ли внизу»: внизу — остаёмся внизу (с новыми событиями), иначе —
+  // ровно туда, где читали.
+  let FEED_POS={top:0,stick:true};
+  function setView(v){
+    if(VIEW==='feed'&&v!=='feed')FEED_POS={top:feed.scrollTop,stick:feed.scrollHeight-feed.scrollTop-feed.clientHeight<60};
+    VIEW=v; clearTimeout(TERM.timer);
     TABS.forEach(function(t){t[1].className='vtab'+(t[0]===v?' on':'')});
     feed.className=(feed.className||'').replace(/\bterm\b/g,'').trim()+(v!=='feed'?' term':''); wrap.hidden=(v==='feed');
-    if(v!=='feed'){TERM.id=null;fillActs()}}
+    if(v!=='feed'){TERM.id=null;fillActs()}
+    else{const go=function(){feed.scrollTop=FEED_POS.stick?feed.scrollHeight:FEED_POS.top};
+      if(window.requestAnimationFrame)requestAnimationFrame(go); else go()}}
   window.setView=setView;
-  setInterval(function(){if(VIEW!=='feed'){const before=sel.value;fillActs();if(sel.value!==before&&!TERM.id)startTerm(sel.value)}},2500);
+  setInterval(function(){if(VIEW!=='feed'){const before=sel.value;fillActs();if(sel.value!==before&&!TERM.id)startTerm(sel.value)}
+    const st=window.STATE||{}; const n=st.pending_reviews, q=st.review_queue;
+    pend.textContent=(VIEW==='chair'&&typeof n==='number'&&n>0)?('ждут ревизии: '+n+(q?' · в очереди на веер: '+q:'')):''},2500);
   }catch(e){try{console.error('вкладки вывода не построены: '+e)}catch(_){}}
 })();
 
@@ -6385,7 +6580,19 @@ def main(argv: list[str] | None = None) -> int:
                 with RUN_LOCK:
                     active = {t.get("edit") for t in RUNNING.values()
                               if t.get("edit")}
+                    live_acts = set(RUNNING)      # акты окна: их логи не трогать
                 edits.sweep(active)
+                # Стенографы окна (лог акта, сырой вывод, кресло) копились
+                # бы вечно и лежали бы нескрёбленными: чистка — на выдаче,
+                # диск — здесь, по возрасту (ревьюер дифа).
+                cutoff = time.time() - 14 * 86400
+                for lg in ACT_DIR.glob("*.log"):
+                    try:
+                        if lg.stat().st_mtime < cutoff and \
+                                lg.name.split(".")[0] not in live_acts:
+                            lg.unlink()
+                    except OSError:
+                        pass
             except Exception as e:              # noqa: BLE001
                 print(f"edit-sweep: {e}", file=sys.stderr)
             time.sleep(60)
@@ -6400,9 +6607,13 @@ def main(argv: list[str] | None = None) -> int:
         # CLI голосов. Без этого закрытое окно оставляло их доживать и
         # жечь квоту (codex, «упустили все», раунд переезд-v1).
         # SIGTERM, не KILL: голос успеет закрыть свою сессию.
+        global _STOPPING
         with RUN_LOCK:
             # Забираем записи СЕБЕ: reap-нить, проснувшись, увидит пустоту
-            # и промолчит — итог у действия ровно один.
+            # и промолчит — итог у действия ровно один. Флаг — чтобы reap
+            # закрывшегося кресла не породил новый акт ревизии уже после
+            # этого снимка (ревьюер дифа).
+            _STOPPING = True
             unfinished = list(RUNNING.items())
             RUNNING.clear()
         # Незавершённые действия обязаны получить ИТОГ в ленте: иначе они
