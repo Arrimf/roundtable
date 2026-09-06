@@ -27,3 +27,11 @@ abstract: >-
   through a review gate with quorum bound to the exact reviewed sha. The
   leader of each round is chosen by a commit-reveal lottery over the public
   drand randomness beacon. Published deliberately as dated prior art.
+doi: 10.5281/zenodo.22432188
+identifiers:
+  - type: doi
+    value: 10.5281/zenodo.22432187
+    description: DOI for all versions (Zenodo concept DOI)
+  - type: doi
+    value: 10.5281/zenodo.22432188
+    description: DOI of version 0.1.0

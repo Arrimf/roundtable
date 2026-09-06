@@ -157,6 +157,8 @@ bash smoke.sh                  # window smoke, 16 checks
 The source is archived by [Software Heritage](https://archive.softwareheritage.org/browse/origin/?origin_url=https://github.com/Arrimf/roundtable)
 as dated prior art (first snapshot 2026-09-02,
 `swh:1:snp:f89f4f91d92b1ae28b483cfec8d4e20481c0e8e9`).
+Release v0.1.0 is archived on Zenodo: DOI [10.5281/zenodo.22432188](https://doi.org/10.5281/zenodo.22432188)
+(all versions: [10.5281/zenodo.22432187](https://doi.org/10.5281/zenodo.22432187)).
 
 ## License and patents
 

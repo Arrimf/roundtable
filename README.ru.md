@@ -155,6 +155,8 @@ repository»). Исходники заархивированы
 [Software Heritage](https://archive.softwareheritage.org/browse/origin/?origin_url=https://github.com/Arrimf/roundtable)
 как датированный prior art (первый снимок 2026-09-02,
 `swh:1:snp:f89f4f91d92b1ae28b483cfec8d4e20481c0e8e9`).
+Релиз v0.1.0 заархивирован на Zenodo: DOI [10.5281/zenodo.22432188](https://doi.org/10.5281/zenodo.22432188)
+(все версии: [10.5281/zenodo.22432187](https://doi.org/10.5281/zenodo.22432187)).
 
 ## Лицензия и патенты
 
