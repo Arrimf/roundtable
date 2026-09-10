@@ -8,7 +8,7 @@ journal/voices/
 journal/notes/
 journal/inbox/
 journal/archive/
-journal/ДОСЬЕ-*
+journal/DOSSIER-*
 journal/rounds/*
 !journal/rounds/RoundTable/
 __pycache__/

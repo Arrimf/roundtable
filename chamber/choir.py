@@ -43,6 +43,8 @@ import shutil
 import subprocess
 import sys
 import threading
+
+import names                                    # noqa: E402  имена файлов латиницей
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -247,11 +249,20 @@ def find_round_file(path_or_name) -> Path:
     # подсунул бы устаревшую затравку вместо переехавшей (grok).
     if _inside_journal(p) and p.exists():
         return p
+    # Записи до 2026-09-10 хранят кириллические имена (ЗАТРАВКА-патент-v2.md);
+    # файлы переименованы латиницей той же картой — ищем по новому имени.
+    fname = names.legacy_to_new(p.name)
+    # Старое и новое имя рядом (файл вернули из архива, копия) — это два
+    # разных файла под одной записью; выбирать молча нельзя (codex, deepseek).
     if PROJECT:
-        own = rounds / PROJECT.name / p.name
-        if own.exists():
-            return own
-    found = sorted(rounds.glob(f"*/{p.name}"))
+        here = sorted({c for c in (rounds / PROJECT.name / fname,
+                                   rounds / PROJECT.name / p.name) if c.exists()})
+        if len(here) == 1:
+            return here[0]
+        if len(here) > 1:
+            raise SystemExit(f"файл раунда {p.name} лежит под старым и новым именем: "
+                             + ", ".join(str(f) for f in here) + " — оставь один")
+    found = sorted(set(rounds.glob(f"*/{fname}")) | set(rounds.glob(f"*/{p.name}")))
     if len(found) == 1:
         return found[0]
     if len(found) > 1:
@@ -2141,7 +2152,7 @@ def cmd_expand(a: argparse.Namespace) -> int:
     # момент ответа, и подмена вопроса перестаёт быть незаметной. Правило
     # 11.5 требует «не сужать вопрос Автора»; требование, которое некому
     # проверить в момент нарушения, — не требование, а пожелание.
-    out = Path(a.out) if a.out else rounds_dir(create=True) / f"ЗАТРАВКА-{a.round}.md"
+    out = Path(a.out) if a.out else rounds_dir(create=True) / names.round_file("SEED-", a.round)
     out.parent.mkdir(parents=True, exist_ok=True)   # первый run нового проекта: каталога ещё нет (grok)
     out.write_text(
         f"# Вопрос Автора, дословно\n\n"
@@ -2514,7 +2525,7 @@ def cmd_run(a: argparse.Namespace) -> int:
     if halted_by_author("expand"):
         return finish("stopped", "остановлен Автором перед фазой expand", 0)
     print(f"\n── 2. затравка: разворачивает {conductor} ──")
-    zt = rounds_dir() / f"ЗАТРАВКА-{a.round}.md"
+    zt = rounds_dir() / names.round_file("SEED-", a.round)
     if cmd_expand(argparse.Namespace(round=a.round, seed=str(seed_path),
                                      by=None, out=str(zt),
                                      effort=a.effort)) != 0 or not zt.is_file():
@@ -2608,7 +2619,7 @@ def cmd_run(a: argparse.Namespace) -> int:
     # ── фаза: СВОД (правило 11: ведущий сводит; отказал — новый жребий)
     if halted_by_author("summarize"):
         return finish("stopped", "остановлен Автором перед сводом", 0)
-    card = Path(a.out) if a.out else rounds_dir(create=True) / f"СВОД-{a.round}.md"
+    card = Path(a.out) if a.out else rounds_dir(create=True) / names.round_file("SUMMARY-", a.round)
     answered = sorted({r["voice"] for r in read_round(a.round)
                        if r.get("role") == "answer" and r.get("status") == "ok"})
 
@@ -3523,7 +3534,7 @@ def cmd_intake(a: argparse.Namespace) -> int:
 
     Обязательство рождается ЗДЕСЬ, а не при закрытии раунда (позиции
     claude и codex в карточке). Это и есть ответ на возражение grok:
-    искать обязательства по именам файлов `ВОПРОС-*.md` — соглашение об
+    искать обязательства по именам файлов `QUESTION-*.md` — соглашение об
     именах, а не гарантия; переименованный файл тихо перестаёт быть
     вопросом. Явная запись переименование переживает.
     """
@@ -3855,7 +3866,7 @@ def cmd_seal(a: argparse.Namespace) -> int:
         print(f"\n✗ НЕ ЗАПЕЧАТАН: обязательство не зарегистрировано.\n"
               f"  У раунда нет записи intake — стол не может закрыть то, "
               f"чего не открывал.\n"
-              f"  choir.py intake --round {a.round} --seed ВОПРОС.md",
+              f"  choir.py intake --round {a.round} --seed QUESTION-{a.round}.md",
               file=sys.stderr)
         return 1
 
@@ -4414,7 +4425,7 @@ def main() -> int:
                          "(по умолчанию 1; больше потолка — ошибка, "
                          "правило 12)")
     rn.add_argument("--out", help="файл карточки свода .md "
-                                  "(по умолчанию СВОД-<раунд>.md)")
+                                  "(по умолчанию SUMMARY-<раунд латиницей>.md)")
     rn.add_argument("--voices", help="через запятую; по умолчанию все")
     rn.add_argument("--caller", default="arr",
                     help="кто запустил такт — пишется в журнал "
@@ -4471,7 +4482,7 @@ def main() -> int:
                         description="Обязательство рождается здесь, а не "
                                     "при закрытии раунда: пока вопрос не "
                                     "записан, незакрытым он не считается. "
-                                    "Поиск по именам файлов ВОПРОС-*.md — "
+                                    "Поиск по именам файлов QUESTION-*.md — "
                                     "соглашение, а не гарантия.")
     ik.add_argument("--round", required=True)
     ik.add_argument("--seed", required=True, help="файл с вопросом")
@@ -4556,6 +4567,15 @@ def main() -> int:
     # pick запускаются отдельными процессами — окно по шагам, руки).
     global PROJECT
     proj = getattr(a, "project", None)
+    # Имя раунда — одна компонента пути: проверить до жребия, иначе
+    # ValueError из names.round_file прилетит после записи lot и оставит
+    # раунд без finish (построчная ревизия переименования).
+    if getattr(a, "round", None):
+        try:
+            names.round_file("SEED-", a.round)
+        except ValueError as e:
+            print(f"--round: {e}", file=sys.stderr)
+            return 2
     if proj:
         # Явный флаг — строго: не каталог → отказ.
         pp = Path(proj).expanduser().resolve()

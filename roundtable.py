@@ -3473,7 +3473,7 @@ class Handler(BaseHTTPRequestHandler):
                                         "разных голоса (жребий ведущего и "
                                         "слепая фаза из одного бессмысленны)"})
             rdir = JOURNAL / "rounds" / ((rp.name or "root") if rp else "RoundTable")
-            qfile = rdir / f"ВОПРОС-{name}.md"
+            qfile = rdir / live.names.round_file("QUESTION-", name)
             # Не переписываем молча: в room.jsonl уже лежит pick с
             # question_sha от старого текста, и файл разошёлся бы с
             # журналом беззвучно (нашёл ревьюер дифа).
@@ -3511,7 +3511,7 @@ class Handler(BaseHTTPRequestHandler):
                 py = shlex.quote(sys.executable)
                 rn = shlex.quote(name)
                 seed = shlex.quote(str(qfile))
-                zt = shlex.quote(str(rdir / f"ЗАТРАВКА-{name}.md"))  # его создаст expand
+                zt = shlex.quote(str(rdir / live.names.round_file("SEED-", name)))  # его создаст expand
                 # --voices у pick и ask (expand его не знает: ведущий
                 # уже выбран жребием среди названных).
                 vs = (" --voices " + shlex.quote(",".join(rvoices))
@@ -3557,7 +3557,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if self.path == "/edit":
             # Правка проекта: кресло исполнителя ОДНОМУ голосу на ОДИН
-            # акт (СПЕКА-исполнитель-v1, этап 1). Задание уходит CLI
+            # акт (SPEC-ispolnitel-v1, этап 1). Задание уходит CLI
             # голоса в отдельном worktree; замок держит обёртка
             # executor_run; вердикт по падению замка выносит
             # edits.verdict_on_drop — по close ЭТОЙ эпохи.
@@ -4287,7 +4287,7 @@ class Handler(BaseHTTPRequestHandler):
                 cmd = [sys.executable, str(CHAMBER / "choir.py"), step, "--round", name]
                 if step == "summarize":
                     # Карточка свода — файлом, как у автопрогона (у run
-                    # умолчание СВОД-<раунд>.md); без --out summarize
+                    # умолчание SUMMARY-<раунд>.md); без --out summarize
                     # пишет свод только в журнал (поймано на «Канбан1»).
                     # Путь АБСОЛЮТНЫЙ, в journal/rounds/<проект жребия>/:
                     # относительный при cwd=chamber/ уходил бы в каталог
@@ -4295,7 +4295,7 @@ class Handler(BaseHTTPRequestHandler):
                     proj = view.get("project")
                     rdir = JOURNAL / "rounds" / ((Path(proj).name or "root") if proj else "RoundTable")
                     rdir.mkdir(parents=True, exist_ok=True)
-                    cmd += ["--out", str(rdir / f"СВОД-{name}.md")]
+                    cmd += ["--out", str(rdir / live.names.round_file("SUMMARY-", name))]
                 who = view.get("summarizer") or view["conductor"]
                 label = (f"round: {name} [виток критики "
                          f"№{view.get('rebuts', 0) + 1}]" if step == "rebut"

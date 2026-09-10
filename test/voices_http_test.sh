@@ -99,7 +99,7 @@ grep -q '"voice_config"' "$W/journal/live.jsonl" && grep -q '\[кресло\]' "
 grep -c 'живая комната' "$W/journal/live.jsonl" | grep -q '^0$' || { grep '\[кресло\]' "$W/journal/live.jsonl" | grep -q 'живая комната' && fail "у события кресла комнатная область" || pass "у события кресла нет комнатной области"; }
 [ "$(code /round '{"question":"q","name":"dup","voices":["claude","claude"]}')" = 400 ] && pass "/round: дубли — не два голоса" || fail "/round дубли"
 [ "$(code /round '{"question":"q","name":"none","voices":[]}')" = 400 ] && pass "/round: пустой список → 400" || fail "/round пусто"
-[ ! -e "$W/journal/rounds/RoundTable/ВОПРОС-dup.md" ] && pass "/round: отказ до записи файла вопроса" || fail "/round: файл вопроса записан при отказе"
+[ ! -e "$W/journal/rounds/RoundTable/QUESTION-dup.md" ] && pass "/round: отказ до записи файла вопроса" || fail "/round: файл вопроса записан при отказе"
 [ "$(code /lot '{"candidates":["grok","grok"]}')" = 400 ] && pass "/lot: дубли кандидатов → 400" || fail "/lot дубли"
 R="$(post /models_refresh '{"voices":["claude","claude","claude","nope"]}')"
 echo "$R" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if list(d["report"].keys())==["claude"] else 1)' \
@@ -131,7 +131,7 @@ curl -s "$B/round_view?name=nope" | grep -q '"found": false' && pass "/round_vie
 [ "$(code /round_step '{"name":"t2","step":"rebut"}')" = 409 ] && pass "/round_step: без слепой фазы → 409" || fail "/round_step без ответов"
 [ "$(code /round_step '{"name":"t9","step":"summarize"}')" = 409 ] && pass "/round_step: без жребия → 409" || fail "/round_step без жребия"
 [ "$(code /round '{"question":"q","name":"pj","project":"/nonexistent/dir"}')" = 400 ] && pass "/round: проект не каталог → 400 до записи файла" || fail "/round проект"
-[ ! -e "$W/journal/rounds/RoundTable/ВОПРОС-pj.md" ] && pass "/round: файл вопроса при отказе не создан" || fail "/round: файл вопроса создан при отказе"
+[ ! -e "$W/journal/rounds/RoundTable/QUESTION-pj.md" ] && pass "/round: файл вопроса при отказе не создан" || fail "/round: файл вопроса создан при отказе"
 # ── шаги раунда с ЗАГЛУШКОЙ дирижёра: argv в файл, сон 3 с, код 0 ──
 # (ревизия 2026-09-03: без стаба «проверка занятости мертва с рождения» и
 # «финал без поля round» проходили тесты — codex, grok, kimi, claude, субагент)
@@ -150,7 +150,7 @@ tail -n 3 "$W/journal/live.jsonl" | grep -q '"status": "done"' && tail -n 3 "$W/
 tail -n 3 "$W/journal/live.jsonl" | grep '"status": "done"' | grep -q '"step": "rebut"' && pass "финал акта несёт step" || fail "финал без step"
 [ "$(code /round_step '{"name":"t1","step":"summarize"}')" = 200 ] && pass "/round_step summarize после витка → 200" || fail "/round_step summarize"
 sleep 5
-grep -q "^summarize --round t1 --out $W/journal/rounds/tmp/СВОД-t1.md$" "$W/chamber/argv.log" && pass "summarize: без --by (сводчика выбирает choir.py), --out абсолютный в journal/rounds/<проект жребия>/" || fail "argv summarize: $(cat "$W/chamber/argv.log")"
+grep -q "^summarize --round t1 --out $W/journal/rounds/tmp/SUMMARY-t1.md$" "$W/chamber/argv.log" && pass "summarize: без --by (сводчика выбирает choir.py), --out абсолютный в journal/rounds/<проект жребия>/" || fail "argv summarize: $(cat "$W/chamber/argv.log")"
 mkdir -p "$W/proj2" && git -C "$W/proj2" init -q
 R="$(post /round "{\"question\":\"q\",\"name\":\"pj2\",\"project\":\"$W/proj2\"}")"
 echo "$R" | grep -q '"act"' && pass "/round с проектом → 200" || fail "/round с проектом: $R"

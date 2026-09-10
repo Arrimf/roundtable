@@ -10,7 +10,7 @@
 Чего он НЕ делает: не сводит ответы, не выносит вердиктов и не заводит
 собственного журнала. Это тонкая обёртка — вся работа и вся запись
 остаются в тех же choir.py / live.py, что и раньше. Профили лежат в
-`столы.json` как данные: новый режим добавляется правкой json, без
+`tables.json` как данные: новый режим добавляется правкой json, без
 правки кода.
 
     python stol.py карта                      — какие режимы есть и когда что
@@ -27,7 +27,7 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-PROFILES = HERE / "столы.json"
+PROFILES = HERE / "tables.json"
 TOOLS = {"choir": HERE / "choir.py", "live": HERE / "live.py",
          "dossier": HERE / "dossier.py"}   # draw_ui.py — личный, не публикуется
 
@@ -113,7 +113,7 @@ def main() -> int:
         description="один вход во все форматы стола",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="python stol.py карта — что бывает и когда что применять")
-    ap.add_argument("режим", help="имя профиля из столы.json, либо «карта»")
+    ap.add_argument("режим", help="имя профиля из tables.json, либо «карта»")
     ap.add_argument("текст", nargs="?", help="для ленточных режимов")
     ap.add_argument("--раунд")
     ap.add_argument("--тема", help="файл затравки")

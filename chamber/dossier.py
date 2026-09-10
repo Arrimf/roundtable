@@ -30,7 +30,7 @@
     платят. Ключ пишется отдельным файлом и голосам НЕ уходит.
 
 Использование:
-    python3 dossier.py --project ../Film --out ДОСЬЕ-film.md
+    python3 dossier.py --project ../Film --out DOSSIER-film.md
     python3 chamber/dossier.py --project . --paths 'chamber/*.py' --canary   # из RoundTable/
     python3 dossier.py --project ../Film --check ОТВЕТ.md   # клюнул ли кто
 """
@@ -44,6 +44,8 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+
+import names                                    # noqa: E402
 
 # Потолок пака. Число выбрано ДИРИЖЁРОМ, а не столом: в раунде eyes-v1
 # формат и объём остались нерешённым пунктом №1, и пока его не решили,
@@ -417,7 +419,11 @@ def main() -> int:
         return check(Path(a.check), kp)
 
     body, key = build(project, a.paths, a.max_kb, a.canary, a.swap)
-    out = Path(a.out) if a.out else Path(f"ДОСЬЕ-{project.name}.md")
+    try:
+        out = Path(a.out) if a.out else Path(names.round_file("DOSSIER-", project.name))
+    except ValueError as e:
+        print(f"--project: {e}", file=sys.stderr)
+        return 2
     out.write_text(body, encoding="utf-8")
     kp = out.with_suffix(".key.json")
     kp.write_text(json.dumps(key, ensure_ascii=False, indent=1),
