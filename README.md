@@ -149,7 +149,24 @@ with the voice as author and the wrapper as committer — the gate
 reviews branches, and work outside a commit would be invisible to it.
 Symlinks and secret-looking files (`.env`, keys, credentials) stay out
 of that commit and are named in the close event; a nested repository or
-a detached HEAD refuses the auto-commit outright. The executor's CLI log lives with the act log and
+a detached HEAD refuses the auto-commit outright. Selecting a chair act
+in the 🔧 tab shows its card: stage, gate verdicts with the reviewers'
+full texts, the branch diff, and the gate buttons (review, accept,
+adopt) — the same gate as in the coder panel.
+
+**A new project.** Start the window in an empty directory and it lays
+down a scaffold: a `.roundtable` link to the installed table and a
+`ПРОЕКТ.md` for the project's description — that file goes into every
+voice's packet identically (rule 1), unlike `CLAUDE.md`/`AGENTS.md`,
+which only one CLI would read. Voice threads are kept per project, so a
+new directory starts fresh sessions and returning to an old project
+resumes its threads (Grok and Kimi bind a session to the working
+directory; a thread from another directory is not resumed). A
+non-empty directory is left alone unless `--init-project` is given. A
+quick question to "random" picks a voice with `secrets.choice` (OS
+entropy: nobody can steer it, nobody can verify it — the drand lottery
+is for the conductor); if that channel fails, the word passes to the
+next voice instead of ending the act. The executor's CLI log lives with the act log and
 survives the close, so the 🔧 tab can be reopened later; the tab follows
 new output like a terminal (scroll up to pause, back to the bottom to
 resume, End/Home keys, a "↓ new: N lines" button), and the act id can
@@ -177,7 +194,7 @@ bash test/edit_test.sh         # 31 edit/recovery scenarios
 bash test/gate_test.sh         # 47 review/merge-gate scenarios
 python3 test/catalog_test.py   # 45 model-catalog scenarios (no network)
 python3 test/exec_argv_test.py # 29 executor argv / explicit-default checks
-python3 test/autoreview_test.py # 27 auto-review / auto-commit / chair-log scenarios (isolated git, no voice calls)
+python3 test/autoreview_test.py # 45 auto-review / auto-commit / act card / project scaffold / per-project thread scenarios (isolated git, no voice calls)
 bash test/voices_http_test.sh  # 59 HTTP checks of the tabs, round card, goal, addressed room, act log (isolated window, no voice calls)
 bash smoke.sh                  # window smoke, 16 checks
 ```

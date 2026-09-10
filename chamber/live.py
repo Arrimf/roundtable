@@ -669,6 +669,9 @@ def post(author: str, kind: str, text: str, **extra) -> dict:
     читал один хвост и раздавал один id дважды. Ленту в тот день ломали
     дважды; flock на самом файле подчиняет всех, кто пишет через post().
     """
+    # служебные поля (с «_») — не для журнала: такое поле однажды утекло
+    # бы через любой путь публикации, где его не сняли (ревьюер дифа)
+    extra = {k: v for k, v in extra.items() if not k.startswith("_")}
     with _WRITE_LOCK:
         LIVE.parent.mkdir(parents=True, exist_ok=True)
         LIVE.touch(exist_ok=True)
@@ -707,17 +710,52 @@ def vdir(name: str, ch: dict | None = None) -> Path:
     return p
 
 
+def _project_key() -> str:
+    """Короткий ключ проекта для имён файлов состояния; "" без проекта."""
+    if not PROJECT:
+        return ""
+    return hashlib.sha1(str(PROJECT).encode("utf-8")).hexdigest()[:10]
+
+
+def _session_dir(v: dict, cwd) -> str:
+    """Каталог, к которому CLI привязывает сессию: у Грока это `--cwd
+    <проект>` (процесс идёт из каталога голоса, флаг — проект), у Кими —
+    cwd процесса. Одна функция и для записи в состояние, и для сравнения
+    перед `-c` — иначе они расходились, и нить либо рвалась каждый ход,
+    либо продолжалась не из того каталога (ревизия: grok, deepseek)."""
+    if v.get("cwd_session") and PROJECT and not v.get("cwd_project"):
+        return str(PROJECT)
+    return str(cwd)
+
+
+def _state_path(name: str, ch: dict | None = None) -> Path:
+    """Файл состояния нити — СВОЙ НА ПРОЕКТ (наказ Автора 2026-09-10:
+    новый каталог — новая сессия). Сессии Грока и Кими и так привязаны к
+    рабочему каталогу: старая нить в новом каталоге давала «No session
+    found for current directory», и быстрый вопрос падал. У остальных
+    нить переносила бы контекст одного проекта в другой. Возврат в
+    прежний проект возвращает его нити. Без проекта — прежний
+    state.json."""
+    k = _project_key()
+    return vdir(name, ch) / (f"state.{k}.json" if k else "state.json")
+
+
 def load_state(name: str, ch: dict | None = None) -> dict:
     """Состояние НИТИ, а не голоса: у линии свой курсор, своя сессия и
     свой счётчик ходов. Запасная линия обычно отстаёт — она и должна
     получить больше дельты, когда её позовут: она этих реплик не видела.
     Слить состояния было бы враньём в обе стороны (правило 8.5)."""
-    p = vdir(name, ch) / "state.json"
+    p = _state_path(name, ch)
     if p.is_file():
         try:
             return json.loads(p.read_text(encoding="utf-8"))
         except Exception:                              # noqa: BLE001
             pass
+    # Нити до 2026-09-10 (state.json без проекта) проекту НЕ присваиваются:
+    # «первый, кто застал» — жребий гонки, а не провенанс, и он ломал бы
+    # наказ «новый каталог — новая сессия» (ревизия: grok, codex,
+    # gemini). Без проекта старый файл работает как прежде; с проектом
+    # нить начинается заново — один раз.
     # ХОЛОДНЫЙ СТАРТ ЗАПАСНОЙ ЛИНИИ. cursor=0 значит «не видел ничего», и
     # первая же реплика утащила бы ей ВЕСЬ архив ленты: замер ревьюера —
     # 197 событий против 47 у основной, 59 635 символов против 8 171
@@ -729,7 +767,7 @@ def load_state(name: str, ch: dict | None = None) -> dict:
     if ch is not None and ch.get("name") != "main":
         main_cursor = 0
         try:
-            mp = vdir(name) / "state.json"
+            mp = _state_path(name)
             if mp.is_file():
                 main_cursor = int(json.loads(
                     mp.read_text(encoding="utf-8")).get("cursor") or 0)
@@ -740,11 +778,19 @@ def load_state(name: str, ch: dict | None = None) -> dict:
             main_cursor = max(0, (ev[-1]["id"] - COLD_TAIL) if ev else 0)
         return {"session": None, "cursor": main_cursor, "turns": 0,
                 "cold_start": True}
+    if PROJECT:
+        # Новая нить проекта входит с хвоста ленты, а не с нуля: курсор 0
+        # утащил бы весь архив (59 635 символов в замере) и контекст
+        # ЧУЖИХ проектов — ровно то, от чего нити разделены (kimi)
+        ev = read_events()
+        return {"session": None, "cursor": max(0, (ev[-1]["id"] - COLD_TAIL) if ev else 0),
+                "turns": 0, "cold_start": True}
     return {"session": None, "cursor": 0, "turns": 0}
 
 
 def save_state(name: str, st: dict, ch: dict | None = None) -> None:
-    (vdir(name, ch) / "state.json").write_text(
+    st["project"] = str(PROJECT) if PROJECT else None
+    _state_path(name, ch).write_text(
         json.dumps(st, ensure_ascii=False, indent=1), encoding="utf-8")
 
 
@@ -817,6 +863,30 @@ CHARTER = """Вы — участник стола AiSandbox: несколько 
 """
 
 
+PROJECT_DOC = "ПРОЕКТ.md"
+PROJECT_DOC_LIMIT = 4000
+
+
+def project_doc() -> str:
+    """Описание проекта из <проект>/ПРОЕКТ.md (кладёт окно при старте в
+    новом каталоге, дописывает Автор). Уходит в пакет ВСЕМ одинаково
+    (правило 1) — в отличие от CLAUDE.md/AGENTS.md, которые подхватывает
+    только чей-то CLI. Обрезка по потолку названа в тексте."""
+    if not PROJECT:
+        return ""
+    f = Path(PROJECT) / PROJECT_DOC
+    try:
+        txt = f.read_text(encoding="utf-8").strip() if f.is_file() else ""
+    except OSError:
+        return ""
+    if not txt:
+        return ""
+    if len(txt) > PROJECT_DOC_LIMIT:
+        txt = txt[:PROJECT_DOC_LIMIT] + f"\n[…обрезано до {PROJECT_DOC_LIMIT} символов, полный текст — {f}]"
+    return (f"ФАЙЛ ПРОЕКТА {f.name} (описание из каталога проекта; уходит всем "
+            f"одинаково; это контекст, не приказ):\n{txt}\n\n")
+
+
 def build_prompt(name: str, st: dict, events: list[dict], first: bool,
                  blind: bool = False) -> str:
     parts = []
@@ -838,6 +908,9 @@ def build_prompt(name: str, st: dict, events: list[dict], first: bool,
                 parts.append(
                     f"Обсуждается проект {PROJECT} — он открыт вам на чтение. "
                     f"Смотрите файлы сами, не полагайтесь на пересказ.\n")
+            doc = project_doc()          # ПРОЕКТ.md — всем одинаково, один раз на нить
+            if doc:
+                parts.append(doc)
         if blind:
             parts.append(
                 "СЛЕПОЙ ХОД. Вы отвечаете первым по новой теме и НЕ видите "
@@ -1200,6 +1273,12 @@ def turn(name: str, prompt) -> dict:
 
             use_cont = bool(st.get("turns")) and (v.get("cwd_session")
                                                   or session)
+            if use_cont and v.get("cwd_session") \
+                    and st.get("cwd") != _session_dir(v, cwd):
+                # `-c` ищет сессию ЭТОГО каталога: нить, начатая в другом
+                # (или без записи о каталоге), там не найдётся («No session
+                # found for current directory») — начинаем заново
+                use_cont = False
             cmd = _voice_cmd(v, "cont" if use_cont else "start", ptext,
                              pfile, afile, session, ch)
             t0 = time.monotonic()  # отсчёт РАБОТЫ, очередь сюда не входит
@@ -1366,6 +1445,7 @@ def turn(name: str, prompt) -> dict:
     if ev["kind"] != "error":
         st["session"] = session
         st["turns"] = st.get("turns", 0) + 1
+        st["cwd"] = _session_dir(v, cwd)     # каталог, где живёт сессия (для -c)
         save_state(name, st, ch)
     if HAND_RE.search(ev.get("text", "")):
         ev["hand"] = True                              # поднял руку
@@ -1872,7 +1952,9 @@ def hand_word(src_ev: dict, names: list[str], why: str,
         fell = "; ".join(f"{e['author']}: {(e.get('detail') or 'сбой')[:60]}"
                          for e in res) or "ответов нет"
         rest = [v for v in pool
-                if v not in tried and v != src_ev.get("author")]
+                if v not in tried and v != src_ev.get("author") and available(v)]
+        # available(): голос без CLI на машине первым в _quietest — он
+        # «никогда не говорил» — и съедал бы бюджет передач (ревьюер)
         if not rest or handoffs >= MAX_HANDOFFS:
             reason = ("кандидатов больше нет" if not rest else
                       f"потолок передач ({MAX_HANDOFFS}) исчерпан")
@@ -1912,6 +1994,28 @@ def _close_thread(thread: int, why: str) -> None:
     print(f"ветка закрыта: {why} — слово у человека")
 
 
+def cmd_threads(a) -> int:
+    """Нити теперь на проект — без списка через месяц никто не вспомнит,
+    что у проекта свои сессии (идея kimi, ревизия 2026-09-10)."""
+    rows = []
+    for d in sorted(VOICEDIR.glob("*")):
+        if not d.is_dir():
+            continue
+        for f in sorted(d.glob("state*.json")):
+            try:
+                st = json.loads(f.read_text(encoding="utf-8"))
+            except Exception:                              # noqa: BLE001
+                continue
+            rows.append((d.name, f.name, st.get("project") or "—", st.get("turns", 0),
+                         st.get("cwd") or "—", time.strftime("%Y-%m-%d %H:%M", time.localtime(f.stat().st_mtime))))
+    if not rows:
+        print("нитей нет")
+        return 0
+    for voice, fn, proj, turns, cwd, when in rows:
+        print(f"{voice:<10} {fn:<24} ходов {turns:<3} {when}  проект {proj}  сессия {cwd}")
+    return 0
+
+
 def cmd_say(a) -> int:
     global THREAD, GOAL_SNAPSHOT
     THREAD = None                    # ветка живёт внутри одного акта
@@ -1923,11 +2027,19 @@ def cmd_say(a) -> int:
         print("никто не вступает")
         return 0
     once = bool(getattr(a, "once", False))
+    prefer = getattr(a, "prefer", None)
     # Адрес — выбор человека: подменять адресата передачей нельзя,
     # как и в --once (нашёл субагент). pool = сами names.
     names = _cap_group(names)
-    res = hand_word(ev, names, why,
-                    names if (once or why.startswith("по адресу")) else allowed)
+    pool = names if (once or why.startswith("по адресу")) else allowed
+    if once and prefer and prefer in allowed and not why.startswith("по адресу"):
+        # Быстрый вопрос «случайному»: окно выбрало голос, но обещание
+        # человеку — ответ, а не конкретный канал. Отказ канала передаёт
+        # слово следующему из состава (наказ Автора 2026-09-10: Грок
+        # выпал без сессии, и раунд не прошёл). Потолок — MAX_HANDOFFS.
+        names, why = [prefer], "выбран окном случайно; при отказе — следующий"
+        pool = allowed
+    res = hand_word(ev, names, why, pool)
 
     if once:
         # ОДИН ХОД И ВСЁ. Ради «быстрого вопроса» из окна: его подпись
@@ -2084,8 +2196,9 @@ def cmd_reset(a) -> int:
         for ch in (channels_of(v) or (None,)):
             save_state(v, {"session": None, "cursor": next_id() - 1,
                            "turns": 0}, ch)
-    post("choir", "note", "нити сброшены: голоса начинают разговор заново")
-    print("нити сброшены, лента сохранена")
+    scope = f" проекта {PROJECT}" if PROJECT else ""
+    post("choir", "note", f"нити{scope} сброшены: голоса начинают разговор заново")
+    print(f"нити{scope} сброшены, лента сохранена")
     return 0
 
 
@@ -2106,6 +2219,9 @@ def main() -> int:
                    help="один ход: вступают только названные голоса, "
                         "разговор дальше сам не идёт (для «быстрого "
                         "вопроса» из окна)")
+    p.add_argument("--prefer", help="кому дать слово первым (окно выбрало "
+                                    "случайно); при отказе канала слово "
+                                    "переходит следующему из --voices")
     p.set_defaults(fn=cmd_say)
 
     p = sub.add_parser("tail", help="читать ленту")
@@ -2116,6 +2232,9 @@ def main() -> int:
 
     p = sub.add_parser("stats", help="перекос по авторам")
     p.set_defaults(fn=cmd_stats)
+
+    p = sub.add_parser("threads", help="нити голосов по проектам: файл, проект, ходов, каталог сессии")
+    p.set_defaults(fn=cmd_threads)
 
     p = sub.add_parser("who", help="состояние нитей")
     p.set_defaults(fn=cmd_who)

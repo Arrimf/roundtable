@@ -113,6 +113,90 @@ SECRET_MARKS = (".credentials.json", "auth.json", ".env", "keys.txt",
                 "credentials", ".netrc", "id_rsa", ".ssh")
 
 
+PROJECT_DOC_TEMPLATE = """# {name}
+
+<!-- ОПИСАНИЕ ПРОЕКТА. Этот файл уходит в пакет ВСЕМ голосам стола одинаково
+(правило 1), в отличие от CLAUDE.md/AGENTS.md, которые читает только чей-то
+CLI. Пишите здесь то, что должен знать каждый участник: что за проект, цель,
+ограничения, где что лежит. Первые ~4000 символов; дальше — ссылки. -->
+
+## Что это
+
+## Цель и критерии «готово»
+
+## Ограничения и договорённости
+
+## Где что лежит
+
+- Стол: `.roundtable/` → {table} (окно `roundtable.py`, комната
+  `chamber/live.py`, дирижёр `chamber/choir.py`).
+- Раунды этого проекта: `{table}/journal/rounds/{name}/`.
+- Кресло исполнителя пишет ТОЛЬКО сюда (worktree этого каталога);
+  остальное пространство голоса читают, а пишут по отдельному заданию.
+"""
+
+
+def scaffold_project(project: Path, *, force: bool = False) -> None:
+    """Каркас нового проекта (наказ Автора 2026-09-10): в каталоге запуска
+    ссылка `.roundtable` на установленный стол и `ПРОЕКТ.md` с
+    инструкциями для всех голосов. История стола остаётся в одном месте
+    (journal/), проект держит своё описание у себя. Создаётся только в
+    ПУСТОМ каталоге (или по --init-project): в чужой проект вроде
+    Cursor_W стол ничего не кладёт без просьбы."""
+    if not project.is_dir():
+        return
+    project = project.resolve()
+    table = Path(__file__).resolve().parent
+    if project == table or project == table.parent:
+        return                                  # сам стол и песочница — не проект
+    # .git — не содержимое: «git init» в новом каталоге — обычный первый
+    # шаг, каркас после него всё ещё нужен (ревизия: gemini, deepseek, grok)
+    entries = [q for q in project.iterdir()
+               if q.name not in (".roundtable", "ПРОЕКТ.md", ".git")]
+    if entries and not force:
+        if not (project / "ПРОЕКТ.md").exists():
+            print(f"каталог {project} не пуст — каркас проекта не создан; "
+                  f"roundtable --init-project создаст .roundtable и ПРОЕКТ.md",
+                  file=sys.stderr)
+        return
+    link = project / ".roundtable"
+    if link.is_symlink() or link.exists():
+        try:
+            if link.resolve() != table:
+                print(f"⚠ {link} уже есть и ведёт в {link.resolve()} — не трогаю",
+                      file=sys.stderr)
+        except OSError:
+            print(f"⚠ {link} уже есть (битая ссылка) — не трогаю", file=sys.stderr)
+    else:
+        link.symlink_to(table, target_is_directory=True)
+        print(f"проект {project.name}: ссылка .roundtable → {table}")
+    # Ссылка на весь стол не должна попасть в коммит проекта (`git add -A`
+    # рукой Автора): через неё в worktree кресла лёг бы путь записи в сам
+    # стол (ревьюер дифа). Исключение — локальное, .gitignore проекта не
+    # трогаем.
+    excl = project / ".git" / "info" / "exclude"
+    if (project / ".git").is_dir():
+        try:
+            excl.parent.mkdir(parents=True, exist_ok=True)
+            cur = excl.read_text(encoding="utf-8") if excl.exists() else ""
+            if ".roundtable" not in cur.split():
+                with open(excl, "a", encoding="utf-8") as fh:
+                    fh.write(("" if cur.endswith("\n") or not cur else "\n") + ".roundtable\n")
+        except OSError as e:
+            print(f"⚠ .git/info/exclude не дописан: {e}", file=sys.stderr)
+    doc = project / "ПРОЕКТ.md"
+    if doc.is_symlink():
+        print(f"⚠ {doc} — ссылка, а не файл: не трогаю", file=sys.stderr)   # codex: запись ушла бы по ссылке наружу
+    elif not doc.exists():
+        try:
+            with open(doc, "x", encoding="utf-8") as fh:    # эксклюзивно: чужой файл не затрём
+                fh.write(PROJECT_DOC_TEMPLATE.format(name=project.name, table=table))
+            print(f"проект {project.name}: создан ПРОЕКТ.md — опишите проект, "
+                  f"он уйдёт в пакет всем голосам")
+        except FileExistsError:
+            pass
+
+
 def project_risk(path: str) -> str | None:
     """Почему этот каталог опасно подставлять умолчанием (или None)."""
     if not path:
@@ -571,6 +655,96 @@ def _read_log_tail(path: Path, since: int, alive: bool = False) -> dict:
     return {"text": _scrub_log(chunk.decode("utf-8", errors="replace")),
             "next": start + len(chunk), "size": size,
             "reset": reset, "skipped": skipped, "more": more and len(chunk) > 0}
+
+
+ACT_VIEW_DIFF_LIMIT = 200 * 1024
+_ACT_VIEW_CACHE: dict = {}          # act → (ключ, карточка)
+
+
+def _stage_of(st: dict, act: str) -> str:
+    if st.get("merge"):
+        return "merged"
+    if st.get("crash"):
+        return "adopted" if st.get("adopt") else "crashed"
+    if st.get("close"):
+        return "closed"
+    return "working" if leases.is_held(act) else "opening"
+
+
+def act_view(act: str) -> dict:
+    """Всё об акте правки для карточки во вкладке «исполнитель»: интент,
+    закрытие, диф ветки (чищеный), ревизии с полными текстами, стадия и
+    счёт гейта — то, что Автор ждал увидеть, выбрав акт, вместо сухого
+    отчёта (2026-09-10). Кнопки гейта рисует страница по stage."""
+    # Карточку опрашивают каждые 6 с, пока она открыта: без кэша это
+    # полный скан ленты плюс два git-вызова на тик (ревизия: все пятеро).
+    # Ключ — лента (размер, mtime) и голова ветки (один rev-parse).
+    try:
+        f = edits.JOURNAL / "live.jsonl"
+        fst = f.stat()
+        fkey = (fst.st_size, fst.st_mtime_ns)
+    except OSError:
+        fkey = None
+    st = merge_gate.act_state(act)
+    if not st["open"]:
+        raise merge_gate.GateRefused(f"акт {act} неизвестен ленте")
+    op = st["open"]
+    head_now = main_now = None
+    if op.get("project"):
+        try:
+            head_now = merge_gate.branch_head(Path(op["project"]), act)
+        except merge_gate.GateRefused:
+            head_now = None
+        # сдвиг main руками Автора не двигает ни ленту, ни ветку акта —
+        # без него карточка показывала бы «база не уехала» (ревьюер)
+        main_now, _ = merge_gate._git(Path(op["project"]), "rev-parse",
+                                      f"refs/heads/{op.get('branch') or 'main'}")
+    key = (fkey, head_now, (main_now or "").strip(), leases.is_held(act))
+    cached = _ACT_VIEW_CACHE.get(act)
+    if fkey is not None and cached and cached[0] == key:
+        return cached[1]
+    out = {"act": act, "voice": op.get("voice"), "seat": op.get("seat"),
+           "task": op.get("task") or op.get("text"), "project": op.get("project"),
+           "base_sha": op.get("base_sha"), "worktree": op.get("worktree"),
+           "opened": op.get("ts"), "close": None, "crash": None,
+           "reviews": [], "diff": "", "diff_truncated": False, "head": None}
+    for k in ("close", "crash", "adopt", "merge", "rebase"):
+        e = st.get(k)
+        if e:
+            out[k] = {kk: e.get(kk) for kk in
+                      ("ts", "text", "status", "rc", "head", "dirty", "autocommit",
+                       "excluded", "elapsed_s", "result_sha", "by") if kk in e}
+    for r in reversed(st.get("reviews") or []):        # старые первыми
+        out["reviews"].append({kk: r.get(kk) for kk in
+                               ("ts", "voice", "verdict", "status", "sha",
+                                "elapsed_s", "eyes", "seat", "full_text", "text")})
+    try:
+        c = merge_gate.checks(act)
+        out["checks"] = {"ok": c.get("ok"), "reasons": c.get("reasons"),
+                         "approvals": c.get("approvals") or [],
+                         "refused": c.get("refuted_by") or c.get("refused") or [],
+                         "quorum": c.get("quorum", merge_gate.QUORUM),
+                         "stale_base": c.get("stale_base"), "scope": c.get("scope")}
+        out["head"] = c.get("head")
+    except Exception as e:                                  # noqa: BLE001
+        out["checks"] = {"ok": False, "reasons": [str(e)], "approvals": [], "refused": [],
+                         "quorum": merge_gate.QUORUM}
+    out["stage"] = _stage_of(st, act)
+    try:
+        if op.get("project"):
+            base = merge_gate._effective_base(st)
+            diff, head, _ = merge_gate.act_diff(Path(op["project"]), act, base)
+            out["head"] = out["head"] or head
+            if len(diff) > ACT_VIEW_DIFF_LIMIT:
+                diff, out["diff_truncated"] = diff[:ACT_VIEW_DIFF_LIMIT], True
+            out["diff"] = _scrub_log(diff)
+    except Exception as e:                                  # noqa: BLE001
+        out["diff_error"] = str(e)
+    if fkey is not None:
+        _ACT_VIEW_CACHE[act] = (key, out)
+        while len(_ACT_VIEW_CACHE) > 8:          # до 200 КБ дифа на акт — не копить
+            _ACT_VIEW_CACHE.pop(next(iter(_ACT_VIEW_CACHE)))
+    return out
 
 
 def _spawn_review(act: str, *, auto: bool = False,
@@ -2847,6 +3021,18 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-cache")
             self.end_headers()
             self._stream(after)
+        elif self.path.partition("?")[0] == "/act_view":
+            q = parse_qs(self.path.partition("?")[2])
+            act = (q.get("act") or [""])[0].strip()
+            if not re.fullmatch(r"[0-9a-f]{8,32}", act):
+                return self._json(400, {"error": "act — 8–32 hex-символов"})
+            try:
+                return self._json(200, act_view(act))
+            except merge_gate.GateRefused as e:
+                return self._json(404, {"error": str(e)})
+            except Exception as e:                          # noqa: BLE001
+                return self._json(500, {"error": f"карточка акта: {e}"})
+
         elif self.path.partition("?")[0] == "/act_log":
             q = parse_qs(self.path.partition("?")[2])
             aid = (q.get("id") or [""])[0].strip()
@@ -3019,8 +3205,18 @@ class Handler(BaseHTTPRequestHandler):
                 # Голос не назван — тянет СЕРВЕР, и говорит об этом в
                 # ленту. Это не жребий drand (правило 11 про ведущего, а
                 # не про мелочь), и называть его жребием нельзя.
-                picked_by_server = secrets.choice(VOICES)
-                voices = [picked_by_server]
+                # состав — тот, что отмечен в окне (kimi): снятый галочкой
+                # голос не должен быть оплачен ни первым, ни при передаче
+                pool = [v for v in (req.get("pool") or []) if v in VOICES] or VOICES
+                if any(f"@{v}" in text for v in pool):
+                    # адрес в тексте сильнее случайного выбора: комната
+                    # отдаст слово адресату, и заметка «выбрал сервер»
+                    # врала бы (ревьюер дифа)
+                    picked_by_server = None
+                    voices = list(pool)
+                else:
+                    picked_by_server = secrets.choice(pool)
+                    voices = [picked_by_server]
             if quick and len(voices) != 1:
                 # Веер по всем шести под подписью «один канал» — это
                 # деньги Автора, потраченные не на то, что он нажал.
@@ -3046,7 +3242,13 @@ class Handler(BaseHTTPRequestHandler):
             args = [mode, text]
             if quick:
                 args.append("--once")
-            if voices:
+            if quick and picked_by_server:
+                # Обещание человеку — ответ, а не канал: выбранный
+                # случайно идёт первым, отказ канала передаёт слово
+                # следующему из состава (наказ Автора 2026-09-10: Грок
+                # выпал без сессии в новом каталоге, и раунд не прошёл).
+                args += ["--voices", ",".join(pool), "--prefer", picked_by_server]
+            elif voices:
                 args += ["--voices", ",".join(voices)]
             # --project (просил grok): комната обсуждает конкретный
             # каталог, live.py выдаст его голосам на чтение. Опечатка в
@@ -3070,7 +3272,10 @@ class Handler(BaseHTTPRequestHandler):
             # межпроцессного замка, и в ленте окажутся две реплики от
             # РАЗНЫХ сессий одного голоса. Окно делало это доступным в
             # два клика (нашёл ревьюер дифа).
-            want = set(voices or VOICES)
+            # при передаче после отказа слово может уйти любому из состава —
+            # занятыми считаются все они (ревьюер дифа: иначе два процесса
+            # вели бы нить одного голоса)
+            want = set(pool) if (quick and picked_by_server) else set(voices or VOICES)
             with RUN_LOCK:
                 busy = {v for t in RUNNING.values() for v in t["voices"]}
             clash = sorted(want & busy)
@@ -3100,13 +3305,15 @@ class Handler(BaseHTTPRequestHandler):
                                   voice=picked_by_server)
             act = spawn([sys.executable, str(CHOIR / "live.py"), *args],
                         f"{'быстрый' if quick else mode}: {text[:60]}",
-                        voices or VOICES,
+                        (list(pool) if (quick and picked_by_server) else (voices or VOICES)),
                         # blind в meta — чтобы /edit видел слепую фазу
                         # и не выдавал кресло, пока она идёт (спека §5).
                         meta={"blind": True} if mode == "ask" else None,
                         note=(f"голос выбрал сервер случайно: "
-                              f"{picked_by_server} (НЕ жребий drand — "
-                              f"random.choice по составу)"
+                              f"{picked_by_server} (secrets.choice из "
+                              f"энтропии ОС — не подстроить, но и не "
+                              f"проверить; НЕ жребий drand). Откажет "
+                              f"канал — слово перейдёт следующему"
                               if picked_by_server else ""),
                         fields=acc_fields or None,
                         env_extra={"CHOIR_BRIEF": "1" if brief else "0",
@@ -6015,7 +6222,7 @@ async function sendQuick(){
   }
   const body={text:text,mode:'quick',voice:voice,project:project,
               brief:briefOn(),thoughts:thoughtsOn()};
-  if(voice)body.voices=[voice];
+  if(voice)body.voices=[voice]; else body.pool=picked('room');   // «случайно» — из отмеченных
   acterr('');
   let r;
   try{
@@ -6068,7 +6275,13 @@ document.getElementById('quick').onclick=()=>sendQuick();
    +'#termid{width:14ch;font:inherit;font-family:ui-monospace,monospace;background:var(--bg);color:var(--ink);border:1px solid var(--rule);border-radius:.3rem;padding:0 .3rem}'
    +'#termcopy,#termnew{font:inherit;background:var(--bg);color:var(--ink);border:1px solid var(--rule);border-radius:.3rem;padding:0 .45rem;cursor:pointer}'
    +'#termbox{position:relative}#termnew{position:absolute;right:.9rem;bottom:.7rem;background:var(--panel);border-color:var(--acc)}'
-   +'#termpend{color:var(--acc)}';
+   +'#termpend{color:var(--acc)}'
+   +'#gatecard{margin-top:.6rem;border:1px solid var(--rule);border-radius:.4rem;padding:.6rem .8rem;font-size:.9rem}'
+   +'#gatecard h4{margin:0 0 .4rem;font-size:.95rem}#gatecard .row{display:flex;gap:.5rem;flex-wrap:wrap;align-items:center;margin:.3rem 0}'
+   +'#gatecard button{font:inherit;background:var(--bg);color:var(--ink);border:1px solid var(--rule);border-radius:.3rem;padding:.15rem .6rem;cursor:pointer}'
+   +'#gatecard button:hover{border-color:var(--acc)}#gatecard details{margin:.3rem 0}#gatecard summary{cursor:pointer;color:var(--dim)}'
+   +'#gatecard pre{white-space:pre-wrap;word-break:break-word;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.8rem;background:var(--bg);border:1px solid var(--rule);border-radius:.3rem;padding:.5rem .7rem;max-height:60vh;overflow:auto;margin:.3rem 0}'
+   +'#gatecard .ok{color:#7fc97f}#gatecard .no{color:var(--err)}#gatecard .dim{color:var(--dim)}';
   (document.head||document.body||feed0).appendChild(css);
   const feed=document.getElementById('feed'), top=document.getElementById('feedtop');
   const qb=document.getElementById('quickbar');
@@ -6106,7 +6319,58 @@ document.getElementById('quick').onclick=()=>sendQuick();
   const newer=document.createElement('button'); newer.id='termnew'; newer.hidden=true; newer.title='Новые строки ниже — перейти к ним';
   const box=document.createElement('div'); box.id='termbox'; box.appendChild(pre); box.appendChild(newer);
   const pend=document.createElement('span'); pend.id='termpend'; pend.title='Закрытые акты кресла без принятого решения гейта (ревизия идёт, ждёт вердиктов или очереди)'; head.appendChild(pend);
-  wrap.appendChild(head); wrap.appendChild(box);
+  // КАРТОЧКА АКТА ПРАВКИ (наказ Автора 2026-09-10: «на вкладке исполнитель
+  // ожидаю увидеть дифы прямо в окне, выбрав акт, и рядом кнопку
+  // принять — ровно тот блок, что во вкладке coder»): стадия, кворум,
+  // кнопки гейта по стадии, вердикты ревьюеров с полными текстами, диф.
+  const gate=document.createElement('div'); gate.id='gatecard'; gate.hidden=true;
+  wrap.appendChild(head); wrap.appendChild(box); wrap.appendChild(gate);
+  const GATE={edit:'',timer:null,open:{}};
+  function el(tag,cls,text){const e=document.createElement(tag); if(cls)e.className=cls; if(text!==undefined)e.textContent=text; return e}
+  function gateBtn(row,label,fn){const b=el('button','',label); b.onclick=fn; row.appendChild(b); return b}
+  function renderGate(v){const sig=JSON.stringify(v); if(gate.dataset.sig===sig)return; gate.dataset.sig=sig; // не срывать клик и прокрутку дифа перестройкой (ревьюер)
+    gate.innerHTML='';
+    const h=el('h4','','правка '+v.act+' ['+(v.voice||'?')+(v.seat&&v.seat!==v.voice?'/'+v.seat:'')+'] · '+({opening:'открыт',working:'в работе',closed:'закрыт',crashed:'вылет',adopted:'adopt',merged:'принят',lost:'ветка потеряна'}[v.stage]||v.stage||'?'));
+    gate.appendChild(h);
+    if(v.task)gate.appendChild(el('div','dim','задание: '+String(v.task).slice(0,300)));
+    if(v.close)gate.appendChild(el('div',v.close.status==='done'?'':'no','закрытие: '+(v.close.text||'')+(v.close.autocommit?' · коммит сделала обёртка':'')+(v.close.excluded&&v.close.excluded.length?' · вне коммита: '+v.close.excluded.join(', '):'')));
+    if(v.crash)gate.appendChild(el('div','no','вылет: '+(v.crash.text||'')));
+    if(v.merge)gate.appendChild(el('div','ok','принят: '+(v.merge.result_sha||'').slice(0,12)));
+    const c=v.checks||{}; const ap=(c.approvals||[]).length, q=c.quorum||2, ref=(c.refused||[]).length;
+    const st=el('div',c.ok?'ok':'', 'гейт: '+(c.ok?'открыт — можно принимать':'закрыт')+' · одобрений '+ap+'/'+q+(ref?' · ОТКАЗ: '+c.refused.join(', '):'')+(c.stale_base?' · main уехал, нужен rebase':''));
+    gate.appendChild(st);
+    if(c.reasons&&c.reasons.length&&!c.ok)gate.appendChild(el('div','dim',c.reasons.join('; ')));
+    const row=el('div','row'); const a=v.act;
+    // те же условия, что у панели coder: гейт при merge сам делает rebase,
+    // поэтому «Принять» — по кворуму и отсутствию отказов, не по c.ok
+    if(v.stage==='closed'||v.stage==='adopted'){
+      if(!ref&&ap<q)gateBtn(row,'Ревизия',function(){if(!confirm('Ревизия акта '+a+': платный веер всем, кроме исполнителя. Пускаем?'))return;
+        gatePost('/edit_review',{act:a},function(){return 'ревизия '+a+' запущена — вердикты придут в ленту'})});
+      if(ap>=q&&!ref)gateBtn(row,'Принять в main',function(){if(!confirm('Принять акт '+a+' в main? Кворум '+ap+'/'+q+(c.stale_base?'; main уехал — гейт сделает rebase, одобрения сгорят, если дельта непуста':'')+'. Ветка сольётся, main сдвинется.'))return;
+        gatePost('/edit_merge',{act:a},function(j){return 'принято: '+(j.result_sha||'').slice(0,12)})});}
+    if(v.stage==='crashed')gateBtn(row,'Adopt',function(){if(!confirm('Adopt акта '+a+': рассмотреть вылетевшую работу из карантина?'))return;
+      gatePost('/edit_adopt',{act:a},function(){return 'adopt: '+a})});
+    gateBtn(row,'⟳',function(){loadGate(true)});
+    gate.appendChild(row);
+    if(v.reviews&&v.reviews.length){const rv=el('div','','ревизии:'); gate.appendChild(rv);
+      v.reviews.forEach(function(r){const k='r'+r.ts+'|'+r.voice; const d=document.createElement('details'); d.open=!!GATE.open[k];
+        d.ontoggle=function(){GATE.open[k]=d.open};
+        const sm=document.createElement('summary'); sm.textContent=(r.voice||'?')+': '+(r.verdict||'?')+' ('+(r.status||'?')+(r.elapsed_s?', '+r.elapsed_s+' с':'')+')'+(v.head&&r.sha&&r.sha!==v.head?' · на прежней голове':'');
+        sm.className=r.verdict==='approve'?'ok':r.verdict==='refuted'?'no':'dim'; d.appendChild(sm);
+        d.appendChild(el('pre','',r.full_text||r.text||'(текста нет)')); rv.appendChild(d)})}
+    const dd=document.createElement('details'); dd.open=!!GATE.open.diff; dd.ontoggle=function(){GATE.open.diff=dd.open};
+    const ds=document.createElement('summary'); ds.textContent='диф ветки'+(v.head?' '+String(v.head).slice(0,12):'')+(v.diff_truncated?' (обрезан)':'')+(v.diff_error?' — '+v.diff_error:''); dd.appendChild(ds);
+    dd.appendChild(el('pre','',v.diff||'(диф пуст)')); gate.appendChild(dd)}
+  async function loadGate(force){clearTimeout(GATE.timer); const e=GATE.edit; if(!e||gate.hidden)return;
+    if(document.hidden){GATE.timer=setTimeout(function(){loadGate(false)},3000);return}
+    let done=false;
+    try{const r=await fetch('/act_view?act='+encodeURIComponent(e)); const j=await r.json();
+      if(GATE.edit!==e)return; if(!r.ok){gate.dataset.sig='';gate.textContent=(j&&j.error)||('ошибка '+r.status)} else {renderGate(j); done=(j.stage==='merged'||j.stage==='lost')}}
+    catch(_){gate.dataset.sig='';gate.textContent='карточка акта: сервер не ответил'}
+    if(done)return;   // терминальная стадия: меняться нечему, кнопка ⟳ обновит вручную
+    GATE.timer=setTimeout(function(){loadGate(false)},force?2000:6000)}
+  function showGate(edit){GATE.edit=edit||''; clearTimeout(GATE.timer); gate.hidden=!edit; gate.innerHTML=''; gate.dataset.sig='';
+    if(edit){gate.textContent='…'; loadGate(true)}}
   // СЛЕЖЕНИЕ КАК В ТЕРМИНАЛЕ (наказ Автора 2026-09-06): отмотал вверх —
   // автопрокрутка выключена и не мешает читать; довёл до последней
   // строки — включена снова. Новые строки при выключенном слежении
@@ -6147,7 +6411,7 @@ document.getElementById('quick').onclick=()=>sendQuick();
     const pick=sel.value||(acts[0]&&acts[0].id)||null;
     if(!pick){if(TERM.id!==null||pre.textContent||!pulse.textContent)startTerm(null);return}
     if(pick!==TERM.id)startTerm(pick)}
-  function startTerm(id){clearTimeout(TERM.timer); TERM.id=id; TERM.edit=(SEEN[id]&&SEEN[id].edit)||''; TERM.next=0; TERM.lastByte=0; TERM.lastSize=0; TERM.quiet=0; TERM.gen++; TERM.source=''; TERM.done=false;
+  function startTerm(id){clearTimeout(TERM.timer); TERM.id=id; showGate(id&&SEEN[id]&&SEEN[id].edit&&SEEN[id].edit!=='batch'?SEEN[id].edit:''); TERM.edit=(SEEN[id]&&SEEN[id].edit)||''; TERM.next=0; TERM.lastByte=0; TERM.lastSize=0; TERM.quiet=0; TERM.gen++; TERM.source=''; TERM.done=false;
     pre.textContent=''; what.textContent=''; inThink=false; PENDING=0; newer.hidden=true; FOLLOW=true; fc.checked=true;
     idbox.value=id?(TERM.edit||id):''; idbox.title=(id?('акт '+id+(TERM.edit?' · правка '+TERM.edit:'')+'. '):'')+'Выделяется; кнопка ⎘ копирует.';
     pulse.textContent=id?'…':(EMPTY[VIEW]||'актов этого рода пока нет');
@@ -6208,7 +6472,7 @@ document.getElementById('quick').onclick=()=>sendQuick();
     TABS.forEach(function(t){t[1].className='vtab'+(t[0]===v?' on':'')});
     feed.className=(feed.className||'').replace(/\bterm\b/g,'').trim()+(v!=='feed'?' term':''); wrap.hidden=(v==='feed');
     if(v!=='feed'){TERM.id=null;fillActs()}
-    else{const go=function(){feed.scrollTop=FEED_POS.stick?feed.scrollHeight:FEED_POS.top};
+    else{showGate(''); const go=function(){feed.scrollTop=FEED_POS.stick?feed.scrollHeight:FEED_POS.top};
       if(window.requestAnimationFrame)requestAnimationFrame(go); else go()}}
   window.setView=setView;
   setInterval(function(){if(VIEW!=='feed'){const before=sel.value;fillActs();if(sel.value!==before&&!TERM.id)startTerm(sel.value)}
@@ -6419,6 +6683,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                          "а не с текущим")
     ap.add_argument("--port", type=int, default=None,
                     help=f"порт окна (умолчание {PORT})")
+    ap.add_argument("--init-project", action="store_true",
+                    help="создать каркас проекта в каталоге запуска, даже "
+                         "если он не пуст: ссылку .roundtable на стол и "
+                         "ПРОЕКТ.md (пустой каталог получает их сам)")
     ap.add_argument("--no-project", action="store_true",
                     help="открыть окно без проекта: поле в панели пустое")
     return ap.parse_args(argv)
@@ -6480,6 +6748,10 @@ def main(argv: list[str] | None = None) -> int:
         PROJECT = ""
     if PROJECT:
         _remember_run(PROJECT)
+        try:
+            scaffold_project(Path(PROJECT), force=bool(getattr(a, "init_project", False)))
+        except OSError as e:
+            print(f"каркас проекта не создан: {e}", file=sys.stderr)
 
     if not FEED.exists():
         print(f"нет ленты {FEED} — сначала python3 live.py ask …",
