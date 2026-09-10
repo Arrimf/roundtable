@@ -154,9 +154,13 @@ in the 🔧 tab shows its card: stage, gate verdicts with the reviewers'
 full texts, the branch diff, and the gate buttons (review, accept,
 adopt) — the same gate as in the coder panel.
 
-**A new project.** Start the window in an empty directory and it lays
-down a scaffold: a `.roundtable` link to the installed table and a
-`ПРОЕКТ.md` for the project's description — that file goes into every
+**A new project.** The feed is one file, but every event carries its
+project: a window shows only its project's events (events from before
+this field belong to the table's own windows), and the delta a voice
+receives is filtered the same way — a new directory starts with an empty
+feed and fresh threads. Start the window in an empty directory and it
+lays down a scaffold: a `.roundtable` link to the installed table and a
+`PROJECT.md` for the project's description — that file goes into every
 voice's packet identically (rule 1), unlike `CLAUDE.md`/`AGENTS.md`,
 which only one CLI would read. Voice threads are kept per project, so a
 new directory starts fresh sessions and returning to an old project
@@ -166,7 +170,11 @@ non-empty directory is left alone unless `--init-project` is given. A
 quick question to "random" picks a voice with `secrets.choice` (OS
 entropy: nobody can steer it, nobody can verify it — the drand lottery
 is for the conductor); if that channel fails, the word passes to the
-next voice instead of ending the act. The executor's CLI log lives with the act log and
+next voice instead of ending the act. The output tabs list acts from
+the whole journal of the project (a chair act and its reviews form one
+group), and the 🪟 button opens a monitor of the table's windows: pid,
+port, project, start time, open or stop. `smoke.sh` runs on a copy of
+the journal; `SMOKE_LIVE=0` skips its one paid voice call. The executor's CLI log lives with the act log and
 survives the close, so the 🔧 tab can be reopened later; the tab follows
 new output like a terminal (scroll up to pause, back to the bottom to
 resume, End/Home keys, a "↓ new: N lines" button), and the act id can

@@ -42,7 +42,7 @@ EOF
 if ss -ltn 2>/dev/null | grep -q ":$PORT "; then
   echo "порт $PORT занят: $(ss -ltnp | grep ":$PORT ") — задайте RT_HTTP_TEST_PORT"; exit 2
 fi
-( cd "$RT_DIR" && ROUNDTABLE_CHAMBER="$W/chamber" ROUNDTABLE_JOURNAL="$W/journal" CHOIR_RT_VOICES="$W/rt-voices.json" CHOIR_RT_ACTS="$W/acts" CHOIR_LEASE_DIR="$W/leases" CHOIR_RT_NO_AUTOREVIEW=1 \
+( cd "$RT_DIR" && ROUNDTABLE_CHAMBER="$W/chamber" ROUNDTABLE_JOURNAL="$W/journal" CHOIR_RT_VOICES="$W/rt-voices.json" CHOIR_RT_ACTS="$W/acts" CHOIR_LEASE_DIR="$W/leases" CHOIR_RT_NO_AUTOREVIEW=1 CHOIR_RT_WINDOWS="$W/windows" CHOIR_RT_LAST_RUN="$W/rt-last.json" \
   CHOIR_RT_MODELS="$W/rt-models.json" CHOIR_RT_NO_DISCOVERY=1 CHOIR_DSH_PATCH_DIR="$W/dshp" \
   CHOIR_WT_DIR="$W/wt" ROUNDTABLE_PORT="$PORT" nohup python3 roundtable.py --no-project \
   > "$W/srv.log" 2>&1 ) &
@@ -288,7 +288,60 @@ printf 'старая эпоха\n' > "$W/leases/edit-abc123def456.1.log"; sleep 
 curl -s "$B/act_log?id=deadbeef&kind=chair&edit=abc123def456" | python3 -c '
 import json,sys; d=json.load(sys.stdin); assert d["source"]=="chair" and d["text"]=="кресло пишет\n", d' && pass "/act_log kind=chair: лог CLI кресла, свежая эпоха" || fail "/act_log chair"
 curl -s "$B/" | grep -q "viewtabs" && pass "страница: вкладки вывода в скрипте" || fail "страница без вкладок вывода"
+# ── /acts, /windows, проект как поле события (наказ Автора 2026-09-10) ──
+python3 - "$W/journal/live.jsonl" <<'PY'
+import json,sys
+p=sys.argv[1]; n=max(json.loads(l)["id"] for l in open(p,encoding="utf-8") if l.strip())   # от максимального id: балласт теста нумерован 900000+
+evs=[{"id":n+1,"ts":"2026-09-10T12:00:00+00:00","author":"roundtable","kind":"act_status","text":"act aa00bb11 принят: round: старый","schema":1,"live":"0.1","act_id":"aa00bb11","status":"accepted"},
+     {"id":n+2,"ts":"2026-09-10T12:00:01+00:00","author":"roundtable","kind":"act_status","text":"act aa00bb11 done: round: старый","schema":1,"live":"0.1","act_id":"aa00bb11","status":"done"},
+     {"id":n+3,"ts":"2026-09-10T12:00:02+00:00","author":"roundtable","kind":"act_status","text":"act cc22dd33 принят: быстрый: чужой проект","schema":1,"live":"0.1","act_id":"cc22dd33","status":"accepted","project":"/nowhere/other"},
+     {"id":n+4,"ts":"2026-09-10T12:00:03+00:00","author":"arr","kind":"say","text":"реплика чужого проекта","schema":1,"live":"0.1","project":"/nowhere/other"}]
+open(p,"a",encoding="utf-8").write("".join(json.dumps(e,ensure_ascii=False)+"\n" for e in evs))
+PY
+curl -s "$B/acts" | python3 -c '
+import json,sys; d=json.load(sys.stdin); ids=[a["id"] for a in d["acts"]]
+assert "aa00bb11" in ids and "cc22dd33" in ids, ids   # окно без проекта видит всё
+a=[x for x in d["acts"] if x["id"]=="aa00bb11"][0]; assert a["label"].startswith("round: старый") and a["status"]=="done" and a["running"] is False, a' \
+  && pass "/acts: акты из всей ленты (окно без проекта видит все), метка и статус" || fail "/acts"
+# второе окно С ПРОЕКТОМ ($W — «стол» этого стенда: chamber/ лежит в нём, старые события без поля — его):
+# чужой проект скрыт и в /acts, и в /events; своё событие видно
+P2=$((PORT+1))
+( cd "$RT_DIR" && ROUNDTABLE_CHAMBER="$W/chamber" ROUNDTABLE_JOURNAL="$W/journal" CHOIR_RT_VOICES="$W/rt-voices.json" CHOIR_RT_ACTS="$W/acts" CHOIR_LEASE_DIR="$W/leases" CHOIR_RT_NO_AUTOREVIEW=1 \
+  CHOIR_RT_NO_DISCOVERY=1 CHOIR_RT_MODELS="$W/rt-models.json" CHOIR_DSH_PATCH_DIR="$W/dsh" CHOIR_WT_DIR="$W/wt" CHOIR_RT_WINDOWS="$W/windows" CHOIR_RT_LAST_RUN="$W/rt-last.json" ROUNDTABLE_PORT="$P2" nohup python3 roundtable.py --project "$W" > "$W/srv2.log" 2>&1 ) &
+B2="http://127.0.0.1:$P2"
+for _ in $(seq 1 40); do sleep 0.25; curl -s -o /dev/null "$B2/state" && break; done
+if curl -s -o /dev/null "$B2/state"; then
+  curl -s "$B2/acts" | python3 -c '
+import json,sys; d=json.load(sys.stdin); ids=[a["id"] for a in d["acts"]]
+assert "aa00bb11" in ids and "cc22dd33" not in ids, ids' && pass "/acts (окно с проектом): старые акты видны, чужой проект скрыт" || fail "/acts фильтр"
+  curl -s "$B2/events" --max-time 2 2>/dev/null | grep -c "реплика чужого проекта" | grep -q "^0$" && pass "/events (окно с проектом): чужое событие не уходит" || fail "/events: чужой проект просочился"
+  curl -s -X POST "$B2/goal" -H 'Content-Type: application/json' -d '{"text":"цель проекта W"}' > /dev/null
+  # метка проекта у детей окна (live.py при пустом поле, executor_run, merge_gate) — юнит в autoreview_test (без платных вызовов)
+  curl -s "$B2/events" --max-time 2 2>/dev/null | grep -q "цель проекта W" && pass "/events (окно с проектом): своё событие видно" || fail "/events: своё событие пропало"
+  curl -s "$B/state" | python3 -c '
+import json,sys; assert json.load(sys.stdin).get("goal") == "цель проекта W"' && pass "окно без проекта видит цель любого проекта (belongs: None — всё)" || fail "окно без проекта не увидело цель проекта W"
+  python3 - "$W/journal/live.jsonl" <<'PY' && pass "id событий уникальны и растут по всей ленте (окно с проектом не начало с 1)" || fail "id ленты: дубли или откат"
+import json,sys
+evs=[json.loads(l) for l in open(sys.argv[1],encoding="utf-8") if l.strip()]
+ids=[e["id"] for e in evs]
+goal=[e for e in evs if e.get("kind")=="goal" and e.get("goal")=="цель проекта W"]
+# балласт теста имеет искусственные id 900000+, поэтому проверяется уникальность и то,
+# что событие окна с проектом получило номер выше всех, а не 1
+assert len(ids)==len(set(ids)), (len(ids), len(set(ids)))
+assert goal and goal[-1]["id"]==max(ids), (goal and goal[-1]["id"], max(ids))
+PY
+  PID2=$(ss -ltnp 2>/dev/null | grep ":$P2 " | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2); [ -n "$PID2" ] && kill "$PID2"
+else
+  fail "второе окно с проектом не поднялось: $(tail -3 "$W/srv2.log")"
+fi
+curl -s "$B/windows" | python3 -c '
+import json,sys; d=json.load(sys.stdin); me=[w for w in d["windows"] if w.get("self")]
+assert me and me[0]["pid"]==d["self"] and me[0].get("port"), d' && pass "/windows: это окно в реестре с портом" || fail "/windows"
+[ "$(code /windows/stop "{\"pid\": $(curl -s "$B/windows" | python3 -c 'import json,sys; print(json.load(sys.stdin)["self"])')}")" = 400 ] && pass "/windows/stop: своё окно — отказ" || fail "/windows/stop self"
+[ "$(code /windows/stop '{"pid": 1}')" = 400 ] && pass "/windows/stop: чужой pid — отказ" || fail "/windows/stop pid 1"
+[ "$(code /windows/stop '{"pid": "x"}')" = 400 ] && pass "/windows/stop: кривой pid → 400" || fail "/windows/stop bad"
 
+cat "$W/srv2.log" 2>/dev/null >> "$W/srv.log"   # трейсбеки второго окна — в ту же проверку (ревьюер)
 grep -q "Traceback" "$W/srv.log" && fail "в логе сервера трейсбек: $(grep -A3 Traceback "$W/srv.log" | head -5)" || pass "трейсбеков в логе сервера нет"
 printf '\nvoices_http: PASS %d · FAIL %d\n' "$PASS" "$FAIL"
 [ "$FAIL" = 0 ]

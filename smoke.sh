@@ -14,13 +14,27 @@
 # полного цикла; всё остальное — бесплатные проверки обвязки.
 set -euo pipefail
 
-PORT="${ROUNDTABLE_PORT:-8771}"
+# Порт смока — небоевой: 8770/8771 у Автора заняты живыми окнами, и
+# расчистка шага 0 не должна к ним даже приближаться (kimi).
+PORT="${ROUNDTABLE_PORT:-8795}"
 BASE="http://127.0.0.1:${PORT}"
 RT_DIR="$(cd "$(dirname "$0")" && pwd)"
-JOURNAL="${ROUNDTABLE_JOURNAL:-$RT_DIR/journal}"     # журналы стола (переезд 2026-09-06)
-FEED="$JOURNAL/live.jsonl"
-LOT_SAFE="$HOME/.cache/choir/roundtable-lot.json"
+# Журнал — КОПИЯ живого (наказ Автора 2026-09-10): прежде смок писал
+# в живую ленту и делал платный вызов DeepSeek на каждом прогоне, и
+# десять «ОК» за день выглядели как чужие вопросы. Копия лежит в WORK,
+# живая лента не трогается. SMOKE_LIVE=0 — без платного вызова голоса
+# (проверяется только цепочка окно → сервер → live.py → лента).
+SRC_JOURNAL="${ROUNDTABLE_JOURNAL:-$RT_DIR/journal}"
+SMOKE_LIVE="${SMOKE_LIVE:-1}"
 WORK="$(mktemp -d /tmp/rt-smoke.XXXXXX)"
+# Свой сейф жребия: живой сейф Автора смок не трогает (kimi). Имя НЕ lot.json:
+# так называется файл с ответом /lot ниже, и сейф затирался этим ответом
+# (полдня «reveal → 000»: KeyError 'candidates' в логе сервера).
+LOT_SAFE="$WORK/lot-safe.json"
+JOURNAL="$WORK/journal"; mkdir -p "$JOURNAL"
+[ -f "$SRC_JOURNAL/live.jsonl" ] && cp "$SRC_JOURNAL/live.jsonl" "$JOURNAL/live.jsonl"
+[ -f "$SRC_JOURNAL/room.jsonl" ] && cp "$SRC_JOURNAL/room.jsonl" "$JOURNAL/room.jsonl"
+FEED="$JOURNAL/live.jsonl"
 SPID=""
 
 PASS=0; FAIL=0; WARN=0
@@ -87,7 +101,7 @@ step 1 "старт сервера (ROUNDTABLE_PORT=$PORT)"
 # Каталог моделей — БЕЗ разведки и в свой файл: смок не должен ходить
 # в сеть с живыми учётками и переписывать кэш Автора (ревизия 2026-09-02).
 ( cd "$RT_DIR" && ROUNDTABLE_PORT="$PORT" CHOIR_RT_NO_DISCOVERY=1 \
-  ROUNDTABLE_JOURNAL="$JOURNAL" CHOIR_RT_NO_AUTOREVIEW=1 CHOIR_RT_MODELS="$WORK/rt-models.json" nohup python3 roundtable.py \
+  ROUNDTABLE_JOURNAL="$JOURNAL" CHOIR_RT_NO_AUTOREVIEW=1 CHOIR_RT_LOT_SAFE="$LOT_SAFE" CHOIR_RT_WINDOWS="$WORK/windows" CHOIR_RT_LAST_RUN="$WORK/rt-last.json" CHOIR_RT_MODELS="$WORK/rt-models.json" nohup python3 roundtable.py \
       >"$WORK/server.log" 2>&1 & echo $! >"$WORK/pid" )
 SPID="$(cat "$WORK/pid")"
 up=""
@@ -148,10 +162,17 @@ deadline=$((SECONDS+45))
 while [ $SECONDS -lt $deadline ]; do
     code="$(http POST /reveal '' "$WORK/rev.json")"
     if [ "$code" = 200 ]; then revealed=1; break; fi
-    [ "$code" = 425 ] || break     # всё, кроме «рано», — не лечится ожиданием
+    # 425 «рано» и 000 (таймаут curl: свежий раунд маяк иногда отдаёт
+    # медленно) лечатся ожиданием до дедлайна; остальное — нет
+    [ "$code" = 425 ] || [ "$code" = 000 ] || break
     sleep 3
 done
-[ -n "$revealed" ] && pass "/reveal → 200" || fail "/reveal → $code (раунд так и не наступил или сейф пропал)"
+if [ -n "$revealed" ]; then pass "/reveal → 200"; else
+    fail "/reveal → $code (раунд так и не наступил или сейф пропал)"
+    echo "      лог сервера (хвост):"; sed 's/^/      | /' "$WORK/server.log" | tail -12
+    echo "      тело ответа:"; sed 's/^/      | /' "$WORK/rev.json" 2>/dev/null | head -3
+    echo "      сейф ($LOT_SAFE):"; sed 's/^/      | /' "$LOT_SAFE" 2>/dev/null | head -5
+fi
 
 # сверка по ленте: commit == sha256(salt:candidates:target) последнего reveal
 if [ -n "$revealed" ] && python3 -c '
@@ -196,6 +217,7 @@ print(last)' "$FEED")"
 # разговора передавал слово дальше по столу — второй платный вызов на
 # каждый прогон смока, который тут же убивался остановкой сервера
 # (замечено в ленте 2026-08-25: «слово → grok» и «прерван» следом).
+if [ "$SMOKE_LIVE" = 1 ]; then
 code="$(http POST /act '{"text":"@deepseek смок RoundTable: ответь словом ОК","voices":["deepseek"],"mode":"quick"}' "$WORK/act.json")"
 if [ "$code" = 200 ]; then
     pass "/act → 200 (task $(python3 -c '
@@ -219,6 +241,9 @@ sys.exit(1)' "$FEED" "$BASE_ID" >"$WORK/ds.txt"; then got=1; break; fi
         echo "      ответ deepseek:"; sed 's/^/      | /' "$WORK/ds.txt"
     else fail "за 180 с новое событие author=deepseek в ленте не появилось"; fi
 else fail "/act → $code"; sed 's/^/      | /' "$WORK/act.json" 2>/dev/null || true; fi
+else
+    warn "живой вызов голоса пропущен (SMOKE_LIVE=0) — цепочка окно → сервер → live.py проверена без оплаты"
+fi
 
 # ── шаг 7: act_status (новый контракт — WARN, не FAIL) ───────────────
 step 7 "события act_status accepted/done в ленте"
@@ -266,7 +291,6 @@ open(sys.argv[1],"w",encoding="utf-8").write(m.group(1))' "$WORK/page.js"
 else
     warn "node не найден — исполнение JS не проверено"
 fi
-
 # ── шаг 8: глушим сервер, сводка ─────────────────────────────────────
 step 8 "остановка сервера"
 pkill -TERM -P "$SPID" 2>/dev/null || true

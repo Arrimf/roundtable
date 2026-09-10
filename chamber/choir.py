@@ -275,7 +275,7 @@ _PROJECT_NOTICE: dict = {}          # снимок на процесс: str(PROJ
 
 def project_notice() -> str:
     """Строка о проекте — В ПАКЕТ ВСЕМ (одинаковый пакет, правило 1);
-    пусто, если проект не задан. ПРОЕКТ.md читается ОДИН раз на процесс:
+    пусто, если проект не задан. PROJECT.md читается ОДИН раз на процесс:
     голоса зовутся параллельно, и правка файла посреди фазы дала бы им
     разные пакеты, а packet_prefix перестал бы воспроизводить пакет
     (ревьюер дифа 2026-09-10)."""
@@ -285,7 +285,7 @@ def project_notice() -> str:
     if key in _PROJECT_NOTICE:
         return _PROJECT_NOTICE[key]
     doc = ""
-    f = Path(PROJECT) / "ПРОЕКТ.md"
+    f = Path(PROJECT) / "PROJECT.md"
     try:
         txt = f.read_text(encoding="utf-8").strip() if f.is_file() else ""
     except OSError:

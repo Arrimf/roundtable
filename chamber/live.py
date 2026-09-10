@@ -284,6 +284,16 @@ def _status_of(rc, out: str, err: str, quota_exit, timed_out: bool = False) -> s
 #       а не агент. Ему проект надо класть в промпт текстом.
 # Права при этом не меняются: read-only у всех, кто умеет песочницу.
 PROJECT: Path | None = None
+# МЕТКА ПРОЕКТА СОБЫТИЙ — отдельно от каталога на чтение: окно даёт детям
+# CHOIR_EVENT_PROJECT, и реплика при пустом поле «проект», закрытие кресла
+# (executor_run) и вердикты ревизии (merge_gate) помечаются проектом окна,
+# иначе они пропадали из его ленты (ревьюер дифа 2026-09-10).
+EVENT_PROJECT = os.environ.get("CHOIR_EVENT_PROJECT") or None
+
+
+def event_project():
+    """Проект, которым помечаются события и по которому читается лента."""
+    return PROJECT or EVENT_PROJECT
 
 # ── Досье и контролёр на первоисточнике (правило 14.5) ──────────────
 #
@@ -640,7 +650,28 @@ def _short(ts: str) -> str:
 # ─────────────────────────────────────────────────────────────────────
 # Лента
 # ─────────────────────────────────────────────────────────────────────
-def read_events(since: int = 0) -> list[dict]:
+# ПРОЕКТ КАК ПОЛЕ СОБЫТИЯ (наказ Автора 2026-09-10: «в новом каталоге
+# ожидаю новый пустой проект»; раунд темы-на-столе-v1 — 5 из 6 за поле в
+# одной ленте, а не за ленту на тему). Лента одна, событие знает свой
+# проект, окно и дельта голосов видят только свой. События до этого дня
+# без поля — история стола: их видят окна без проекта и окна самого
+# стола/песочницы, чужой новый проект — нет.
+LEGACY_HOMES = {str(HERE.parent), str(HERE.parent.parent)}   # RoundTable/, песочница
+
+
+def belongs(e: dict, project) -> bool:
+    """Принадлежит ли событие проекту project (None — всё видно)."""
+    if project is None:
+        return True
+    ep = e.get("project")
+    if ep is None:
+        return str(project) in LEGACY_HOMES
+    return ep == str(project)
+
+
+def read_events(since: int = 0, *, all_projects: bool = False) -> list[dict]:
+    """События ленты новее since — ТОЛЬКО своего проекта (см. belongs);
+    all_projects=True — вся лента (служебные проходы, ревизии актов)."""
     if not LIVE.exists():
         return []
     out = []
@@ -651,13 +682,18 @@ def read_events(since: int = 0) -> list[dict]:
             e = json.loads(line)
         except Exception:                              # noqa: BLE001
             continue
-        if e.get("id", 0) > since:
+        if not isinstance(e, dict):
+            continue                                    # `null`/`123` — валидный json, не событие
+        if e.get("id", 0) > since and (all_projects or belongs(e, event_project())):
             out.append(e)
     return out
 
 
 def next_id() -> int:
-    ev = read_events()
+    """Номер следующего события — по ВСЕЙ ленте: id глобальны (курсоры
+    нитей, Last-Event-ID в SSE), а фильтр проекта дал бы новому проекту
+    id=1 и дубли с историей."""
+    ev = read_events(all_projects=True)
     return (ev[-1]["id"] + 1) if ev else 1
 
 
@@ -672,6 +708,9 @@ def post(author: str, kind: str, text: str, **extra) -> dict:
     # служебные поля (с «_») — не для журнала: такое поле однажды утекло
     # бы через любой путь публикации, где его не сняли (ревьюер дифа)
     extra = {k: v for k, v in extra.items() if not k.startswith("_")}
+    ep = event_project()
+    if ep and "project" not in extra:
+        extra["project"] = str(ep)                 # событие знает свой проект
     with _WRITE_LOCK:
         LIVE.parent.mkdir(parents=True, exist_ok=True)
         LIVE.touch(exist_ok=True)
@@ -863,12 +902,12 @@ CHARTER = """Вы — участник стола AiSandbox: несколько 
 """
 
 
-PROJECT_DOC = "ПРОЕКТ.md"
+PROJECT_DOC = "PROJECT.md"
 PROJECT_DOC_LIMIT = 4000
 
 
 def project_doc() -> str:
-    """Описание проекта из <проект>/ПРОЕКТ.md (кладёт окно при старте в
+    """Описание проекта из <проект>/PROJECT.md (кладёт окно при старте в
     новом каталоге, дописывает Автор). Уходит в пакет ВСЕМ одинаково
     (правило 1) — в отличие от CLAUDE.md/AGENTS.md, которые подхватывает
     только чей-то CLI. Обрезка по потолку названа в тексте."""
@@ -908,7 +947,7 @@ def build_prompt(name: str, st: dict, events: list[dict], first: bool,
                 parts.append(
                     f"Обсуждается проект {PROJECT} — он открыт вам на чтение. "
                     f"Смотрите файлы сами, не полагайтесь на пересказ.\n")
-            doc = project_doc()          # ПРОЕКТ.md — всем одинаково, один раз на нить
+            doc = project_doc()          # PROJECT.md — всем одинаково, один раз на нить
             if doc:
                 parts.append(doc)
         if blind:
@@ -2123,7 +2162,10 @@ def cmd_say(a) -> int:
 
 def cmd_tail(a) -> int:
     """Читать ленту потоком. Единственное место, где комнату видно живой."""
-    seen = 0 if a.all else max(0, next_id() - 1 - a.n)
+    # хвост — из событий СВОЕГО проекта: глобальная нумерация дала бы
+    # пустой хвост, когда конец ленты занят соседним проектом (kimi, grok)
+    ev = read_events()
+    seen = 0 if a.all else (ev[-a.n]["id"] - 1 if a.n > 0 and len(ev) >= a.n else 0)
     print(f"— лента {LIVE.name} (Ctrl-C чтобы выйти) —\n")
     try:
         while True:

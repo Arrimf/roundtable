@@ -99,7 +99,8 @@ PORT = int(os.environ.get("ROUNDTABLE_PORT", "8770"))
 # Переопределяется флагом --project и переменной ROUNDTABLE_PROJECT;
 # `-c/--continue` берёт путь прошлого запуска (LAST_RUN).
 PROJECT = os.environ.get("ROUNDTABLE_PROJECT") or os.getcwd()
-LAST_RUN = Path.home() / ".cache" / "choir" / "rt-last.json"
+LAST_RUN = Path(os.environ.get("CHOIR_RT_LAST_RUN")           # тесты — свой файл, память -c Автора не трогают
+                or Path.home() / ".cache" / "choir" / "rt-last.json")
 
 # Каталоги, которые НЕЛЬЗЯ подставлять молча, и файлы, выдающие такой
 # каталог. Причина найдена ревьюером дифа и она денежная, а не
@@ -138,7 +139,7 @@ CLI. Пишите здесь то, что должен знать каждый �
 
 def scaffold_project(project: Path, *, force: bool = False) -> None:
     """Каркас нового проекта (наказ Автора 2026-09-10): в каталоге запуска
-    ссылка `.roundtable` на установленный стол и `ПРОЕКТ.md` с
+    ссылка `.roundtable` на установленный стол и `PROJECT.md` с
     инструкциями для всех голосов. История стола остаётся в одном месте
     (journal/), проект держит своё описание у себя. Создаётся только в
     ПУСТОМ каталоге (или по --init-project): в чужой проект вроде
@@ -152,11 +153,11 @@ def scaffold_project(project: Path, *, force: bool = False) -> None:
     # .git — не содержимое: «git init» в новом каталоге — обычный первый
     # шаг, каркас после него всё ещё нужен (ревизия: gemini, deepseek, grok)
     entries = [q for q in project.iterdir()
-               if q.name not in (".roundtable", "ПРОЕКТ.md", ".git")]
+               if q.name not in (".roundtable", "PROJECT.md", ".git")]
     if entries and not force:
-        if not (project / "ПРОЕКТ.md").exists():
+        if not (project / "PROJECT.md").exists():
             print(f"каталог {project} не пуст — каркас проекта не создан; "
-                  f"roundtable --init-project создаст .roundtable и ПРОЕКТ.md",
+                  f"roundtable --init-project создаст .roundtable и PROJECT.md",
                   file=sys.stderr)
         return
     link = project / ".roundtable"
@@ -184,14 +185,14 @@ def scaffold_project(project: Path, *, force: bool = False) -> None:
                     fh.write(("" if cur.endswith("\n") or not cur else "\n") + ".roundtable\n")
         except OSError as e:
             print(f"⚠ .git/info/exclude не дописан: {e}", file=sys.stderr)
-    doc = project / "ПРОЕКТ.md"
+    doc = project / "PROJECT.md"
     if doc.is_symlink():
         print(f"⚠ {doc} — ссылка, а не файл: не трогаю", file=sys.stderr)   # codex: запись ушла бы по ссылке наружу
     elif not doc.exists():
         try:
             with open(doc, "x", encoding="utf-8") as fh:    # эксклюзивно: чужой файл не затрём
                 fh.write(PROJECT_DOC_TEMPLATE.format(name=project.name, table=table))
-            print(f"проект {project.name}: создан ПРОЕКТ.md — опишите проект, "
+            print(f"проект {project.name}: создан PROJECT.md — опишите проект, "
                   f"он уйдёт в пакет всем голосам")
         except FileExistsError:
             pass
@@ -246,7 +247,8 @@ _ROUND_RESERVED: set[str] = set()
 # наступления R; соль до раскрытия лежит в приватном сейфе Автора на
 # диске (это секрет по построению, а не вторая истина: в истине — commit).
 LOT_LOCK = threading.Lock()
-LOT_SAFE = Path.home() / ".cache" / "choir" / "roundtable-lot.json"
+LOT_SAFE = Path(os.environ.get("CHOIR_RT_LOT_SAFE")          # смок и тесты — свой сейф, живой не трогают
+                or Path.home() / ".cache" / "choir" / "roundtable-lot.json")
 LOT_AHEAD = 10          # раундов вперёд ≈ 30 с: подписи ещё нет ни у кого
 
 DRAND_ROUND = "https://api.drand.sh/v2/beacons/quicknet/rounds/{r}"
@@ -401,7 +403,7 @@ def _last_goal() -> str:
     Кэш по (размер, mtime): /state опрашивается каждые две секунды."""
     try:
         st = FEED.stat()
-        key = (st.st_size, st.st_mtime_ns)
+        key = (st.st_size, st.st_mtime_ns, str(live.PROJECT))
     except OSError:
         return ""
     if _GOAL_CACHE["key"] == key:
@@ -416,7 +418,8 @@ def _last_goal() -> str:
                     e = json.loads(line)
                 except ValueError:
                     continue
-                if isinstance(e, dict) and e.get("kind") == "goal":
+                if isinstance(e, dict) and e.get("kind") == "goal" \
+                        and live.belongs(e, live.PROJECT):
                     goal = str(e.get("goal") or "").strip()
     except OSError:
         return ""
@@ -1006,6 +1009,15 @@ def spawn(cmd: list[str], label: str, voices: list[str],
     return act_id
 
 
+def _line_in_project(line: str) -> bool:
+    """Строка ленты принадлежит проекту окна (см. live.belongs)."""
+    try:
+        e = json.loads(line)
+    except Exception:                                   # noqa: BLE001
+        return False
+    return isinstance(e, dict) and live.belongs(e, live.PROJECT)
+
+
 def _line_id(line: str) -> int:
     """Числовой id события ленты; кривая строка — -1 (без "id:" в SSE,
     и при resume не отдаётся: сравнивать её id не с чем).
@@ -1436,6 +1448,10 @@ def _spawn_env(voices: list[str]) -> dict:
     # чтобы комната знала, куда класть сырой вывод (RT_RAW, см. live.py).
     env["PYTHONUNBUFFERED"] = "1"
     env["RT_ACT_DIR"] = str(ACT_DIR)
+    # Метка проекта для событий детей (live.py при пустом поле «проект»,
+    # executor_run, merge_gate): без неё их события шли без поля и
+    # пропадали из ленты окна проекта (ревьюер дифа 2026-09-10).
+    env["CHOIR_EVENT_PROJECT"] = PROJECT or ""
     # RT_RAW — только по явному решению обработчика (быстрый вопрос);
     # унаследованная из оболочки «1» положила бы сырые ответы слепого
     # такта на диск (нашёл grok).
@@ -3021,6 +3037,40 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-cache")
             self.end_headers()
             self._stream(after)
+        elif self.path.partition("?")[0] == "/acts":
+            # Список актов для вкладок вывода: из ВСЕЙ ленты (хвост в 80
+            # событий терял раунды, и вкладка «дирижёр» пустела — Автор,
+            # 2026-09-10), только свой проект, новые первыми.
+            acts: dict = {}
+            order: list = []
+            for e in reversed(live.read_events(all_projects=True)):
+                if e.get("kind") != "act_status" or not e.get("act_id"):
+                    continue
+                if not live.belongs(e, live.PROJECT):
+                    continue
+                aid = e["act_id"]
+                m = re.match(r"^act [0-9a-f]+ (?:принят|done|error|прерван|отвязан|abort|судьба неизвестна)[^:]*: (.*)$",
+                             e.get("text") or "", re.S)
+                rec = acts.get(aid)
+                if rec is None:
+                    rec = acts[aid] = {"id": aid, "label": "", "status": e.get("status"),
+                                       "edit": e.get("edit"), "ts": e.get("ts")}
+                    order.append(aid)
+                if not rec["label"] and m:
+                    rec["label"] = m.group(1).split("\n")[0][:80]
+                if e.get("status") == "accepted":
+                    rec["ts"] = e.get("ts")          # время старта акта
+                if e.get("edit") and not rec["edit"]:
+                    rec["edit"] = e["edit"]
+            with RUN_LOCK:
+                live_ids = set(RUNNING)
+            for a in acts.values():
+                a["running"] = a["id"] in live_ids
+            return self._json(200, {"acts": [acts[a] for a in order[:300]]})
+
+        elif self.path == "/windows":
+            return self._json(200, {"windows": list_windows(), "self": os.getpid()})
+
         elif self.path.partition("?")[0] == "/act_view":
             q = parse_qs(self.path.partition("?")[2])
             act = (q.get("act") or [""])[0].strip()
@@ -3076,7 +3126,8 @@ class Handler(BaseHTTPRequestHandler):
                 lot = _lot_load()
                 winner = lot_winner(lot) if lot else None
             try:
-                acts = merge_gate.acts_summary()
+                acts = [a for a in merge_gate.acts_summary()
+                        if live.belongs({"project": a.get("project")}, live.PROJECT)]
                 pending = len(merge_gate.pending_acts())
             except Exception as e:              # noqa: BLE001
                 print(f"/state acts: {e}", file=sys.stderr)
@@ -3135,18 +3186,38 @@ class Handler(BaseHTTPRequestHandler):
         а не перечитывает. Ротации у live.jsonl нет, инода стабильна."""
         try:
             with open(FEED, "r", encoding="utf-8") as f:
+                # Окно видит ТОЛЬКО свой проект (поле события; старые
+                # события без поля — у окон стола и песочницы): новый
+                # каталог начинается с пустой ленты (наказ Автора
+                # 2026-09-10). Хвост в 80 — из событий проекта.
+                # Разбирать ВСЮ ленту на каждое подключение дорого (все
+                # трое ревьюеров): хвост в 80 собирается с конца, а после
+                # Last-Event-ID разбираются только строки новее него.
                 lines = f.readlines()
                 if after is None:
-                    tail = lines[-80:]
+                    tail = []
+                    for ln in reversed(lines):
+                        if _line_in_project(ln):
+                            tail.append(ln)
+                            if len(tail) >= 80:
+                                break
+                    tail.reverse()
                 else:
-                    tail = [ln for ln in lines if _line_id(ln) > after]
+                    k = len(lines)
+                    while k > 0:
+                        lid = _line_id(lines[k - 1])
+                        if lid != -1 and lid <= after:     # кривая строка (-1) не останавливает ход назад (ревьюер)
+                            break
+                        k -= 1
+                    tail = [ln for ln in lines[k:] if _line_in_project(ln)]
                 for line in tail:
                     self._emit(line)
                 while True:
                     pos = f.tell()
                     line = f.readline()
                     if line.endswith("\n"):
-                        self._emit(line)
+                        if _line_in_project(line):
+                            self._emit(line)
                     elif line:
                         # хвост ещё дописывается вторым процессом —
                         # отдать полстроки значит скормить UI битый json
@@ -4249,6 +4320,17 @@ class Handler(BaseHTTPRequestHandler):
                     _ROUND_RESERVED.discard(name)
             return self._json(200, {"act": act, "step": step, "by": who})
 
+        if self.path == "/windows/stop":
+            try:
+                pid = int(req.get("pid") or 0)
+                msg = stop_window(pid)
+            except (ValueError, TypeError) as e:
+                return self._json(400, {"error": str(e)})
+            except OSError as e:
+                return self._json(500, {"error": f"сигнал не ушёл: {e}"})
+            feed_append("note", f"окно pid {pid} остановлено из монитора окон")
+            return self._json(200, {"stopped": pid, "note": msg})
+
         if self.path == "/goal":
             # Цель целеполагателя — событием в ленту (append-only): её
             # читают live.py (первый ход) и choir.py (пакет раунда).
@@ -4322,7 +4404,12 @@ class Handler(BaseHTTPRequestHandler):
                 lot = _lot_load()
                 if not lot:
                     return self._json(409, {"error": "нераскрытого жребия нет"})
-                ev = reveal_lot(lot)
+                try:
+                    ev = reveal_lot(lot)
+                except (KeyError, TypeError, ValueError) as e:
+                    # битый сейф (не наш файл, чужая запись) — ответ, не
+                    # разрыв соединения без строки в журнале
+                    return self._json(500, {"error": f"сейф жребия нечитаем: {e!r}"})
             if ev is None:
                 return self._json(425, {"error": "целевой drand-раунд ещё "
                                         "не наступил — подождите"})
@@ -6294,11 +6381,37 @@ document.getElementById('quick').onclick=()=>sendQuick();
     const t=document.getElementById('term'); if(t)t.className=tc.checked?'':'nothink'};
   tl.appendChild(tc); tl.appendChild(document.createTextNode(' 💭 мысли'));
   if(qb)qb.appendChild(tl);
+  // МОНИТОР ОКОН (наказ Автора 2026-09-10): какие окна стола живы, где
+  // запущены, на каком порту; открыть или остановить. Останавливать можно
+  // только чужое окно этого пользователя, сигналом SIGTERM.
+  const wb=document.createElement('button'); wb.textContent='🪟 окна'; wb.className='vtab';
+  wb.title='Окна стола этого пользователя: pid, порт, проект, время запуска. «Открыть» — ссылка на окно; «Остановить» — SIGTERM (окно погасит свои акты и выйдет).';
+  const wp=document.createElement('div'); wp.id='winpanel'; wp.hidden=true;
+  css.textContent+='#winpanel{margin:.4rem 0 0;border:1px solid var(--rule);border-radius:.4rem;padding:.4rem .7rem;font-size:.86rem}'
+    +'#winpanel .row{display:flex;gap:.6rem;align-items:center;flex-wrap:wrap;padding:.15rem 0}#winpanel button{font:inherit;background:var(--bg);color:var(--ink);border:1px solid var(--rule);border-radius:.3rem;padding:.05rem .5rem;cursor:pointer}'
+    +'#winpanel .me{color:var(--acc)}#winpanel .dim{color:var(--dim)}';
+  async function loadWindows(){wp.innerHTML=''; let j=null;
+    try{const r=await fetch('/windows'); j=await r.json()}catch(_){wp.textContent='сервер не ответил';return}
+    (j.windows||[]).forEach(function(w){const row=document.createElement('div'); row.className='row';
+      const lab=document.createElement('span'); lab.className=w.self?'me':''; lab.textContent='pid '+w.pid+(w.port?' · :'+w.port:' · порт неизвестен')+' · '+(w.project||w.cwd||'—')+(w.started?' · с '+w.started:'')+(w.self?' · это окно':'')+(w.unregistered?' · без карточки (старый код)':'');
+      row.appendChild(lab);
+      const okPort=Number.isInteger(w.port)&&w.port>0&&w.port<65536;   // карточка — данные с диска: порт только числом (grok)
+      if(okPort&&!w.self){const a=document.createElement('a'); a.href='http://127.0.0.1:'+w.port+'/'; a.target='_blank'; a.textContent='открыть'; row.appendChild(a)}
+      if(!w.self){const b=document.createElement('button'); b.textContent='остановить'; b.onclick=async function(){
+        if(!confirm('Остановить окно pid '+w.pid+' ('+(w.project||w.cwd||'?')+')? Его идущие акты будут прерваны.'))return;
+        try{const r=await fetch('/windows/stop',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pid:w.pid})}); const jj=await r.json();
+          lab.textContent+=' · '+(r.ok?(jj.note||'остановлено'):(jj.error||('ошибка '+r.status)))}catch(_){lab.textContent+=' · сервер не ответил'}
+        setTimeout(loadWindows,1500)}; row.appendChild(b)}
+      wp.appendChild(row)});
+    if(!(j.windows||[]).length)wp.textContent='окон не найдено'}
+  wb.onclick=function(){wp.hidden=!wp.hidden; if(!wp.hidden)loadWindows()};
+  if(qb)qb.appendChild(wb);
   // вкладки
   const bar=document.createElement('div'); bar.id='viewtabs'; const TABS=[];
   VIEWS.forEach(function(v){const b=document.createElement('button'); b.className='vtab'+(v[0]==='feed'?' on':'');
     b.setAttribute('data-view',v[0]); b.textContent=v[1]; b.title=v[2]; b.onclick=function(){setView(v[0])}; bar.appendChild(b); TABS.push([v[0],b])});
   if(top)top.appendChild(bar);
+  if(top)top.appendChild(wp);
   const wrap=document.createElement('div'); wrap.id='termwrap'; wrap.hidden=true;
   const head=document.createElement('div'); head.id='termhead';
   const sel=document.createElement('select'); sel.id='termact'; sel.title='Какой акт показывать: идущие — первыми, потом завершённые (лог акта переживает окно)';
@@ -6330,7 +6443,8 @@ document.getElementById('quick').onclick=()=>sendQuick();
   function gateBtn(row,label,fn){const b=el('button','',label); b.onclick=fn; row.appendChild(b); return b}
   function renderGate(v){const sig=JSON.stringify(v); if(gate.dataset.sig===sig)return; gate.dataset.sig=sig; // не срывать клик и прокрутку дифа перестройкой (ревьюер)
     gate.innerHTML='';
-    const h=el('h4','','правка '+v.act+' ['+(v.voice||'?')+(v.seat&&v.seat!==v.voice?'/'+v.seat:'')+'] · '+({opening:'открыт',working:'в работе',closed:'закрыт',crashed:'вылет',adopted:'adopt',merged:'принят',lost:'ветка потеряна'}[v.stage]||v.stage||'?'));
+    const isRev=SEEN[TERM.id]&&SEEN[TERM.id].kind==='review';
+    const h=el('h4','',(isRev?'ревизия правки ':'правка ')+v.act+' ['+(v.voice||'?')+(v.seat&&v.seat!==v.voice?'/'+v.seat:'')+'] · '+({opening:'открыт',working:'в работе',closed:'закрыт',crashed:'вылет',adopted:'adopt',merged:'принят',lost:'ветка потеряна'}[v.stage]||v.stage||'?'));
     gate.appendChild(h);
     if(v.task)gate.appendChild(el('div','dim','задание: '+String(v.task).slice(0,300)));
     if(v.close)gate.appendChild(el('div',v.close.status==='done'?'':'no','закрытие: '+(v.close.text||'')+(v.close.autocommit?' · коммит сделала обёртка':'')+(v.close.excluded&&v.close.excluded.length?' · вне коммита: '+v.close.excluded.join(', '):'')));
@@ -6350,7 +6464,7 @@ document.getElementById('quick').onclick=()=>sendQuick();
         gatePost('/edit_merge',{act:a},function(j){return 'принято: '+(j.result_sha||'').slice(0,12)})});}
     if(v.stage==='crashed')gateBtn(row,'Adopt',function(){if(!confirm('Adopt акта '+a+': рассмотреть вылетевшую работу из карантина?'))return;
       gatePost('/edit_adopt',{act:a},function(){return 'adopt: '+a})});
-    gateBtn(row,'⟳',function(){loadGate(true)});
+    gateBtn(row,'⟳',function(){loadGate(true)}).title='Обновить карточку сейчас (сама она обновляется раз в 6 с, пока акт не принят)';
     gate.appendChild(row);
     if(v.reviews&&v.reviews.length){const rv=el('div','','ревизии:'); gate.appendChild(rv);
       v.reviews.forEach(function(r){const k='r'+r.ts+'|'+r.voice; const d=document.createElement('details'); d.open=!!GATE.open[k];
@@ -6401,12 +6515,27 @@ document.getElementById('quick').onclick=()=>sendQuick();
   function syncRunning(){const r=(window.STATE&&window.STATE.running)||[]; const live={};
     r.forEach(function(t){live[t.id]=1; noteAct(t.id,t.label,{edit:t.edit,running:true})});
     Object.keys(SEEN).forEach(function(id){if(!live[id]&&SEEN[id].running&&window.STATE)SEEN[id].running=false})}
+  // Акты — у сервера, из ВСЕЙ ленты проекта: хвост SSE в 80 событий
+  // терял раунды, и вкладка «дирижёр» пустела (Автор, 2026-09-10)
+  let ACTS_AT=0;
+  async function loadActs(force){if(!force&&Date.now()-ACTS_AT<20000)return; ACTS_AT=Date.now();
+    try{const r=await fetch('/acts'); const j=await r.json(); (j.acts||[]).forEach(function(a){
+      const o=SEEN[a.id]||(SEEN[a.id]={id:a.id,ts:a.ts?Date.parse(a.ts)||Date.now():Date.now()});
+      if(a.label&&!o.label){o.label=a.label;o.kind=classify(a.label)} if(a.edit)o.edit=a.edit; if(a.status)o.status=a.status; o.running=!!a.running})}catch(_){}}
   function actsFor(view){syncRunning(); const ks=KINDS[view]||[];
     return Object.keys(SEEN).map(function(k){return SEEN[k]}).filter(function(a){return ks.indexOf(a.kind)>=0})
       .sort(function(a,b){return (b.running?1:0)-(a.running?1:0)||b.ts-a.ts})}
-  function fillActs(){const acts=actsFor(VIEW); const cur=sel.value; sel.innerHTML='';
+  function fillActs(){let acts=actsFor(VIEW); const cur=sel.value; sel.innerHTML='';
+    if(VIEW==='chair'){
+      // кресло и ревизии одной правки — одна группа: кресло первым, его
+      // ревизии с отступом под ним (Автор: «не плодить лишних записей,
+      // но и разделять»); карточка правки у них общая
+      const byEdit={}; const order=[];
+      acts.forEach(function(a){const k=a.edit||a.id; if(!byEdit[k]){byEdit[k]=[];order.push(k)} byEdit[k].push(a)});
+      acts=[]; order.forEach(function(k){const g=byEdit[k]; g.sort(function(x,y){return (x.kind==='chair'?0:1)-(y.kind==='chair'?0:1)||x.ts-y.ts});
+        g.forEach(function(a,i){a._sub=(i>0); acts.push(a)})})}
     acts.forEach(function(a){const o=document.createElement('option'); o.value=a.id;
-      o.textContent=(a.running?'● ':'■ ')+a.id+' · '+(a.label||'').slice(0,40); sel.appendChild(o)});
+      o.textContent=(a._sub?'   ↳ ':'')+(a.running?'● ':'■ ')+a.id+' · '+(a.label||'').slice(0,40); sel.appendChild(o)});
     if(acts.length&&acts.some(function(a){return a.id===cur}))sel.value=cur;
     const pick=sel.value||(acts[0]&&acts[0].id)||null;
     if(!pick){if(TERM.id!==null||pre.textContent||!pulse.textContent)startTerm(null);return}
@@ -6471,11 +6600,11 @@ document.getElementById('quick').onclick=()=>sendQuick();
     VIEW=v; clearTimeout(TERM.timer);
     TABS.forEach(function(t){t[1].className='vtab'+(t[0]===v?' on':'')});
     feed.className=(feed.className||'').replace(/\bterm\b/g,'').trim()+(v!=='feed'?' term':''); wrap.hidden=(v==='feed');
-    if(v!=='feed'){TERM.id=null;fillActs()}
+    if(v!=='feed'){TERM.id=null;fillActs();loadActs(true).then(function(){if(VIEW===v)fillActs()})}
     else{showGate(''); const go=function(){feed.scrollTop=FEED_POS.stick?feed.scrollHeight:FEED_POS.top};
       if(window.requestAnimationFrame)requestAnimationFrame(go); else go()}}
   window.setView=setView;
-  setInterval(function(){if(VIEW!=='feed'){const before=sel.value;fillActs();if(sel.value!==before&&!TERM.id)startTerm(sel.value)}
+  setInterval(function(){if(VIEW!=='feed'){loadActs(false);const before=sel.value;fillActs();if(sel.value!==before&&!TERM.id)startTerm(sel.value)}
     const st=window.STATE||{}; const n=st.pending_reviews, q=st.review_queue;
     pend.textContent=(VIEW==='chair'&&typeof n==='number'&&n>0)?('ждут ревизии: '+n+(q?' · в очереди на веер: '+q:'')):''},2500);
   }catch(e){try{console.error('вкладки вывода не построены: '+e)}catch(_){}}
@@ -6621,7 +6750,7 @@ def sweep_orphan_acts() -> int:
             continue
         aid, st = d.get("act_id"), d.get("status")
         if st == "accepted":
-            opened[aid] = d.get("text", "")
+            opened[aid] = d                     # событие целиком: нужен его проект
         # `detached` — ОКОНЧАТЕЛЬНЫЙ статус ответственности окна: такт
         # пережил его и доигрывает сам, а reap был daemon-нитью умершего
         # процесса и финал уже не запишет. Не считать detached закрытым
@@ -6637,10 +6766,14 @@ def sweep_orphan_acts() -> int:
             closed.add(aid)
     stale = [a for a in opened if a and a not in closed]
     for aid in stale:
+        # Финал наследует проект акта, а не проект ЭТОГО окна: иначе
+        # осиротевший акт чужого проекта «переезжал» бы в ленту того окна,
+        # которое случилось запустить первым (поймано HTTP-тестом).
         feed_append("act_status",
                     f"act {aid} судьба неизвестна: окно было перезапущено, "
                     f"итог не записан",
-                    act_id=aid, status="unknown")
+                    act_id=aid, status="unknown",
+                    **({"project": opened[aid]["project"]} if opened[aid].get("project") else {}))
     return len(stale)
 
 
@@ -6649,6 +6782,132 @@ def _last_run() -> dict:
         return json.loads(LAST_RUN.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
+
+
+# ── МОНИТОР ОКОН (наказ Автора 2026-09-10) ───────────────────────────
+# Каждое окно при старте пишет карточку в реестр (pid, порт, проект,
+# каталог, время) и снимает её при выходе; окна старого кода без карточки
+# находятся по /proc. Остановить можно только чужое окно этого же
+# пользователя с roundtable.py в командной строке — сигналом SIGTERM, чтобы
+# его finally погасил свои акты.
+WINDOWS_DIR = Path(os.environ.get("CHOIR_RT_WINDOWS")
+                   or Path.home() / ".cache" / "choir" / "rt-windows")
+
+
+def _proc_start(pid: int):
+    """Метка запуска процесса (starttime из /proc/<pid>/stat): переиспользованный
+    pid её не повторит — карточка мёртвого окна не примет чужой процесс за
+    своё (ревизия: codex, deepseek, gemini)."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+        return int(stat.rsplit(")", 1)[1].split()[19])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _window_card() -> dict:
+    return {"pid": os.getpid(), "port": PORT, "project": PROJECT or None,
+            "cwd": os.getcwd(), "started": _now(), "start_tick": _proc_start(os.getpid())}
+
+
+def register_window() -> None:
+    try:
+        WINDOWS_DIR.mkdir(parents=True, exist_ok=True)
+        (WINDOWS_DIR / f"{os.getpid()}.json").write_text(
+            json.dumps(_window_card(), ensure_ascii=False), encoding="utf-8")
+    except OSError as e:
+        print(f"реестр окон: {e}", file=sys.stderr)
+
+
+def unregister_window() -> None:
+    try:
+        (WINDOWS_DIR / f"{os.getpid()}.json").unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _proc_cmdline(pid: int) -> str:
+    try:
+        return Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+def _is_window_pid(pid: int) -> bool:
+    """Живой процесс окна ЭТОГО пользователя (не наш собственный): исполняемый
+    файл — python, а roundtable.py — его СКРИПТ (аргумент), не подстрока где-то
+    в командной строке: иначе `vim roundtable.py` или `tail -f …/roundtable.py`
+    попали бы в монитор и получили SIGTERM (kimi, grok)."""
+    if pid <= 1 or pid == os.getpid():
+        return False
+    try:
+        if os.stat(f"/proc/{pid}").st_uid != os.getuid():
+            return False
+        exe = os.path.basename(os.readlink(f"/proc/{pid}/exe"))
+    except OSError:
+        return False
+    if not exe.startswith("python"):
+        return False
+    args = [a for a in _proc_cmdline(pid).split(" ") if a]
+    return any(os.path.basename(a) == "roundtable.py" for a in args[1:3])
+
+
+def list_windows() -> list[dict]:
+    out: dict[int, dict] = {}
+    try:
+        for f in WINDOWS_DIR.glob("*.json"):
+            try:
+                card = json.loads(f.read_text(encoding="utf-8"))
+                pid = int(card.get("pid") or 0)
+            except (ValueError, OSError, TypeError):
+                continue
+            same = card.get("start_tick") in (None, _proc_start(pid))
+            if pid == os.getpid() or (_is_window_pid(pid) and same):
+                card["alive"] = True
+                out[pid] = card
+            else:
+                f.unlink(missing_ok=True)           # умершее окно без finally / pid переиспользован
+    except OSError:
+        pass
+    # окна без карточки (старый код): по /proc, порт неизвестен
+    try:
+        for d in Path("/proc").iterdir():
+            if not d.name.isdigit():
+                continue
+            pid = int(d.name)
+            if pid in out or not (pid == os.getpid() or _is_window_pid(pid)):
+                continue
+            try:
+                started = time.strftime("%Y-%m-%d %H:%M", time.localtime(d.stat().st_mtime))
+                cwd = os.readlink(f"/proc/{pid}/cwd")
+            except OSError:
+                started, cwd = "", ""
+            out[pid] = {"pid": pid, "port": None, "project": None, "cwd": cwd,
+                        "started": started, "alive": True, "unregistered": True}
+    except OSError:
+        pass
+    for pid, card in out.items():
+        card["self"] = (pid == os.getpid())
+    return sorted(out.values(), key=lambda c: c["pid"])
+
+
+def stop_window(pid: int) -> str:
+    if pid == os.getpid():
+        raise ValueError("это окно — закройте его само")
+    # pidfd берётся ДО проверки: между проверкой и сигналом pid мог бы
+    # достаться чужому процессу (codex, deepseek); с дескриптором сигнал
+    # уходит ровно тому процессу, который проверяли
+    try:
+        fd = os.pidfd_open(pid)
+    except (ProcessLookupError, OSError) as e:
+        raise ValueError(f"pid {pid}: процесса нет ({e})")
+    try:
+        if not _is_window_pid(pid):
+            raise ValueError(f"pid {pid} — не окно стола этого пользователя")
+        signal.pidfd_send_signal(fd, signal.SIGTERM)
+    finally:
+        os.close(fd)
+    return "SIGTERM отправлен — окно погасит свои акты и выйдет"
 
 
 def _remember_run(project: str) -> None:
@@ -6686,7 +6945,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--init-project", action="store_true",
                     help="создать каркас проекта в каталоге запуска, даже "
                          "если он не пуст: ссылку .roundtable на стол и "
-                         "ПРОЕКТ.md (пустой каталог получает их сам)")
+                         "PROJECT.md (пустой каталог получает их сам)")
     ap.add_argument("--no-project", action="store_true",
                     help="открыть окно без проекта: поле в панели пустое")
     return ap.parse_args(argv)
@@ -6752,6 +7011,11 @@ def main(argv: list[str] | None = None) -> int:
             scaffold_project(Path(PROJECT), force=bool(getattr(a, "init_project", False)))
         except OSError as e:
             print(f"каркас проекта не создан: {e}", file=sys.stderr)
+    # Комната окна (feed_append → live.post) штампует события проектом,
+    # а фильтры ленты/цели/актов читают live.PROJECT: без этой строки
+    # события самого окна были бы «без проекта» и не показывались бы в
+    # его же ленте.
+    live.PROJECT = Path(PROJECT) if PROJECT else None
 
     if not FEED.exists():
         print(f"нет ленты {FEED} — сначала python3 live.py ask …",
@@ -6801,6 +7065,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+        PORT = srv.server_address[1]          # --port 0 → фактический порт (карточка окна, реестр)
     except OSError as e:
         # Трейсбек на «порт занят» — грубость: чаще всего это ВТОРОЕ окно
         # или окно, забытое работать в фоне. Человеку нужно не место в
@@ -6869,6 +7134,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"edit-sweep: {e}", file=sys.stderr)
             time.sleep(60)
     threading.Thread(target=_edit_sweep, daemon=True).start()
+    register_window()
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
@@ -6880,6 +7146,7 @@ def main(argv: list[str] | None = None) -> int:
         # жечь квоту (codex, «упустили все», раунд переезд-v1).
         # SIGTERM, не KILL: голос успеет закрыть свою сессию.
         global _STOPPING
+        unregister_window()
         with RUN_LOCK:
             # Забираем записи СЕБЕ: reap-нить, проснувшись, увидит пустоту
             # и промолчит — итог у действия ровно один. Флаг — чтобы reap
