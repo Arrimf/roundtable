@@ -207,7 +207,7 @@ def act_state(act: str) -> dict:
     для гейта не существует, какой бы worktree ни лежал на диске.
     """
     st = {"open": None, "close": None, "crash": None, "adopt": None,
-          "rebase": None, "reviews": []}
+          "rebase": None, "drop": None, "reviews": []}
     for e in edits._feed_events(None):   # свежие первыми
         if e.get("act") != act:
             continue
@@ -232,8 +232,36 @@ def act_state(act: str) -> dict:
             st["rebase"] = e
         elif k == "edit_review":
             st["reviews"].append(e)
+        elif k == "edit_drop" and st["drop"] is None:
+            st["drop"] = e
         elif k == "edit_merge":
             st.setdefault("merge", e)
+    # ПРОДОЛЖЕНИЕ акта (edits.continue_edit) — новое edit_open с новой
+    # эпохой на той же ветке: close/crash прежней эпохи к нему не
+    # относятся, иначе продолжающийся акт читался бы «закрытым» и гейт
+    # выдавал бы кнопки на движущуюся мишень.
+    # Продолжение (edits.continue_edit) — новое edit_open с новой эпохой:
+    # close/crash/adopt прежней жизни акта к нему не относятся, иначе
+    # продолжающийся акт читался бы «закрытым» или «adopted», и гейт
+    # выдавал бы кнопки на движущуюся мишень (ревизия: субагент, grok,
+    # gemini, deepseek). rebase остаётся: геометрия той же ветки.
+    # Ревизии прежней жизни в счёт гейта не идут даже при той же голове —
+    # Автор просил доработать, старый кворум не его ответ (субагент);
+    # карточке они остаются в reviews_all.
+    opn = st["open"] or {}
+    oe, oid = opn.get("epoch"), opn.get("id") or 0
+    for k in ("close", "crash", "adopt"):
+        ev = st[k]
+        if not ev:
+            continue
+        ee = ev.get("epoch")
+        if oe is not None and ee is not None:
+            if ee != oe:
+                st[k] = None
+        elif (ev.get("id") or 0) < oid:
+            st[k] = None
+    st["reviews_all"] = list(st["reviews"])
+    st["reviews"] = [r for r in st["reviews"] if (r.get("id") or 0) > oid]
     return st
 
 
@@ -302,6 +330,12 @@ def _review_prompt(act: str, st: dict, diff: str, head: str,
         warn += (f"\n\nВНИМАНИЕ: CLI исполнителя завершился с ошибкой "
                  f"(status={cl.get('status')}, rc={cl.get('rc')}): работа могла "
                  f"остаться недоделанной — судите диф как черновик.")
+    if op.get("continues"):
+        # Прежние вердикты стола ревьюерам не показываются намеренно
+        # (правило 9: каскад и имена); словам Автора — место есть.
+        warn += (f"\n\nЭТО ПРОДОЛЖЕНИЕ ПРАВКИ по словам Автора: "
+                 f"«{str(op.get('author_text') or '')[:1500]}». Прежние вердикты "
+                 f"стола не показаны: судите диф заново, целиком.")
     # Ключи и токены, попавшие в диф (CLI оставил .env, автокоммит его
     # исключает, но не всё имеет предсказуемое имя), не должны уехать в
     # пакет шести провайдерам: чистка по форме ключей (ревьюер). Не по
@@ -463,9 +497,30 @@ def review(act: str, *, reviewers=None, timeout: int = REVIEW_TIMEOUT,
                       seat=REVIEWER_SEATS.get(name, name),
                       full_text=full)
             events.append(ev)
+        # ИТОГ ВЕЕРА одной строкой (Автор 2026-09-14: «отказ от Грока
+        # вылез сильно после» — ответы ложатся по мере прихода, и без
+        # итога нельзя понять, все ли ответили). Кто сколько думал —
+        # тоже здесь: ждать Грока 6 минут — факт, а не сбой.
+        _post_tally(post, act, head, events)   # в ленту; в ответ — только edit_review
     finally:
         pf.unlink(missing_ok=True)
     return events
+
+
+def _post_tally(post, act: str, head: str, evs: list[dict]) -> dict:
+    ok = sorted(e.get("voice") for e in evs if e.get("verdict") == "approve")
+    no = sorted(e.get("voice") for e in evs if e.get("verdict") == "refuted")
+    absent = sorted(e.get("voice") for e in evs
+                    if e.get("verdict") not in ("approve", "refuted"))
+    slow = max(evs, key=lambda e: e.get("elapsed_s") or 0, default=None)
+    text = (f"ревизия {act} закрыта: {len(ok)} одобряют"
+            + (f" ({', '.join(ok)})" if ok else "")
+            + f", {len(no)} отказ" + (f" ({', '.join(no)})" if no else "")
+            + (f", без вердикта: {', '.join(absent)}" if absent else "")
+            + (f"; дольше всех {slow.get('voice')} — {slow.get('elapsed_s')} с"
+               if slow and slow.get("elapsed_s") else ""))
+    return post("edit_review_done", text, act=act, sha=head,
+                approvals=ok, refused=no, absent=absent)
 
 
 # ── Приёмка ──────────────────────────────────────────────────────────
@@ -483,6 +538,9 @@ def checks(act: str) -> dict:
     out["voice"] = st["open"].get("voice")
     if st.get("merge"):
         out["reasons"].append(f"уже принят: {st['merge'].get('result_sha')}")
+        return out
+    if st.get("drop"):
+        out["reasons"].append("акт отброшен Автором — ветки больше нет")
         return out
     if not st["close"]:
         if st["crash"] and st["adopt"]:
@@ -1008,7 +1066,8 @@ def acts_summary(limit: int = 12) -> list[dict]:
         return _ACTS_CACHE["val"]
 
     opens: dict = {}
-    closed, crashed, adopted, merged, rebased = set(), set(), {}, {}, {}
+    closed, crashed, adopted, merged, rebased = {}, {}, {}, {}, {}
+    dropped: set = set()
     reviews: dict = {}
     order: list = []
     for e in edits._feed_events(None):   # свежие первыми, один проход
@@ -1021,9 +1080,11 @@ def acts_summary(limit: int = 12) -> list[dict]:
             opens[act] = e
             order.append(act)
         elif k == "edit_close":
-            closed.add(act)
+            closed.setdefault(act, e)        # свежий close акта
         elif k == "edit_crash":
-            crashed.add(act)
+            crashed.setdefault(act, e)
+        elif k == "edit_drop":
+            dropped.add(act)
         elif k == "edit_adopt" and act not in adopted:
             adopted[act] = e
         elif k == "edit_merge" and act not in merged:
@@ -1032,19 +1093,34 @@ def acts_summary(limit: int = 12) -> list[dict]:
             reviews.setdefault(act, []).append(e)
 
     out = []
+
+    def _same_epoch(ev, opn):
+        # close/crash/adopt прежней жизни не считаются после продолжения
+        if not ev:
+            return False
+        oe, ee = opn.get("epoch"), ev.get("epoch")
+        if oe is not None and ee is not None:
+            return ee == oe
+        return (ev.get("id") or 0) >= (opn.get("id") or 0)
+
     for act in order[:limit]:
         e = opens[act]
         row = {"act": act, "voice": e.get("voice"),
                "seat": e.get("seat"), "task": (e.get("task") or "")[:80],
-               "project": e.get("project")}
+               "project": e.get("project"),
+               "continued": bool(e.get("continues"))}
+        is_closed = _same_epoch(closed.get(act), e)
+        is_crashed = _same_epoch(crashed.get(act), e)
         if act in merged:
             row["stage"] = "merged"
             row["result"] = (merged[act].get("result_sha") or "")[:12]
-        elif act in crashed and act in adopted:
+        elif act in dropped:
+            row["stage"] = "dropped"
+        elif is_crashed and _same_epoch(adopted.get(act), e):
             row["stage"] = "adopted"
-        elif act in crashed:
+        elif is_crashed:
             row["stage"] = "crashed"
-        elif act in closed:
+        elif is_closed:
             row["stage"] = "closed"
         else:
             row["stage"] = ("working" if leases.is_held(act)
@@ -1054,6 +1130,8 @@ def acts_summary(limit: int = 12) -> list[dict]:
                 head = branch_head(Path(e["project"]), act)
                 last = {}
                 for r in reviews.get(act, []):   # свежие первыми
+                    if (r.get("id") or 0) < (e.get("id") or 0):
+                        continue                 # ревизия прежней жизни акта
                     if (r.get("sha") == head
                             and r.get("voice") != row["voice"]
                             and r.get("verdict") in ("approve", "refuted")):
@@ -1083,7 +1161,7 @@ def pending_acts() -> list[str]:
             continue
         seen.add(act)
         st = act_state(act)
-        if st.get("merge") or leases.is_held(act):
+        if st.get("merge") or st.get("drop") or leases.is_held(act):
             continue
         if st["close"] or st["adopt"]:
             out.append(act)
@@ -1225,6 +1303,12 @@ def review_batch(acts: list[str] | None = None, *, reviewers=None,
                     eyes=REVIEWER_EYES.get(name, "files"),
                     seat=REVIEWER_SEATS.get(name, name),
                     batch_acts=acts, full_text=full))
+        # итог веера — по каждому акту пачки (см. _post_tally)
+        for act in acts:
+            head, _ps, _st = heads[act]
+            mine = [e for e in events if e.get("act") == act
+                    and e.get("kind") == "edit_review"]
+            _post_tally(post, act, head, mine)     # в ленту; в ответ — только edit_review
     finally:
         pf.unlink(missing_ok=True)
     return events

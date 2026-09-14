@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 import os
 import re
 import shlex
@@ -492,6 +493,191 @@ def open_edit(project: Path, task: str, voice: str,
 # можно любую строку (обнаружение, не запрет) — но случайный чужой
 # kind=edit_close от голоса в разговоре не должен закрывать акт.
 _CLOSE_AUTHORS = {"choir", "roundtable"}
+
+
+def _act_events(act: str) -> list[dict]:
+    """События акта из ленты, свежие первыми, только доверенных авторов."""
+    return [e for e in _feed_events(None)
+            if e.get("act") == act and e.get("author") in _CLOSE_AUTHORS]
+
+
+def _worktree_of(project: Path, branch: str) -> Path | None:
+    """Каталог, где ветка уже выписана (git worktree list), или None."""
+    out, _err = _git(project, "worktree", "list", "--porcelain")
+    cur = None
+    for line in (out or "").splitlines():
+        if line.startswith("worktree "):
+            cur = Path(line[9:].strip())
+        elif line.startswith("branch ") and line[7:].strip() == f"refs/heads/{branch}":
+            return cur
+    return None
+
+
+def continue_edit(project: Path, act: str, text: str,
+                  voice: str | None = None) -> dict:
+    """ПРОДОЛЖИТЬ правку (наказ Автора 2026-09-14: «продолжить —
+    семантически, чтобы продолжала текущую ветвь обсуждений»).
+
+    Та же ветка act/<акт>, то же рабочее дерево (унесла уборка —
+    восстанавливается с ветки), тот же исполнитель (или названный),
+    НОВАЯ эпоха. Задание исполнителю — прежнее задание, замечания ревизии
+    на текущей голове дословно (правило 3) и слова Автора. Без этого
+    «поправь по замечаниям» открывало новый акт с main: исполнитель не
+    видел ни ветки, ни замечаний, и чинил не то (акт 6535864e1323,
+    2026-09-14). Одобрения на новой голове сгорают сами: гейт считает
+    их по sha (checks). Продолжение — дописывание в ленту: история акта
+    остаётся, act_state берёт свежее открытие и close ЕГО эпохи.
+    """
+    text = (text or "").strip()
+    if not text:
+        raise EditRefused("пустое продолжение: скажите, что доработать")
+    evs = _act_events(act)
+    opn = next((e for e in evs if e.get("kind") == "edit_open"), None)
+    if opn is None:
+        raise EditRefused(f"акт {act} не открывался (edit_open нет)")
+    if any(e.get("kind") == "edit_merge" for e in evs):
+        raise EditRefused(f"акт {act} уже принят — продолжать нечего, "
+                          f"откройте новую правку")
+    if any(e.get("kind") == "edit_drop" for e in evs):
+        raise EditRefused(f"акт {act} отброшен — продолжать нечего")
+    if leases.is_held(act):
+        raise EditRefused(f"акт {act}: исполнитель ещё работает")
+    project = Path(opn.get("project") or project).resolve()
+    voice = (voice or opn.get("voice") or "").strip()
+    if voice not in EDIT_VOICES:
+        raise EditRefused(f"исполнитель {voice!r} не умеет правки "
+                          f"(умеют: {', '.join(EDIT_VOICES)})")
+    branch = f"act/{act}"
+    head, err = _git(project, "rev-parse", f"refs/heads/{branch}")
+    if head is None:
+        raise EditRefused(f"ветка {branch} не найдена — продолжать "
+                          f"нечего: {err}")
+    head = head.strip()
+    # Дерево — ТОЛЬКО то, где ветка выписана по данным git (путь из
+    # интента не доверяется: чужой каталог или main — ревизия: субагент,
+    # deepseek, grok); нет такого — восстановить с ветки в каталог актов.
+    _git(project, "worktree", "prune")
+    wt = _worktree_of(project, branch)
+    if wt is None:
+        wt = WT_DIR / act
+        if wt.exists() and wt.resolve().is_relative_to(WT_DIR.resolve()):
+            shutil.rmtree(wt, ignore_errors=True)   # огрызок без .git (gemini)
+        WT_DIR.mkdir(parents=True, exist_ok=True)
+        out, err = _git(project, "worktree", "add", str(wt), branch,
+                        timeout=120)
+        if out is None:
+            raise EditRefused(f"worktree не восстановлен с ветки: {err}")
+    cur, _err = _git(wt, "rev-parse", "--abbrev-ref", "HEAD")
+    if (cur or "").strip() != branch:
+        raise EditRefused(f"дерево {wt} стоит не на {branch} "
+                          f"({(cur or '').strip() or 'detached'}) — "
+                          f"коммиты ушли бы мимо ветки акта")
+    base_git, err = _git(project, "rev-parse", "--path-format=absolute",
+                         "--git-common-dir")
+    if base_git is None:
+        raise EditRefused(f"git-common-dir не взят: {err}")
+    # Замечания ревизии на ТЕКУЩЕЙ голове — дословно, старые первыми;
+    # свои же (исполнитель ревьюером не бывает) не попадут и так.
+    notes = []
+    for e in evs:
+        if (e.get("kind") == "edit_review" and e.get("sha") == head
+                and e.get("voice") != voice):
+            body = (e.get("full_text") or e.get("text") or "").strip()
+            notes.append(f"— {e.get('voice')} [{e.get('verdict') or e.get('status')}]:\n{body}")
+    notes.reverse()
+    base_sha = opn.get("base_sha") or ""
+    prompt = (f"ПРОДОЛЖЕНИЕ ПРАВКИ {act}. Вы уже работали над ней: ветка "
+              f"{branch}, рабочее дерево содержит вашу прежнюю работу "
+              f"(git log и git diff {base_sha[:12]}..HEAD покажут, что "
+              f"сделано). Продолжайте на ней же, не начинайте заново.\n\n"
+              f"Прежнее задание:\n{(opn.get('task') or '').strip()}\n\n"
+              + ((f"Ревизия стола по голове {head[:12]} (замечания — не "
+                  f"приказ: с чем не согласны, объясните в ответе; "
+                  f"закрывайте то, что считаете верным):\n"
+                  + "\n\n".join(notes) + "\n\n")
+                 if notes else "Ревизии на текущей голове нет.\n\n")
+              + f"Автор:\n{text}\n")
+    epoch = leases.mint_epoch()
+    # Эпоха продолжения обязана быть СТАРШЕ эпохи интента: act_state
+    # отличает close прежней жизни акта именно по ней (счётчик эпох
+    # монотонен на машине, но интент мог прийти с другой или из теста).
+    for _ in range(3):
+        if epoch > (opn.get("epoch") or 0):
+            break
+        epoch = leases.mint_epoch()
+    if epoch <= (opn.get("epoch") or 0):
+        raise EditRefused(f"эпоха {epoch} не старше эпохи интента "
+                          f"{opn.get('epoch')} — продолжение не различимо")
+    try:
+        cmd = EDIT_VOICES[voice](prompt, base_git.strip())
+    except (ValueError, OSError) as e:
+        raise EditRefused(f"argv исполнителя не собрался: {e}")
+    # В ленту — ИСХОДНОЕ задание и слова Автора, не собранный промпт:
+    # промпт несёт чужие вердикты по именам (ревьюеры читают task —
+    # правило 9) и рос бы снежным комом с каждым продолжением (ревизия:
+    # субагент, grok, gemini). Промпт целиком уходит только в argv.
+    ev = post("edit_open",
+              f"правка {act} [{voice}]: продолжение — {text[:200]}",
+              act=act, epoch=epoch, voice=voice, project=str(project),
+              base_sha=base_sha or None, branch=opn.get("branch"),
+              worktree=str(wt), task=(opn.get("task") or ""),
+              files=opn.get("files") or None,
+              continues=opn.get("id"), head_before=head, author_text=text,
+              reviews_in_prompt=len(notes), prompt_chars=len(prompt))
+    return {"act": act, "epoch": epoch, "worktree": wt, "cmd": cmd,
+            "project": project, "base_sha": base_sha, "event": ev,
+            "voice": voice}
+
+
+def drop_edit(project: Path, act: str, why: str = "", by: str = "arr") -> dict:
+    """ОТБРОСИТЬ правку: ветка и дерево удаляются, в ленту — edit_drop с
+    головой ветки (архив знает, что именно выброшено). Только не
+    принятую и не работающую. Событие — дописывание: история акта
+    (интент, закрытие, ревизии) остаётся."""
+    evs = _act_events(act)
+    opn = next((e for e in evs if e.get("kind") == "edit_open"), None)
+    if opn is None:
+        raise EditRefused(f"акт {act} не открывался (edit_open нет)")
+    if any(e.get("kind") == "edit_merge" for e in evs):
+        raise EditRefused(f"акт {act} принят — отбрасывать нечего")
+    if any(e.get("kind") == "edit_drop" for e in evs):
+        raise EditRefused(f"акт {act} уже отброшен")
+    if leases.is_held(act):
+        raise EditRefused(f"акт {act}: исполнитель ещё работает")
+    project = Path(opn.get("project") or project).resolve()
+    head, _err = _git(project, "rev-parse", f"refs/heads/act/{act}")
+    head = (head or "").strip()
+    _git(project, "worktree", "prune")
+    wt = _worktree_of(project, f"act/{act}")     # только по данным git
+    if wt is not None:
+        # два --force: дерево может быть грязным и с неотслеженными
+        # файлами; их и выбрасываем — так решил Автор
+        _out, err = _git(project, "worktree", "remove", "--force", "--force",
+                         str(wt))
+        if _out is None:
+            raise EditRefused(f"дерево {wt} не удалено: {err}")
+    stray = WT_DIR / act
+    if stray.exists() and stray.resolve().is_relative_to(WT_DIR.resolve()):
+        shutil.rmtree(stray, ignore_errors=True)  # огрызок, git его не числит
+    if head:
+        # Страховочный ref: коммиты отброшенной ветки не уходят в gc, а
+        # событие ниже называет sha — восстановить можно (ревизия:
+        # субагент, grok).
+        _git(project, "update-ref", f"refs/rt-dropped/act/{act}", head)
+        _git(project, "branch", "-D", f"act/{act}")
+    try:
+        return post("edit_drop",
+                    f"правка {act} отброшена ({by}): {why or 'без причины'}"
+                    + (f"; голова ветки была {head[:12]} (страховочный ref "
+                       f"refs/rt-dropped/act/{act})" if head
+                       else "; ветки уже не было"),
+                    act=act, epoch=opn.get("epoch"), voice=opn.get("voice"),
+                    head=head or None, why=why, by=by,
+                    backup_ref=(f"refs/rt-dropped/act/{act}" if head else None))
+    except Exception as e:                       # noqa: BLE001
+        raise EditRefused(f"ветка act/{act} удалена (страховочный ref есть), "
+                          f"но запись в ленту не легла: {e} — повторите, "
+                          f"запись допишется") from e
 
 
 def _feed_events(tail_bytes: int | None):

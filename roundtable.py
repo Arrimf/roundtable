@@ -668,6 +668,8 @@ _ACT_VIEW_CACHE: dict = {}          # act → (ключ, карточка)
 def _stage_of(st: dict, act: str) -> str:
     if st.get("merge"):
         return "merged"
+    if st.get("drop"):
+        return "dropped"
     if st.get("crash"):
         return "adopted" if st.get("adopt") else "crashed"
     if st.get("close"):
@@ -718,7 +720,7 @@ def act_view(act: str) -> dict:
             out[k] = {kk: e.get(kk) for kk in
                       ("ts", "text", "status", "rc", "head", "dirty", "autocommit",
                        "excluded", "elapsed_s", "result_sha", "by") if kk in e}
-    for r in reversed(st.get("reviews") or []):        # старые первыми
+    for r in reversed(st.get("reviews_all") or st.get("reviews") or []):   # старые первыми; прежней жизни — тоже (карточке)
         out["reviews"].append({kk: r.get(kk) for kk in
                                ("ts", "voice", "verdict", "status", "sha",
                                 "elapsed_s", "eyes", "seat", "full_text", "text")})
@@ -3560,8 +3562,25 @@ class Handler(BaseHTTPRequestHandler):
             task = (req.get("task") or req.get("text") or "").strip()
             voice = (req.get("voice") or "").strip() or "random"
             project = (req.get("project") or "").strip() or str(PROJECT or "")
+            # ПРОДОЛЖИТЬ правку (наказ Автора 2026-09-14): тот же акт,
+            # та же ветка и дерево, исполнитель прежний (или названный),
+            # задание — прежнее + замечания ревизии + слова Автора.
+            cont = (req.get("continue") or "").strip()
+            if cont and not re.fullmatch(r"[0-9a-f]{8,32}", cont):
+                return self._json(400, {"error": "кривой act в continue"})
+            if cont:
+                # проект — ИЗ ИНТЕНТА акта, не из запроса: резерв и
+                # проверка «одно кресло на проект» должны смотреть на тот
+                # же .git, что и продолжение (ревизия: субагент, grok)
+                opn0 = next((e for e in edits._act_events(cont)
+                             if e.get("kind") == "edit_open"), None)
+                if opn0 is None:
+                    return self._json(400, {"error": f"акт {cont} не открывался"})
+                project = opn0.get("project") or project
             if not task:
-                return self._json(400, {"error": "пустое задание"})
+                return self._json(400, {"error": "пустое задание"
+                                        if not cont else
+                                        "пустое продолжение: скажите, что доработать"})
             if not project:
                 return self._json(400, {"error": "нужен project: правка "
                                         "без репозитория некуда"})
@@ -3588,6 +3607,8 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e0:             # noqa: BLE001
                 print(f"/edit: проверка ленты: {e0}", file=sys.stderr)
             picked_note = ""
+            if cont and voice == "random":
+                voice = ""              # продолжение: исполнитель прежний
             if voice == "random":
                 # ДО резерва: пустой пул с уже взятым резервом оставлял
                 # проект «занятым» до перезапуска окна (нашёл codex), а
@@ -3626,8 +3647,13 @@ class Handler(BaseHTTPRequestHandler):
                 files = [x.strip() for x in files.split(",") if x.strip()]
             try:
                 try:
-                    ed = edits.open_edit(Path(project), task, voice,
-                                         files=files)
+                    if cont:
+                        ed = edits.continue_edit(Path(project), cont, task,
+                                                 voice or None)
+                        voice = ed["voice"]
+                    else:
+                        ed = edits.open_edit(Path(project), task, voice,
+                                             files=files)
                 except edits.EditRefused as e:
                     return self._json(400, {"error": str(e)})
                 except leases.EpochCorrupt as e:
@@ -3651,11 +3677,13 @@ class Handler(BaseHTTPRequestHandler):
                          if voice in edits.EDIT_GATES else []),
                        "--cmd-json",
                        json.dumps(ed["cmd"], ensure_ascii=False)],
-                      f"edit: [{voice}] {task[:60]}", [voice],
+                      (f"edit: [{voice}] продолжение {act}: {task[:50]}"
+                       if cont else f"edit: [{voice}] {task[:60]}"), [voice],
                       meta={"edit": act, "epoch": epoch,
                             "edit_project": str(ed["project"])},
                       note=picked_note,
-                      fields={"edit": act, "epoch": epoch, "voice": voice},
+                      fields={"edit": act, "epoch": epoch, "voice": voice,
+                              **({"continues": cont} if cont else {})},
                       env_extra={"CHOIR_THOUGHTS": "1" if req.get("thoughts") else "0"})
             finally:
                 with RUN_LOCK:
@@ -3753,6 +3781,34 @@ class Handler(BaseHTTPRequestHandler):
                 "act": act, "result_sha": ev.get("result_sha"),
                 "reviewed_by": ev.get("reviewed_by"),
                 "worktree_copy": ev.get("worktree_copy")})
+
+        if self.path == "/edit_drop":
+            # Отбросить правку: ветка и дерево удаляются, в ленте —
+            # edit_drop с головой ветки; история акта остаётся.
+            act = (req.get("act") or "").strip()
+            if not re.fullmatch(r"[0-9a-f]{8,32}", act):
+                return self._json(400, {"error": "кривой act"})
+            opn0 = next((e for e in edits._act_events(act)
+                         if e.get("kind") == "edit_open"), None)
+            proj0 = str(Path(opn0.get("project")).resolve()) if opn0 and opn0.get("project") else ""
+            with RUN_LOCK:
+                # ветку читает кресло, одиночный веер (meta.edit=act) и
+                # веер пачки (edit="batch"); резерв — открывающееся
+                # кресло того же проекта (ревизия: субагент, grok, gemini)
+                if any(t.get("edit") == act for t in RUNNING.values()):
+                    return self._json(409, {"error": "по акту идёт кресло или ревизия — дождитесь конца"})
+                if any(t.get("edit") == "batch" for t in RUNNING.values()):
+                    return self._json(409, {"error": "идёт ревизия пачки — дождитесь её конца"})
+                if proj0 and proj0 in _EDIT_RESERVED:
+                    return self._json(409, {"error": "кресло по этому проекту открывается — повторите через секунду"})
+            try:
+                ev = edits.drop_edit(Path(PROJECT or "."), act,
+                                     str(req.get("why") or "")[:300])
+            except edits.EditRefused as e:
+                return self._json(400, {"error": str(e)})
+            except Exception as e:              # noqa: BLE001
+                return self._json(500, {"error": f"не отброшен: {e}"})
+            return self._json(200, {"act": act, "event": ev.get("id")})
 
         if self.path == "/edit_adopt":
             act = (req.get("act") or "").strip()
@@ -4457,6 +4513,8 @@ padding:.2rem .5rem}
 color:var(--acc)}
 .ev.arr .who{color:var(--me)}
 .ev .t{white-space:pre-wrap;word-wrap:break-word;margin-top:.15rem}
+.ev .t.fold{max-height:13em;overflow:hidden}
+.ev .unfold{font:inherit;font-size:.76rem;background:none;border:1px solid var(--rule);color:var(--dim);border-radius:.3rem;padding:0 .4rem;cursor:pointer;margin-top:.2rem}
 .ev.sys .t{color:var(--dim);font-size:.86rem}
 .ev.err .who{color:var(--err)}
 .ev.err .t{color:var(--err)}
@@ -4851,7 +4909,7 @@ actFeedBox.onchange=function(){
   try{localStorage.setItem('rt-actfeed',actFeedBox.checked?'1':'0')}catch(_){}
   renderActs();
 };
-const STAGE_RU={working:'в кресле',opening:'открывается',closed:'закрыт',
+const STAGE_RU={dropped:'отброшена',working:'в кресле',opening:'открывается',closed:'закрыт',
   crashed:'ВЫЛЕТ',adopted:'adopt',merged:'принят',lost:'ветка потеряна'};
 function renderActs(){
   const box=document.getElementById('actlist');
@@ -4876,6 +4934,8 @@ function renderActs(){
       stagebar='кресло → диф → ревизия → merge '+(a.result||'');
     else if(a.stage==='lost')
       stagebar='ветка исчезла из репозитория';
+    else if(a.stage==='dropped')
+      stagebar='отброшена Автором — ветки нет, история в ленте';
     else if(a.stage!=='working'&&a.stage!=='opening')
       stagebar='кресло → диф → ревизия '+ap+'/'+q+
         (ref?(' (ОТКАЗ: '+a.refused.join(',')+')'):'');
@@ -5099,7 +5159,12 @@ function add(ev){
   const sys=(a==='choir'||a==='roundtable'||k==='act_status'||
              k==='lot_commit'||k==='lot_reveal');
   el.className='ev '+(k==='error'?'err':(a==='arr'?'arr':(sys?'sys':'')))+(ev.thread?' thr':'');
-  const body=(ev.text||'')||(k==='error'?'(пусто)':'');
+  let body=(ev.text||'')||(k==='error'?'(пусто)':'');
+  // Ревизия — ЦЕЛИКОМ (правило 3; Автор 2026-09-14: «в ленте я вижу
+  // обрезанные ответы»): text события — превью в 400 символов, полный
+  // текст в full_text. Длинную сворачиваем, кнопка разворачивает.
+  let fold=false;
+  if(k==='edit_review'&&ev.full_text){const m=/^(ревизия [^:]*:)/.exec(ev.text||''); body=(m?m[1]+'\n':'')+ev.full_text; fold=ev.full_text.length>700}
   const det=ev.detail?'<div class="det">'+esc(ev.detail)+'</div>':'';
   const badge=(k&&k!=='say'?'<span class="kind">'+esc(k)+'</span>':'')+
     (ev.thread?'<span class="kind" title="ответ в адресной ветке между голосами">↳ ветка '+esc(String(Number(ev.thread)||''))+'</span>':'')+
@@ -5107,7 +5172,9 @@ function add(ev){
   const tv=tsView(ev.ts);
   el.innerHTML='<span class="who">'+esc(a)+'</span>'+badge+
     '<span class="ts">'+esc(tv.short)+'</span>'+
-    '<div class="t">'+esc(body)+'</div>'+det;
+    '<div class="t'+(fold?' fold':'')+'">'+esc(body)+'</div>'+
+    (fold?'<button class="unfold" type="button">развернуть ('+ev.full_text.length+' симв.)</button>':'')+det;
+  const ub=el.querySelector('.unfold'); if(ub)ub.onclick=function(){const t=el.querySelector('.t'); const f=t.classList.toggle('fold'); ub.textContent=f?('развернуть ('+ev.full_text.length+' симв.)'):'свернуть'};
   // Полная метка — СВОЙСТВОМ, а не внутрь строки html: esc() экранирует
   // < > &, но не кавычку, а тут значение попадало бы в атрибут. Поле ts
   // приходит из ленты, то есть снаружи; строка вида `x" onmouseover=…`
@@ -6367,7 +6434,8 @@ document.getElementById('quick').onclick=()=>sendQuick();
    +'#gatecard button{font:inherit;background:var(--bg);color:var(--ink);border:1px solid var(--rule);border-radius:.3rem;padding:.15rem .6rem;cursor:pointer}'
    +'#gatecard button:hover{border-color:var(--acc)}#gatecard details{margin:.3rem 0}#gatecard summary{cursor:pointer;color:var(--dim)}'
    +'#gatecard pre{white-space:pre-wrap;word-break:break-word;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.8rem;background:var(--bg);border:1px solid var(--rule);border-radius:.3rem;padding:.5rem .7rem;max-height:60vh;overflow:auto;margin:.3rem 0}'
-   +'#gatecard .ok{color:#7fc97f}#gatecard .no{color:var(--err)}#gatecard .dim{color:var(--dim)}';
+   +'#gatecard .ok{color:#7fc97f}#gatecard .no{color:var(--err)}#gatecard .dim{color:var(--dim)}'
+   +'#gatecard .controw{margin-top:.5rem;border-top:1px solid var(--rule);padding-top:.4rem}#gatecard .controw textarea{width:100%;box-sizing:border-box;font:inherit;background:var(--bg);color:var(--ink);border:1px solid var(--rule);border-radius:.3rem;padding:.3rem .5rem;resize:vertical}';
   (document.head||document.body||feed0).appendChild(css);
   const feed=document.getElementById('feed'), top=document.getElementById('feedtop');
   const qb=document.getElementById('quickbar');
@@ -6472,13 +6540,13 @@ document.getElementById('quick').onclick=()=>sendQuick();
   // кнопки гейта по стадии, вердикты ревьюеров с полными текстами, диф.
   const gate=document.createElement('div'); gate.id='gatecard'; gate.hidden=true;
   wrap.appendChild(head); wrap.appendChild(box); wrap.appendChild(gate);
-  const GATE={edit:'',timer:null,open:{}};
+  const GATE={edit:'',timer:null,open:{},draft:{}};
   function el(tag,cls,text){const e=document.createElement(tag); if(cls)e.className=cls; if(text!==undefined)e.textContent=text; return e}
   function gateBtn(row,label,fn){const b=el('button','',label); b.onclick=fn; row.appendChild(b); return b}
   function renderGate(v){const sig=JSON.stringify(v); if(gate.dataset.sig===sig)return; gate.dataset.sig=sig; // не срывать клик и прокрутку дифа перестройкой (ревьюер)
     gate.innerHTML='';
     const isRev=SEEN[TERM.id]&&SEEN[TERM.id].kind==='review';
-    const h=el('h4','',(isRev?'ревизия правки ':'правка ')+v.act+' ['+(v.voice||'?')+(v.seat&&v.seat!==v.voice?'/'+v.seat:'')+'] · '+({opening:'открыт',working:'в работе',closed:'закрыт',crashed:'вылет',adopted:'adopt',merged:'принят',lost:'ветка потеряна'}[v.stage]||v.stage||'?'));
+    const h=el('h4','',(isRev?'ревизия правки ':'правка ')+v.act+' ['+(v.voice||'?')+(v.seat&&v.seat!==v.voice?'/'+v.seat:'')+'] · '+({opening:'открыт',working:'в работе',closed:'закрыт',crashed:'вылет',adopted:'adopt',dropped:'отброшен',merged:'принят',lost:'ветка потеряна'}[v.stage]||v.stage||'?'));
     gate.appendChild(h);
     if(v.task)gate.appendChild(el('div','dim','задание: '+String(v.task).slice(0,300)));
     if(v.close)gate.appendChild(el('div',v.close.status==='done'?'':'no','закрытие: '+(v.close.text||'')+(v.close.autocommit?' · коммит сделала обёртка':'')+(v.close.excluded&&v.close.excluded.length?' · вне коммита: '+v.close.excluded.join(', '):'')));
@@ -6500,6 +6568,23 @@ document.getElementById('quick').onclick=()=>sendQuick();
       gatePost('/edit_adopt',{act:a},function(){return 'adopt: '+a})});
     gateBtn(row,'⟳',function(){loadGate(true)}).title='Обновить карточку сейчас (сама она обновляется раз в 6 с, пока акт не принят)';
     gate.appendChild(row);
+    // ПРОДОЛЖИТЬ (наказ Автора 2026-09-14: «продолжить — семантически,
+    // чтобы продолжала текущую ветвь обсуждений»): тот же исполнитель,
+    // та же ветка, в задании — прежнее задание, замечания ревизии и
+    // эти слова. ОТБРОСИТЬ — ветка удаляется, история остаётся.
+    if(v.stage==='closed'||v.stage==='adopted'||v.stage==='crashed'||v.stage==='lost'){
+      const cw=el('div','controw'); const cr=el('div','row');
+      if(v.stage!=='lost'){   // ветки нет — продолжать нечего (ревьюеры)
+        const ta=document.createElement('textarea'); ta.rows=2; ta.placeholder='продолжить: что доработать, что ответить на замечания, куда двигаться дальше — исполнителю уйдёт прежнее задание, замечания ревизии на этой голове и эти слова';
+        ta.value=GATE.draft[a]||''; ta.oninput=function(){GATE.draft[a]=ta.value}; cw.appendChild(ta);
+        const cb=gateBtn(cr,'Продолжить',function(){const t=(ta.value||'').trim(); if(!t){vnote&&vnote('продолжение пустое: скажите, что доработать');ta.focus();return}
+          if(!confirm('Продолжить правку '+a+' тем же исполнителем ['+(v.voice||'?')+'] на той же ветке? Прежние вердикты в счёт не идут, авторевизия пойдёт снова.'))return;
+          gatePost('/edit',{continue:a,text:t,thoughts:thoughtsOn()},function(j){GATE.draft[a]=''; return 'продолжение '+a+' ушло исполнителю ['+j.voice+'], эпоха '+j.epoch})});
+        cb.title='Тот же акт, та же ветка и рабочее дерево, тот же исполнитель (галочки пула не спрашиваются), новая эпоха аренды. Исполнитель получит прежнее задание, замечания ревизии на текущей голове дословно и ваш текст; ревьюерам прежние вердикты не показываются.'}
+      const db=gateBtn(cr,'Отбросить',function(){const why=prompt('Отбросить правку '+a+'? Ветка и рабочее дерево удаляются (коммиты остаются под refs/rt-dropped/act/'+a+'), в ленте — запись с головой ветки. Причина (в ленту):',''); if(why===null)return;
+        gatePost('/edit_drop',{act:a,why:why},function(j){return 'правка '+a+' отброшена'})});
+      db.title='Удалить ветку act/'+a+' и рабочее дерево; коммиты остаются под страховочным ref refs/rt-dropped/act/'+a+'. История акта (интент, закрытие, ревизии) остаётся в ленте, плюс запись edit_drop.';
+      cw.appendChild(cr); gate.appendChild(cw)}
     if(v.reviews&&v.reviews.length){const rv=el('div','','ревизии:'); gate.appendChild(rv);
       v.reviews.forEach(function(r){const k='r'+r.ts+'|'+r.voice; const d=document.createElement('details'); d.open=!!GATE.open[k];
         d.ontoggle=function(){GATE.open[k]=d.open};
@@ -6513,7 +6598,7 @@ document.getElementById('quick').onclick=()=>sendQuick();
     if(document.hidden){GATE.timer=setTimeout(function(){loadGate(false)},3000);return}
     let done=false;
     try{const r=await fetch('/act_view?act='+encodeURIComponent(e)); const j=await r.json();
-      if(GATE.edit!==e)return; if(!r.ok){gate.dataset.sig='';gate.textContent=(j&&j.error)||('ошибка '+r.status)} else {renderGate(j); done=(j.stage==='merged'||j.stage==='lost')}}
+      if(GATE.edit!==e)return; if(!r.ok){gate.dataset.sig='';gate.textContent=(j&&j.error)||('ошибка '+r.status)} else {renderGate(j); done=(j.stage==='merged'||j.stage==='lost'||j.stage==='dropped')}}
     catch(_){gate.dataset.sig='';gate.textContent='карточка акта: сервер не ответил'}
     if(done)return;   // терминальная стадия: меняться нечему, кнопка ⟳ обновит вручную
     GATE.timer=setTimeout(function(){loadGate(false)},force?2000:6000)}
