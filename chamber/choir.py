@@ -45,6 +45,7 @@ import sys
 import threading
 
 import names                                    # noqa: E402  имена файлов латиницей
+import transcript                               # noqa: E402  стенограмма акта
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -604,12 +605,21 @@ def _from_stream_json(out: str, ev_type: str, field: str) -> str:
     return text.strip()
 
 
-def _pump(stream, sink: list[str], clock: list[float]) -> None:
-    """Тянуть поток построчно, отмечая КАЖДУЮ строку как признак жизни."""
+def _pump(stream, sink: list[str], clock: list[float], tee=None) -> None:
+    """Тянуть поток построчно, отмечая КАЖДУЮ строку как признак жизни.
+    tee — приёмник стенограммы: строка уходит туда по мере прихода."""
     try:
         for line in iter(stream.readline, ""):
             sink.append(line)
             clock[0] = time.monotonic()
+            if tee is not None:
+                try:
+                    # только целыми строками: хвост без \n склеивался бы со
+                    # следующей строкой дирижёра (ревизия: субагент, codex, deepseek)
+                    tee((line if line.endswith("\n") else line + "\n")
+                        .encode("utf-8", "replace"))
+                except Exception as e:             # noqa: BLE001  приёмник — не ответ
+                    print(f"стенограмма не пишется: {e}", file=sys.stderr)
     except (ValueError, OSError):
         pass                      # поток закрыт из-под нас при kill — норма
     finally:
@@ -620,7 +630,7 @@ def _pump(stream, sink: list[str], clock: list[float]) -> None:
 
 
 def run_watched(argv: list[str], *, cwd: str, hard_limit: int,
-                idle_limit: int = IDLE_LIMIT) -> dict:
+                idle_limit: int = IDLE_LIMIT, sink=None) -> dict:
     """Запуск с двумя лимитами: на тишину и на общее время.
 
     Возвращает stdout/stderr целиком (собранные по ходу), код возврата,
@@ -632,9 +642,9 @@ def run_watched(argv: list[str], *, cwd: str, hard_limit: int,
     out: list[str] = []
     err: list[str] = []
     clock = [time.monotonic()]
-    pumps = [threading.Thread(target=_pump, args=(proc.stdout, out, clock),
+    pumps = [threading.Thread(target=_pump, args=(proc.stdout, out, clock, sink),
                               daemon=True),
-             threading.Thread(target=_pump, args=(proc.stderr, err, clock),
+             threading.Thread(target=_pump, args=(proc.stderr, err, clock, sink),
                               daemon=True)]
     for t in pumps:
         t.start()
@@ -1295,7 +1305,16 @@ class _FifoReader:
 # в ревизии вкладок вывода). В слепой фазе они копятся здесь и печатаются
 # пачкой по закрытии; в открытых фазах печатаются сразу.
 BLIND_NOTES: list[str] = []
+BLIND_TR: dict[str, list[bytes]] = {}     # фаза: голос → куски потока (см. _tr_sink)
+HOLD_OPEN = False      # открытая фаза нескольких голосов: копить до конца голоса
 _BLIND_NOTES_LOCK = threading.Lock()
+
+
+def _out(msg: str) -> None:
+    """В лог акта И в стенограмму (chamber/transcript.py): строки дирижёра,
+    которые человек должен видеть во вкладке рядом с потоком голоса."""
+    print(msg, flush=True)
+    transcript.line(msg)
 
 
 def _say(visibility: str, msg: str) -> None:
@@ -1303,7 +1322,24 @@ def _say(visibility: str, msg: str) -> None:
         with _BLIND_NOTES_LOCK:
             BLIND_NOTES.append(msg)
     else:
-        print(msg, flush=True)
+        _out(msg)
+
+
+def _tr_sink(name: str, visibility: str):
+    """Приёмник потока CLI голоса для стенограммы: None — стенограммы нет
+    (запуск не из окна); в слепой фазе — память до закрытия (правило 8.5:
+    на диске нет ни байта чужого ответа, пока фаза идёт); иначе — файл по
+    мере прихода."""
+    if transcript.path() is None:
+        return None
+    if visibility == "blind" or HOLD_OPEN:
+        # HOLD_OPEN: открытая фаза нескольких голосов — потоки шли бы в
+        # один файл вперемешку построчно (ревизия: субагент, grok);
+        # копим и выкладываем, как только голос закончил (_run_phase)
+        with _BLIND_NOTES_LOCK:
+            buf = BLIND_TR.setdefault(name, [])
+        return buf.append                      # list.append — атомарно под GIL
+    return transcript.write
 
 
 _THOUGHTS_RE = re.compile(r"💭 мысли модели.*?💭 конец мыслей\n?", re.S)
@@ -1317,10 +1353,17 @@ def strip_thoughts(text: str) -> str:
 
 
 def flush_blind_notes() -> None:
+    """Фаза закрыта: сначала потоки голосов в стенограмму (по алфавиту —
+    порядок готовности сам по себе улика), потом заметки очереди."""
     with _BLIND_NOTES_LOCK:
         notes, BLIND_NOTES[:] = list(BLIND_NOTES), []
+        streams = dict(BLIND_TR)
+        BLIND_TR.clear()
+    for n in sorted(streams):
+        for chunk in streams[n]:
+            transcript.write(chunk)
     for msg in notes:
-        print(msg, flush=True)
+        _out(msg)
 
 
 def ask_one(name: str, prompt: str, round_id: str, phase: str,
@@ -1427,8 +1470,14 @@ def ask_one(name: str, prompt: str, round_id: str, phase: str,
                 # (нашёл codex). Берём девять десятых лимита.
                 argv += ["--timeout", str(max(5, min(limit - 5,
                                                      limit * 9 // 10)))]
+            tee = _tr_sink(name, visibility)
+            if tee is not None:
+                tee(transcript.head(name, argv, prompt,
+                                    channel=(ch or {}).get("name", ""))
+                    .encode("utf-8", "replace"))
             return run_watched(argv, cwd=voice_cwd(name), hard_limit=limit,
-                               idle_limit=idle if idle is not None else limit)
+                               idle_limit=idle if idle is not None else limit,
+                               sink=tee)
 
         if v.get("serial"):
             # ВОРОТА. Очередь вместо падения — и очередь, названная вслух:
@@ -1599,13 +1648,25 @@ def _run_phase(names: list[str], prompts: dict[str, str], round_id: str,
     blind = (visibility == "blind")
     held: list[dict] = []
     results: dict[str, dict] = {}
-    with ThreadPoolExecutor(max_workers=len(names)) as ex:
+    global HOLD_OPEN
+    with _BLIND_NOTES_LOCK:
+        BLIND_TR.clear()          # остатки упавшей фазы — не в этот акт (ревизия: субагент)
+    HOLD_OPEN = (not blind and len(names) > 1)
+    try:
+      with ThreadPoolExecutor(max_workers=len(names)) as ex:
         futs = {ex.submit(ask_one, n, prompts[n], round_id, phase, parent,
                           visibility): n for n in names}
         deferred: list[str] = []
         for f in as_completed(futs):
             rec = f.result()
             results[rec["voice"]] = rec
+            if HOLD_OPEN:
+                # открытая фаза: поток голоса — в стенограмму, как только
+                # он закончил, перед его итоговой строкой
+                with _BLIND_NOTES_LOCK:
+                    chunks = BLIND_TR.pop(rec["voice"], [])
+                for chunk in chunks:
+                    transcript.write(chunk)
             if blind:
                 held.append(rec)
             else:
@@ -1632,14 +1693,16 @@ def _run_phase(names: list[str], prompts: dict[str, str], round_id: str,
                 # печатается только обезличенный счётчик; поимённые строки
                 # выходят пачкой по закрытии фазы, по алфавиту.
                 deferred.append(line)
-                print(f"· готово {len(results)}/{len(names)}", flush=True)
+                _out(f"· готово {len(results)}/{len(names)}")
             else:
-                print(line, flush=True)
+                _out(line)
         if deferred:
-            print("слепая фаза закрыта — поимённо:", flush=True)
-            flush_blind_notes()          # очередь, запасные линии, повторы
+            _out("слепая фаза закрыта — поимённо:")
+            flush_blind_notes()          # потоки голосов, очередь, запасные линии, повторы
             for line in sorted(deferred, key=lambda l: l.split()[1] if len(l.split()) > 1 else l):
-                print(line, flush=True)
+                _out(line)
+    finally:
+        HOLD_OPEN = False
 
     # Каскад: если ВСЕ упали, и упали мгновенно — это почти наверняка
     # общий сбой (сеть, шлюз), а не мнение стола. Молча записать четыре
@@ -1649,7 +1712,7 @@ def _run_phase(names: list[str], prompts: dict[str, str], round_id: str,
         # Фаза закрыта — только теперь ответы становятся видимыми.
         for rec in sorted(held, key=lambda r: r["ts"]):
             _append(rec)
-        print(f"\nслепая фаза закрыта: {len(held)} записей записано в комнату")
+        _out(f"\nслепая фаза закрыта: {len(held)} записей записано в комнату")
 
     bad = [r for r in results.values() if r["status"] != "ok"]
     if len(bad) == len(results) and all(
@@ -2132,7 +2195,7 @@ def cmd_expand(a: argparse.Namespace) -> int:
 - Пишите по-русски, Markdown. Выдайте ТОЛЬКО текст затравки, без
   вступлений вроде «вот моя затравка».
 """
-    print(f"затравку разворачивает: {who}\n")
+    _out(f"затравку разворачивает: {who}\n")
     rec = ask_one(who, prompt, a.round, "expand", None, "blind", use_role=False)
     flush_blind_notes()      # затравка — один голос, скрывать нечего; заметки сразу
     rec["role"] = "seed_expanded"
@@ -2457,8 +2520,8 @@ def cmd_run(a: argparse.Namespace) -> int:
                  "choir": CHOIR_VERSION,
                  "text": f"такт {status}: {reason}", **extra})
         mark = {"done": "✓", "stopped": "■"}.get(status, "✗")
-        print(f"\n{mark} такт «{a.round}» {status} за {el:.0f} с — {reason}")
-        print(f"  прошли фазы: {', '.join(done) or 'ни одной'}")
+        _out(f"\n{mark} такт «{a.round}» {status} за {el:.0f} с — {reason}")
+        _out(f"  прошли фазы: {', '.join(done) or 'ни одной'}")
         print(f"  журнал: {ROOM}")
         _ding()
         return code
@@ -2471,17 +2534,18 @@ def cmd_run(a: argparse.Namespace) -> int:
         print(f"\n■ найден стоп-файл — фаза {next_phase} не начата")
         return True
 
-    print(f"══ такт «{a.round}»: {plan}")
-    print(f"   вопрос: {seed_path}  (sha {_sha(question)})")
-    print(f"   голоса: {', '.join(names)}")
-    print(f"   прервать штатно:  touch {stop}\n")
+    _out(f"══ такт «{a.round}»: {plan}")
+    transcript.line(f"❯ {question.strip()}")
+    _out(f"   вопрос: {seed_path}  (sha {_sha(question)})")
+    _out(f"   голоса: {', '.join(names)}")
+    _out(f"   прервать штатно:  touch {stop}\n")
 
     # ── фаза: ЖРЕБИЙ (правило 11) ────────────────────────────────────
     # Fail-closed зашит в cmd_pick: маяк недоступен → код 3 и никакого
     # локального random(). Такт эту строгость не смягчает — иначе он бы
     # тихо вернул назначение ведущего, ради отмены которого жребий и
     # заведён.
-    print("── 1. жребий: кто ведёт раунд ──")
+    _out("── 1. жребий: кто ведёт раунд ──")
     # У раунда МОЖЕТ уже быть ведущий: такт перезапускают после стопа или
     # сбоя. Бросить жребий второй раз значит молча заменить ведущего, чью
     # затравку стол уже читал, — автомат решил бы то, что решает жребий
@@ -2524,7 +2588,7 @@ def cmd_run(a: argparse.Namespace) -> int:
     # ── фаза: ЗАТРАВКА (правило 11.5) ────────────────────────────────
     if halted_by_author("expand"):
         return finish("stopped", "остановлен Автором перед фазой expand", 0)
-    print(f"\n── 2. затравка: разворачивает {conductor} ──")
+    _out(f"\n── 2. затравка: разворачивает {conductor} ──")
     zt = rounds_dir() / names.round_file("SEED-", a.round)
     if cmd_expand(argparse.Namespace(round=a.round, seed=str(seed_path),
                                      by=None, out=str(zt),
@@ -2541,7 +2605,7 @@ def cmd_run(a: argparse.Namespace) -> int:
     # ── фаза: СЛЕПОЙ РАУНД (правило 9) ───────────────────────────────
     if halted_by_author("ask"):
         return finish("stopped", "остановлен Автором перед слепой фазой", 0)
-    print(f"\n── 3. слепая фаза: {len(names)} голосов ──")
+    _out(f"\n── 3. слепая фаза: {len(names)} голосов ──")
     seen = _seen_ids(a.round)
     cmd_ask(argparse.Namespace(round=a.round, seed=str(zt), voices=a.voices,
                                out=None, timeout=a.timeout,
@@ -2583,7 +2647,7 @@ def cmd_run(a: argparse.Namespace) -> int:
         if halted_by_author(f"rebut {i}/{rebuts}"):
             return finish("stopped",
                           f"остановлен Автором перед витком критики {i}", 0)
-        print(f"\n── 4.{i} открытая критика, виток {i} из {rebuts} ──")
+        _out(f"\n── 4.{i} открытая критика, виток {i} из {rebuts} ──")
         seen = _seen_ids(a.round)
         cmd_rebut(argparse.Namespace(round=a.round, out=None, force=False,
                                      effort=a.effort, focus=a.focus))
@@ -2667,7 +2731,7 @@ def cmd_run(a: argparse.Namespace) -> int:
         if attempt and halted_by_author("следующая попытка свода"):
             return finish("stopped", "остановлен Автором на своде", 0,
                           summary_tries=tried)
-        print(f"\n── 5. свод (попытка {attempt + 1} из {RUN_SUMMARY_TRIES}) ──")
+        _out(f"\n── 5. свод (попытка {attempt + 1} из {RUN_SUMMARY_TRIES}) ──")
         rc = cmd_summarize(argparse.Namespace(round=a.round, by=who,
                                               out=str(card), effort=a.effort))
         sums = [r for r in read_round(a.round) if r.get("role") == "summary"]
@@ -4127,7 +4191,7 @@ def cmd_debts(a: argparse.Namespace) -> int:
     if voices:
         print("  добрать: choir.py catchup [--round …]")
 
-    print(f"\n── ДОЛГИ РЕШЕНИЙ ── {len(dec) or 'нет'}")
+    _out(f"\n── ДОЛГИ РЕШЕНИЙ ── {len(dec) or 'нет'}")
     for x in dec:
         print(f"  {x['round']:<22} {x['status']:<12} {x['kind']:<40} "
               f"{x['what']:<18} {_age_str(x.get('ts'))}")
@@ -4268,7 +4332,7 @@ def cmd_inbox(a: argparse.Namespace) -> int:
         try:
             entries = list(os.scandir(d))
         except OSError as e:
-            print(f"\n── {name} ── каталог не читается: {e}")
+            _out(f"\n── {name} ── каталог не читается: {e}")
             continue
         for e in entries:
             if e.name == ".gitkeep":
@@ -4301,7 +4365,7 @@ def cmd_inbox(a: argparse.Namespace) -> int:
         how = ("файлов не видит вовсе (прямой HTTP) — сам сюда не положит"
                if _no_files(name) else "может получить право записи "
                "(пока не выдано)")
-        print(f"\n── {name} ── {len(rows) or 'пусто'}   [{how}]")
+        _out(f"\n── {name} ── {len(rows) or 'пусто'}   [{how}]")
         for ts, nm, what in rows[:INBOX_CAP]:
             print(f"    {nm:<44} {what:<24} "
                   f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(ts))}")

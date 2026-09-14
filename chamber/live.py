@@ -56,6 +56,7 @@ import sys
 import threading
 
 import names                                    # noqa: E402  имена файлов латиницей
+import transcript                               # noqa: E402  стенограмма акта
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -1021,21 +1022,52 @@ def build_prompt(name: str, st: dict, events: list[dict], first: bool,
 # Ход одного голоса
 # ─────────────────────────────────────────────────────────────────────
 
-# ── СЫРОЙ ВЫВОД CLI ДЛЯ ВКЛАДКИ «БЫСТРЫЙ ОТВЕТ» (наказ Автора 2026-09-06) ──
-# Автор хочет видеть ход работы голоса, как в терминале: мысли модели,
-# вызовы инструментов, печать канала — по мере прихода, а не разом в конце
-# (правило 17). Окно задаёт RT_RAW=1 ТОЛЬКО быстрому вопросу: там один
-# голос и слепой фазы нет; для слепого хода переменной нет, и сырой вывод
-# на диск не ложится (правило 8.5: файл под тем же пользователем читает
-# любой агент). Путь — <RT_ACT_DIR>/<RT_ACT_ID>.raw.log, его хвост отдаёт
-# GET /act_log?kind=raw.
+# ── СТЕНОГРАММА АКТА (наказ Автора 2026-09-06; доработка 2026-09-14) ──
+# Автор хочет видеть ход работы голоса, как в терминале Claude Code:
+# вопрос, кто отвечает и какой командой, мысли модели и вызовы инструментов
+# по мере прихода, ответ, итог (правило 17). Одна стенограмма на акт —
+# <RT_ACT_DIR>/<RT_ACT_ID>.raw.log; её хвост отдаёт GET /act_log?kind=raw,
+# и вкладки окна («дирижёр», «быстрый ответ») читают её вместо печати
+# процесса, как только она появилась. Сюда ложится всё, что дирижёр
+# печатает в лог акта (_note/_out), плюс шапка каждого хода и поток
+# stdout+stderr CLI или адаптера.
+# Первая редакция (RT_RAW=1 только быстрому вопросу) давала голый stdout
+# одного голоса: без вопроса, без шапки, без итога, а «дирижёр» видел
+# одни заметки — Автор 2026-09-14: «дирижёр отдаёт только сухую
+# статистику». Выключатель снят: решает режим хода, не переменная
+# окружения, которую можно унаследовать из оболочки (нашёл grok).
+# СЛЕПОЙ ХОД (правило 8.5): шапка и поток каждого голоса копятся В ПАМЯТИ
+# (HOLD_TR) и ложатся в стенограмму разом по закрытии хода, в порядке
+# публикации; до закрытия на диске нет ни байта чужого ответа — файл под
+# тем же пользователем читает любой агент.
 # ЗАМЕТКИ ХОДА В СЛЕПОМ ПЕРВОМ ХОДЕ: поимённые «● grok 12.3 с 512 симв.»,
 # очередь, запасная линия, откат модели — ложатся в лог акта на диске, пока
 # другие голоса ещё думают, а лог читает любой агент под тем же
 # пользователем (правило 8.5; нашёл grok в ревизии вкладок вывода). В слепом
 # ходе они копятся и печатаются пачкой по закрытии; иначе — сразу.
 HOLD_NOTES: list[str] | None = None
+HOLD_TR: dict[str, list[bytes]] | None = None    # слепой ход: голос → куски
 _HOLD_LOCK = threading.Lock()
+
+
+def _transcript_path() -> Path | None:
+    return transcript.path()
+
+
+def _tr_write(data: bytes) -> None:
+    transcript.write(data)
+
+
+def _tr(msg: str) -> None:
+    """Строка дирижёра в стенограмму (в лог акта она уже напечатана)."""
+    transcript.line(msg)
+
+
+def _out(msg: str) -> None:
+    """Напечатать в лог акта И в стенограмму — для строк дирижёра, которые
+    человек должен видеть во вкладке рядом с потоком голоса."""
+    print(msg, flush=True)
+    _tr(msg)
 
 
 def _note(msg: str) -> None:
@@ -1043,7 +1075,25 @@ def _note(msg: str) -> None:
         if HOLD_NOTES is not None:
             HOLD_NOTES.append(msg)
             return
-    print(msg, flush=True)
+    _out(msg)
+
+
+def _tr_sink(name: str):
+    """Приёмник потока CLI голоса: None — стенограммы нет (запуск не из
+    окна); в слепом ходе — память до закрытия; иначе файл по мере прихода."""
+    if _transcript_path() is None:
+        return None
+    with _HOLD_LOCK:
+        if HOLD_TR is not None:
+            buf = HOLD_TR.setdefault(name, [])
+            return buf.append           # list.append — атомарно под GIL
+    return _tr_write
+
+
+def _tr_head(name: str, cmd: list[str], ptext: str, ch: dict | None,
+             cont: bool) -> str:
+    return transcript.head(name, cmd, ptext, channel=(ch or {}).get("name", ""),
+                           cont=cont)
 
 
 _THOUGHTS_RE = re.compile(r"💭 мысли модели.*?💭 конец мыслей\n?", re.S)
@@ -1055,15 +1105,6 @@ def strip_thoughts(text: str) -> str:
     напишет «429» или «rate limit» — и линия выключилась бы на сутки
     (ревьюер)."""
     return _THOUGHTS_RE.sub("", text or "")
-
-
-def _raw_log_path() -> Path | None:
-    if os.environ.get("RT_RAW") != "1":
-        return None
-    d, a = os.environ.get("RT_ACT_DIR"), os.environ.get("RT_ACT_ID")
-    if not d or not a:
-        return None
-    return Path(d) / f"{a}.raw.log"
 
 
 # Группы CLI, запущенных тройником: окно прерывает акт SIGTERM'ом в группу
@@ -1095,23 +1136,23 @@ except (ValueError, OSError):
 
 
 def _run_capture(cmd: list[str], cwd, timeout: float,
-                 raw: Path | None) -> subprocess.CompletedProcess:
+                 sink) -> subprocess.CompletedProcess:
     """subprocess.run(capture_output=True, text=True) с тройником.
 
-    Без raw — прежний вызов, бит-в-бит. С raw — Popen и два читателя:
-    каждая порция stdout/stderr дописывается в файл по мере прихода и
-    копится в память, чтобы разбор ответа остался прежним. Таймаут
-    поднимает тот же TimeoutExpired с накопленным stderr — ветка
-    обработки в turn() не меняется."""
-    if raw is None:
+    Без sink — прежний вызов, бит-в-бит. С sink (callable(bytes)) — Popen
+    и два читателя: каждая порция stdout/stderr отдаётся приёмнику по
+    мере прихода (стенограмма на диске или память слепого хода) и
+    копится, чтобы разбор ответа остался прежним. Таймаут поднимает тот
+    же TimeoutExpired с накопленным stderr — ветка обработки в turn() не
+    меняется."""
+    if sink is None:
         return subprocess.run(cmd, capture_output=True, text=True,
                               timeout=timeout, cwd=str(cwd))
-    raw.parent.mkdir(parents=True, exist_ok=True)
     bufs: dict[str, list[bytes]] = {"out": [], "err": []}
     lock = threading.Lock()
-    closed = False           # файл закрыт — читатель больше не пишет в него
+    closed = False           # ход завершён — читатель больше не пишет
     deadline = time.monotonic() + timeout
-    with raw.open("ab") as rf:
+    if True:                 # (уровень отступа прежнего `with raw.open()`)
         # Своя группа процессов: CLI плодит внуков (script/pty, узлы
         # Node), и kill() одного родителя оставлял их сиротами с открытым
         # pipe — читатели висели, квота горела (ревизия: codex, gemini).
@@ -1129,10 +1170,9 @@ def _run_capture(cmd: list[str], cwd, timeout: float,
             with lock:
                 if not closed:
                     try:
-                        rf.write(data)
-                        rf.flush()
-                    except OSError as e:          # диск кончился — ответ важнее файла
-                        print(f"raw-лог не пишется: {e}", file=sys.stderr)
+                        sink(data)
+                    except Exception as e:        # noqa: BLE001  приёмник — не ответ
+                        print(f"стенограмма не пишется: {e}", file=sys.stderr)
 
         def pump(stream, key: str) -> None:
             # В файл — только ЦЕЛЫМИ строками: два читателя пишут в один
@@ -1325,7 +1365,11 @@ def turn(name: str, prompt) -> dict:
             t0 = time.monotonic()  # отсчёт РАБОТЫ, очередь сюда не входит
             wall_t0 = time.time()  # для пробы логов Кими (mtime файлов)
             vt = v.get("turn_timeout", TURN_TIMEOUT)
-            r = _run_capture(cmd, cwd, vt, _raw_log_path())
+            sink = _tr_sink(name)
+            if sink is not None:
+                sink(_tr_head(name, cmd, ptext, ch, bool(use_cont))
+                     .encode("utf-8", "replace"))
+            r = _run_capture(cmd, cwd, vt, sink)
         rc = r.returncode
         if v.get("answer_file") and afile.exists():
             out = afile.read_text(encoding="utf-8").strip()
@@ -1519,16 +1563,33 @@ def deliver(names: list[str], blind: bool = False) -> list[dict]:
     # Одному голосу разыгрывать нечего — печатаем сразу, чтобы разговор
     # оставался живым. Копим только там, где очередь имеет смысл.
     solo = len(names) == 1 and not blind
-    global HOLD_NOTES
-    if blind:
-        with _HOLD_LOCK:
+    global HOLD_NOTES, HOLD_TR
+    notes: list[str] = []
+    tr_held: dict[str, list[bytes]] = {}
+    # Стенограмма: в слепом ходе потоки копятся до закрытия (правило 8.5);
+    # в открытом ходе НЕСКОЛЬКИХ голосов — до завершения каждого голоса,
+    # иначе шесть потоков перемешивались бы построчно в один файл (ревизия:
+    # субагент, grok). Один голос (быстрый вопрос, передача слова) идёт
+    # в файл по мере прихода.
+    hold_tr = blind or len(names) > 1
+    with _HOLD_LOCK:
+        if blind:
             HOLD_NOTES = []
+        HOLD_TR = {} if hold_tr else None
     done_n = 0
-    with ThreadPoolExecutor(max_workers=max(1, len(names))) as ex:
+    try:
+      with ThreadPoolExecutor(max_workers=max(1, len(names))) as ex:
         futs = {ex.submit(turn, n, prompts[n]): n for n in names}
         for f in as_completed(futs):
             n = futs[f]
             ev = f.result()
+            if hold_tr and not blind:
+                # открытый ход: поток голоса — в стенограмму, как только
+                # он закончил, перед его итоговой строкой
+                with _HOLD_LOCK:
+                    chunks = (HOLD_TR or {}).pop(n, [])
+                for chunk in chunks:
+                    _tr_write(chunk)
             if THREAD is not None:
                 ev["thread"] = THREAD          # ответ в адресной ветке
             # Состояние перечитываем ПОСЛЕ хода, а не берём прочитанное до
@@ -1552,16 +1613,27 @@ def deliver(names: list[str], blind: bool = False) -> list[dict]:
                   f"{len(ev.get('text', '')):>5} симв."
                   f"{'' if ev['kind'] != 'error' else '  ' + ev.get('detail', '')[:70]}")
             if blind:
-                print(f"· готово {done_n}/{len(names)}", flush=True)
+                _out(f"· готово {done_n}/{len(names)}")   # обезличенный счётчик — можно на диск
             if solo:
                 results.append(post(**ev))
             else:
                 held.append(ev)
+    except BaseException:
+        # авария внутри хода: память не должна остаться «включённой»
+        # для следующих ходов процесса (ревизия: субагент)
+        with _HOLD_LOCK:
+            HOLD_NOTES = None
+            HOLD_TR = None
+        raise
+    if not blind:
+        with _HOLD_LOCK:
+            HOLD_TR = None
 
     if blind:
         # ход закрыт — только теперь поимённые строки и заметки очереди
         with _HOLD_LOCK:
             notes, HOLD_NOTES = list(HOLD_NOTES or []), None
+            tr_held, HOLD_TR = (HOLD_TR or {}), None
         if notes:
             print("слепой ход закрыт — поимённо:", flush=True)
             for msg in notes:
@@ -1600,14 +1672,16 @@ def deliver(names: list[str], blind: bool = False) -> list[dict]:
             ev["drand_round"] = b["round"]
             ev["drand_signature"] = b["signature"]
             ev["order_index"] = i
-        print(f"\nпорядок публикации разыгран drand (round {b['round']}): "
-              f"{' → '.join(order)}")
-        print(f"проверить: curl -s https://api.drand.sh/v2/beacons/quicknet/"
-              f"rounds/{b['round']}\n"
-              f"           sha256(подпись + ':' + имя), отсортировать")
+        _out(f"\nпорядок публикации разыгран drand (round {b['round']}): "
+             f"{' → '.join(order)}")
+        _out(f"проверить: curl -s https://api.drand.sh/v2/beacons/quicknet/"
+             f"rounds/{b['round']}\n"
+             f"           sha256(подпись + ':' + имя), отсортировать")
     except Exception as e:                             # noqa: BLE001
         print(f"\nмаяк недоступен ({type(e).__name__}): порядок НЕ разыгран, "
               f"публикую в порядке прихода", file=sys.stderr)
+        _tr(f"\nмаяк недоступен ({type(e).__name__}): порядок НЕ разыгран, "
+            f"публикую в порядке прихода")
         post("choir", "note",
              f"порядок публикации не разыгран: маяк drand недоступен "
              f"({type(e).__name__}). Очередь ниже — порядок прихода, то есть "
@@ -1615,6 +1689,17 @@ def deliver(names: list[str], blind: bool = False) -> list[dict]:
         for ev in held:
             ev["order_unrolled"] = True
 
+    if blind:
+        # Стенограмма слепого хода — только теперь и в порядке публикации:
+        # шапка и поток каждого голоса, затем поимённые заметки.
+        order_names = [e["author"] for e in held]
+        for n in order_names + [n for n in tr_held if n not in order_names]:
+            for chunk in tr_held.get(n, []):
+                _tr_write(chunk)
+        if notes:
+            _tr("слепой ход закрыт — поимённо:")
+            for msg in notes:
+                _tr(msg)
     for ev in held:
         results.append(post(**ev))
     return results
@@ -1922,11 +2007,12 @@ def cmd_ask(a) -> int:
     GOAL_SNAPSHOT = _read_goal()      # одна цель на акт — всем одинаково
     names = a.voices.split(",") if a.voices else roster()
     post(HUMAN, "topic", a.text, topic=a.topic or "")
+    _tr(f"❯ {a.text}")
 
     # С досье контролёр в слепую фазу не идёт: его такт — второй, и
     # сверять он должен уже сказанное, а не отвечать наравне.
     speaking = [n for n in names if not (DOSSIER and n == AUDITOR)]
-    print(f"тема: {a.text}\nслепой первый ход: {', '.join(speaking)}\n")
+    _out(f"тема: {a.text}\nслепой первый ход: {', '.join(speaking)}\n")
     evs = deliver(speaking, blind=True)
 
     if DOSSIER and AUDITOR:
@@ -1940,7 +2026,7 @@ def cmd_ask(a) -> int:
 
     note = coverage(names, evs)
     post("choir", "note", note)
-    print(f"\nслепая фаза закрыта — ответы в ленте, дальше разговор живой\n{note}")
+    _out(f"\nслепая фаза закрыта — ответы в ленте, дальше разговор живой\n{note}")
     return 0
 
 
@@ -1985,7 +2071,7 @@ def hand_word(src_ev: dict, names: list[str], why: str,
         post("choir", "note", note, word_to=list(names),
              act=os.environ.get("RT_ACT_ID", ""),
              **({"thread": THREAD} if THREAD is not None else {}))
-        print(f"вступают ({why}): {', '.join(names)}\n")
+        _out(f"вступают ({why}): {', '.join(names)}\n")
         res = deliver(names)
         tried |= set(names)
         if any(e.get("kind") in ("say", "pass", "verdict") for e in res):
@@ -2004,7 +2090,7 @@ def hand_word(src_ev: dict, names: list[str], why: str,
                  f"возвращается человеку", word_to=[],
                  act=os.environ.get("RT_ACT_ID", ""),
                  **({"thread": THREAD} if THREAD is not None else {}))
-            print(f"ход не состоялся: {fell} ({reason})")
+            _out(f"ход не состоялся: {fell} ({reason})")
             return res
         if _since_human() >= MAX_TURNS_WITHOUT_HUMAN:
             # Передача — тоже платный ход: потолок реплик без человека
@@ -2014,7 +2100,7 @@ def hand_word(src_ev: dict, names: list[str], why: str,
                  f"ход не состоялся: {fell}. Потолок реплик без человека "
                  f"({MAX_TURNS_WITHOUT_HUMAN}) — слово возвращается человеку",
                  word_to=[], act=os.environ.get("RT_ACT_ID", ""))
-            print(f"ход не состоялся: {fell} (потолок реплик без человека)")
+            _out(f"ход не состоялся: {fell} (потолок реплик без человека)")
             return res
         handoffs += 1
         names = _quietest(rest)[:1]
@@ -2062,10 +2148,11 @@ def cmd_say(a) -> int:
     THREAD = None                    # ветка живёт внутри одного акта
     GOAL_SNAPSHOT = _read_goal()     # одна цель на акт — всем одинаково
     ev = post(HUMAN, "say", a.text)
+    _tr(f"❯ {a.text}")
     allowed = a.voices.split(",") if a.voices else roster()
     names, why = pick_voices(ev, allowed)
     if not names:
-        print("никто не вступает")
+        _out("никто не вступает")
         return 0
     once = bool(getattr(a, "once", False))
     prefer = getattr(a, "prefer", None)
@@ -2090,7 +2177,7 @@ def cmd_say(a) -> int:
         # платными вызовами, пока не упрётся в guards. Подпись обещала
         # одно, механика делала другое: правило 8.5 в чистом виде.
         # Нашли grok и kimi независимо, ревьюя диф окна.
-        print("\n(--once: разговор дальше не продолжается)")
+        _out("\n(--once: разговор дальше не продолжается)")
         return 0
 
     # Разговор продолжается сам, пока не упрётся в предел или в тишину.

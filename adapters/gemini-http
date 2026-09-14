@@ -60,7 +60,7 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "gemini-http 1.0"
+VERSION = "gemini-http 1.1 (stream)"
 DEFAULT_MODEL = "gemini-3.7-flash"
 API = "https://generativelanguage.googleapis.com/v1beta"
 
@@ -131,6 +131,119 @@ def post(url: str, payload: dict, timeout: int) -> tuple[int, dict]:
             return e.code, {"error": {"message": raw[:500]}}
 
 
+STREAM = True          # --no-stream выключает печать по мере прихода
+
+
+class StreamBroken(Exception):
+    """Поток оборвался ПОСЛЕ того, как часть ответа ушла в stdout: повтор
+    или другой ключ напечатали бы второй экземпляр, и стол прочёл бы
+    удвоенный текст. Наружу — код 1 и причина, без повтора."""
+
+
+def post_stream(url: str, payload: dict, timeout: int,
+                deadline: float | None = None) -> tuple[int, dict]:
+    """POST на :streamGenerateContent?alt=sse — ответ ПО МЕРЕ ПРИХОДА
+    (правило 17, наказ Автора 2026-09-14: «хочется похожесть на общение в
+    терминале»): части thought=True — в stderr между маркерами «💭 мысли
+    модели» / «💭 конец мыслей» (по CHOIR_THOUGHTS=1), текст — в stdout.
+    Возвращает (код, тело той же формы, что у generateContent): части
+    склеены, usageMetadata и finishReason — последние из потока, плюс
+    _streamed=True, чтобы вызывающий не печатал текст второй раз."""
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data,
+                                 headers={"Content-Type": "application/json"})
+    thoughts_on = os.environ.get("CHOIR_THOUGHTS") == "1"
+    think: list[str] = []
+    text: list[str] = []
+    usage: dict = {}
+    finish = ""
+    version = ""
+    feedback = None
+    opened = closed = False
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            for raw in r:
+                if deadline is not None and time.monotonic() > deadline:
+                    # timeout у urlopen — на каждое чтение сокета, не на
+                    # весь ответ: капающий поток пережил бы дедлайн, и
+                    # его убил бы сторож стола без причины в stderr
+                    # (ревизия: субагент, codex, deepseek)
+                    raise TimeoutError("дедлайн вышел посреди потока")
+                line = raw.decode("utf-8", "replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                try:
+                    d = json.loads(line[5:].strip())
+                except ValueError:
+                    continue
+                usage = d.get("usageMetadata") or usage
+                version = d.get("modelVersion") or version
+                feedback = d.get("promptFeedback") or feedback
+                for cand in d.get("candidates") or []:
+                    finish = cand.get("finishReason") or finish
+                    for part in (cand.get("content") or {}).get("parts", []):
+                        t = part.get("text")
+                        if not isinstance(t, str) or not t:
+                            continue
+                        if part.get("thought"):
+                            think.append(t)
+                            if thoughts_on:
+                                if not opened:
+                                    print("💭 мысли модели (thought summaries, поток):",
+                                          file=sys.stderr, flush=True)
+                                    opened = True
+                                print(t, end="", file=sys.stderr, flush=True)
+                            continue
+                        if opened and not closed:
+                            print(f"\n💭 конец мыслей ({len(''.join(think))} симв.)",
+                                  file=sys.stderr, flush=True)
+                            closed = True
+                        text.append(t)
+                        print(t, end="", flush=True)
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", errors="replace")
+        try:
+            return e.code, json.loads(raw)
+        except Exception:                              # noqa: BLE001
+            return e.code, {"error": {"message": raw[:500]}}
+    except Exception as e:                             # noqa: BLE001
+        if text or think:
+            # Наружу уже ушли текст или мысли: повтор другим ключом
+            # напечатал бы второй экземпляр (ревизия: deepseek, субагент)
+            raise StreamBroken(f"{type(e).__name__}: {e}; напечатано "
+                               f"{len(''.join(text))} симв. текста, "
+                               f"{len(''.join(think))} симв. мыслей") from e
+        raise
+    finally:
+        # Маркер закрывается и при обрыве: иначе strip_thoughts у стола
+        # съел бы всё до следующего «конец мыслей» (ревизия: субагент)
+        if opened and not closed:
+            print(f"\n💭 конец мыслей ({len(''.join(think))} симв.)",
+                  file=sys.stderr, flush=True)
+            closed = True
+    if text:
+        print(flush=True)                  # завершающий перевод строки
+    if not finish:
+        # EOF без finishReason — усечённый ответ, не STOP (ревизия: codex,
+        # субагент). До вывода — обычный сбой канала (повтор, ротация);
+        # после — StreamBroken, без повтора.
+        msg = (f"поток закрылся без finishReason "
+               f"(получено {len(''.join(text))} симв.)")
+        if text or think:
+            raise StreamBroken(msg)
+        raise OSError(msg)
+    parts = ([{"thought": True, "text": "".join(think)}] if think else []) \
+        + [{"text": "".join(text)}]
+    resp = {"candidates": [{"content": {"parts": parts},
+                            "finishReason": finish}],
+            "usageMetadata": usage, "_streamed": True}
+    if version:
+        resp["modelVersion"] = version
+    if feedback:
+        resp["promptFeedback"] = feedback
+    return 200, resp
+
+
 def extract_text(resp: dict) -> str:
     """Текст ответа из candidates.
 
@@ -150,7 +263,7 @@ def extract_text(resp: dict) -> str:
                 continue
             if isinstance(part.get("text"), str):
                 out.append(part["text"])
-    if thoughts and os.environ.get("CHOIR_THOUGHTS") == "1":
+    if thoughts and os.environ.get("CHOIR_THOUGHTS") == "1" and not resp.get("_streamed"):
         joined = "".join(thoughts).strip()
         print(f"💭 мысли модели (thought summaries, {len(joined)} симв.):\n"
               f"{joined}\n💭 конец мыслей", file=sys.stderr, flush=True)
@@ -307,7 +420,8 @@ def ask(prompt: str, model: str, timeout: int, session: str | None,
         return 1, "nomodel"
     for step in range(n):
         idx = (start + step) % n
-        url = f"{API}/models/{model}:generateContent?key={keys[idx]}"
+        url = (f"{API}/models/{model}:streamGenerateContent?alt=sse&key={keys[idx]}"
+               if STREAM else f"{API}/models/{model}:generateContent?key={keys[idx]}")
 
         for attempt in range(NET_RETRIES):
             if left() < 5:
@@ -315,7 +429,13 @@ def ask(prompt: str, model: str, timeout: int, session: str | None,
                     f"{last_err or 'нет'}")
                 return 1, "deadline"
             try:
-                code, resp = post(url, payload, max(5, min(90, left())))
+                # Потоку — весь остаток дедлайна: он держит соединение всё
+                # время ответа, а не только до первого байта.
+                code, resp = (post_stream(url, payload, max(5, int(left())), deadline)
+                              if STREAM else post(url, payload, max(5, min(90, left()))))
+            except StreamBroken as e:
+                log(f"ключ #{idx}: {e} — без повтора")
+                return 1, "stream"
             except Exception as e:                     # noqa: BLE001
                 last_err = f"{type(e).__name__}: {e}"
                 last_why = "gateway"
@@ -365,7 +485,8 @@ def ask(prompt: str, model: str, timeout: int, session: str | None,
                 log(f"ключ #{idx}, модель {model}, "
                     f"{usage.get('totalTokenCount', '?')} токенов, "
                     f"{elapsed:.1f} с, история: {hp}")
-                print(text)
+                if not resp.get("_streamed"):
+                    print(text)
                 return 0, ""
 
             msg = (resp.get("error") or {}).get("message", "")[:200]
@@ -458,8 +579,12 @@ def main() -> int:
                          "accepted by all models — passed through as is)")
     ap.add_argument("--models", action="store_true",
                     help="показать модели, доступные ключу")
+    ap.add_argument("--no-stream", action="store_true",
+                    help="ответ целиком по завершении (без печати по мере прихода)")
     ap.add_argument("--version", action="store_true")
     a = ap.parse_args()
+    global STREAM
+    STREAM = not a.no_stream
 
     if a.version:
         print(f"{VERSION} ({DEFAULT_MODEL})")

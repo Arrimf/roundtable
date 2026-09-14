@@ -581,7 +581,8 @@ def _scrub_log(text: str) -> str:
 
 def _act_log_path(aid: str, kind: str, edit: str = "") -> tuple[Path | None, str]:
     """Файл лога по роду вкладки: act — stdout+stderr процесса акта; raw —
-    сырой вывод CLI голоса (быстрый вопрос, RT_RAW), иначе лог акта; chair —
+    стенограмма акта (вопрос, шапки ходов, поток CLI голосов, итоги —
+    пишут live.py/choir.py через transcript.py), иначе лог акта; chair —
     долговечный стенограф кресла <акт>.chair.log в каталоге актов (пишет
     executor_run, когда кресло выдано окном), иначе лог из каталога аренд
     (edit-<акт правки>.<эпоха>.log, самая свежая эпоха; его стирает уборка),
@@ -1445,17 +1446,17 @@ def _spawn_env(voices: list[str]) -> dict:
     # у Python блочный — без этого лог акта пуст до самого конца хода
     # (замер grok, раунд вкладки-вывода-v1: 0 байт до закрытия fd), и
     # вкладки «дирижёр»/«исполнитель» показывали бы тишину. RT_ACT_DIR —
-    # чтобы комната знала, куда класть сырой вывод (RT_RAW, см. live.py).
+    # чтобы комната и дирижёр знали, куда класть стенограмму акта
+    # (chamber/transcript.py).
     env["PYTHONUNBUFFERED"] = "1"
     env["RT_ACT_DIR"] = str(ACT_DIR)
     # Метка проекта для событий детей (live.py при пустом поле «проект»,
     # executor_run, merge_gate): без неё их события шли без поля и
     # пропадали из ленты окна проекта (ревьюер дифа 2026-09-10).
     env["CHOIR_EVENT_PROJECT"] = PROJECT or ""
-    # RT_RAW — только по явному решению обработчика (быстрый вопрос);
-    # унаследованная из оболочки «1» положила бы сырые ответы слепого
-    # такта на диск (нашёл grok).
-    env["RT_RAW"] = "0"
+    # Стенограмма акта (<акт>.raw.log) пишется комнатой и дирижёром сами
+    # по RT_ACT_DIR/RT_ACT_ID: слепой ход они держат в памяти до закрытия
+    # (правило 8.5), выключатель RT_RAW снят 2026-09-14 (см. transcript.py).
     # Такт, запущенный окном, НЕ звонит paplay сам: сокет звука он
     # наследует (окружение передаётся целиком), и без этой строки
     # каждый такт звонил дважды — paplay изнутри плюс WebAudio окна
@@ -3389,11 +3390,6 @@ class Handler(BaseHTTPRequestHandler):
                         fields=acc_fields or None,
                         env_extra={"CHOIR_BRIEF": "1" if brief else "0",
                                    "CHOIR_PEER": "1" if peer else "0",
-                                   # Сырой вывод CLI на диск — ТОЛЬКО
-                                   # быстрому вопросу: один голос, слепоты
-                                   # нет. Слепой ход (ask) и разговор —
-                                   # без него (правило 8.5).
-                                   "RT_RAW": "1" if quick else "0",
                                    "CHOIR_THOUGHTS": "1" if req.get("thoughts") else "0"})
             return self._json(200, {"act": act})
 
@@ -6339,13 +6335,15 @@ document.getElementById('quick').onclick=()=>sendQuick();
   if(!feed0||!top0||!document.createElement||!document.createDocumentFragment)return; // заглушка DOM в смоке
   try{
   const VIEWS=[['feed','💬 лента','Лента комнаты (как прежде)'],
-    ['cond','🎼 дирижёр','Ход оркестровки раунда и комнаты вживую: кого вызвал, очередь, повторы, статусы. В слепой фазе — только обезличенный счётчик; поимённые строки и сырые ответы — после закрытия фазы (правило 8.5).'],
+    ['cond','🎼 дирижёр','Стенограмма раунда или хода комнаты, как в терминале: вопрос, кого вызвал и какой командой, поток каждого голоса (мысли, инструменты, ответ), итоги. В слепой фазе вживую — только обезличенный счётчик; потоки и поимённые строки ложатся по закрытии фазы (правило 8.5).'],
     ['chair','🔧 исполнитель','Вывод CLI в кресле исполнителя по мере работы: вызовы инструментов, правки, мысли (если канал их отдаёт).'],
-    ['quick','⚡ быстрый ответ','Сырой вывод CLI или HTTP-адаптера голоса на быстрый вопрос — по мере прихода, с мыслями модели, если галочка «мысли» стояла при отправке.']];
+    ['quick','⚡ быстрый ответ','Стенограмма быстрого вопроса: вопрос, кто отвечает и какой командой, поток CLI или HTTP-адаптера по мере прихода (мысли модели — если галочка «мысли» стояла при отправке), итог.']];
   const KINDS={cond:['round','room'],chair:['chair','review'],quick:['quick']};
   // род лога — по роду АКТА, не вкладки: ревизия дифа живёт во вкладке
-  // исполнителя, но её вывод — печать обёртки merge_gate (kind=act)
-  function logKind(a){if(!a)return 'act'; const k=a.kind||(a.edit?'chair':''); return k==='chair'?'chair':k==='quick'?'raw':'act'}
+  // исполнителя, но её вывод — печать обёртки merge_gate (kind=act);
+  // раунд, ход комнаты и быстрый вопрос — стенограмма (raw), а пока её
+  // нет (старый акт, ход ещё не начался) сервер отдаёт лог акта
+  function logKind(a){if(!a)return 'act'; const k=a.kind||(a.edit?'chair':''); return k==='chair'?'chair':k==='review'?'act':'raw'}
   const EMPTY={cond:'актов раунда или комнаты пока нет',
     chair:'актов кресла пока нет',
     quick:'актов быстрого ответа пока нет. Быстрый вопрос с галочкой «coder» — это кресло: его вывод во вкладке 🔧 исполнитель'};
@@ -6358,6 +6356,7 @@ document.getElementById('quick').onclick=()=>sendQuick();
    +'#termact{max-width:38ch;font:inherit;background:var(--bg);color:var(--ink);border:1px solid var(--rule);border-radius:.3rem}'
    +'#term{white-space:pre-wrap;word-break:break-word;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.84rem;line-height:1.35;background:var(--bg);border:1px solid var(--rule);border-radius:.4rem;padding:.6rem .8rem;max-height:calc(100vh - 14rem);overflow:auto;margin:0}'
    +'#term .think{color:var(--acc)}#term .tool{color:var(--me)}#term .meta{color:var(--dim)}#term .err{color:var(--err)}'
+   +'#term .q{color:var(--me);font-weight:600}#term .head{display:block;color:var(--ink);font-weight:600;border-top:1px solid var(--rule);margin-top:.35rem;padding-top:.35rem}#term .cmd{color:var(--dim)}'
    +'#term.nothink .think{display:none}'
    +'#termid{width:14ch;font:inherit;font-family:ui-monospace,monospace;background:var(--bg);color:var(--ink);border:1px solid var(--rule);border-radius:.3rem;padding:0 .3rem}'
    +'#termcopy,#termnew{font:inherit;background:var(--bg);color:var(--ink);border:1px solid var(--rule);border-radius:.3rem;padding:0 .45rem;cursor:pointer}'
@@ -6576,17 +6575,43 @@ document.getElementById('quick').onclick=()=>sendQuick();
     if(!pick){if(TERM.id!==null||pre.textContent||!pulse.textContent)startTerm(null);return}
     if(pick!==TERM.id)startTerm(pick)}
   function startTerm(id){clearTimeout(TERM.timer); TERM.id=id; showGate(id&&SEEN[id]&&SEEN[id].edit&&SEEN[id].edit!=='batch'?SEEN[id].edit:''); TERM.edit=(SEEN[id]&&SEEN[id].edit)||''; TERM.next=0; TERM.lastByte=0; TERM.lastSize=0; TERM.quiet=0; TERM.gen++; TERM.source=''; TERM.done=false;
-    pre.textContent=''; what.textContent=''; inThink=false; PENDING=0; newer.hidden=true; FOLLOW=true; fc.checked=true;
+    pre.textContent=''; what.textContent=''; inThink=false; afterHead=false; inVoice=false; PENDING=0; newer.hidden=true; FOLLOW=true; fc.checked=true;
     idbox.value=id?(TERM.edit||id):''; idbox.title=(id?('акт '+id+(TERM.edit?' · правка '+TERM.edit:'')+'. '):'')+'Выделяется; кнопка ⎘ копирует.';
     pulse.textContent=id?'…':(EMPTY[VIEW]||'актов этого рода пока нет');
     if(id)tick()}
   sel.onchange=function(){startTerm(sel.value)};
   function line(cls,text){const s=document.createElement('span'); if(cls)s.className=cls; s.textContent=text+'\n'; return s}
   let inThink=false;   // сбрасывается в startTerm: стиль мыслей не должен утекать в следующий акт
+  let afterHead=false, inVoice=false;   // стенограмма: после шапки идёт «$ команда»; внутри потока голоса ❯ — его вывод
   function render(text){const frag=document.createDocumentFragment();
     text.split('\n').forEach(function(l,i,arr){if(i===arr.length-1&&l==='')return;
+      // строки дирижёра из стенограммы: вопрос, шапка хода «→ голос · …»,
+      // команда «$ …» сразу после шапки (строже, чем «первый символ»:
+      // pty grok рисует ❯, вывод codex содержит «$ …» — ревьюер)
+      const wasHead=afterHead; afterHead=false;
+      if(l.slice(0,2)==='❯ '&&!inVoice){frag.appendChild(line('q',l));return}
+      if(/^→ [a-z][a-z0-9_-]* · /.test(l)){inThink=false;inVoice=true;afterHead=true;frag.appendChild(line('head',l));return}
+      if(wasHead&&l.slice(0,2)==='$ '){frag.appendChild(line('cmd',l));return}
+      if(/^[●○✗] [a-z]+ +[0-9.]+ с /.test(l)){inVoice=false;frag.appendChild(line('meta',l));return}
       if(l.charAt(0)==='{'){let d=null; try{d=JSON.parse(l)}catch(_){}
-        if(d&&d.type){ // claude --output-format stream-json
+        if(d&&d.type){
+          // codex exec --json: пункты целиком (reasoning — мысли, agent_message — ответ, command_execution — инструмент)
+          if(d.type==='item.completed'&&d.item){const it=d.item;
+            if(it.type==='reasoning')frag.appendChild(line('think','💭 '+(it.text||'')));
+            else if(it.type==='agent_message')frag.appendChild(line('','📝 '+(it.text||'')));
+            else if(it.type==='command_execution')frag.appendChild(line('tool','🔧 $ '+(it.command||'')+(it.exit_code!==undefined&&it.exit_code!==null?' → код '+it.exit_code:'')+(it.aggregated_output?'\n'+String(it.aggregated_output).slice(0,600):'')));
+            else if(it.type==='file_change')frag.appendChild(line('tool','✎ правка файлов: '+JSON.stringify(it.changes||[]).slice(0,300)));
+            else if(it.type==='mcp_tool_call')frag.appendChild(line('tool','🔧 '+(it.server||'')+'/'+(it.tool||'')));
+            else if(it.type==='web_search')frag.appendChild(line('tool','🔎 '+(it.query||'')));
+            else if(it.type==='error')frag.appendChild(line('err','✗ '+(it.message||'')));
+            else frag.appendChild(line('meta','· '+it.type));
+            return}
+          if(d.type==='item.started'||d.type==='item.updated'||d.type==='turn.started')return;   // пункт ещё пишется — покажем целиком
+          if(d.type==='thread.started'){frag.appendChild(line('meta','· нить codex '+(d.thread_id||'')));return}
+          if(d.type==='turn.completed'){const u=d.usage||{}; frag.appendChild(line('meta','■ ход codex завершён · токены: вход '+(u.input_tokens||0)+' (кэш '+(u.cached_input_tokens||0)+'), выход '+(u.output_tokens||0)+', рассуждение '+(u.reasoning_output_tokens||0)));return}
+          if(d.type==='turn.failed'){frag.appendChild(line('err','✗ ход codex не удался: '+((d.error||{}).message||'')));return}
+          if(d.type==='error'&&d.message!==undefined){frag.appendChild(line('err','✗ '+d.message));return}
+          // claude --output-format stream-json
           if(d.type==='assistant'&&d.message&&d.message.content){(d.message.content||[]).forEach(function(b){
             if(b.type==='thinking')frag.appendChild(line('think','💭 '+(b.thinking||'')));
             else if(b.type==='text')frag.appendChild(line('','📝 '+(b.text||'')));
@@ -6617,7 +6642,7 @@ document.getElementById('quick').onclick=()=>sendQuick();
     if(j.text){const n=(j.text.match(/\n/g)||[]).length; pre.appendChild(render(j.text)); TERM.lastByte=Date.now(); TERM.quiet=0;
       if(FOLLOW)pre.scrollTop=pre.scrollHeight; else {PENDING+=n; newer.textContent='↓ новое: '+PENDING+' строк'; newer.hidden=false}}
     TERM.next=j.next; TERM.lastSize=j.size; TERM.done=!!j.done;
-    const src={act:'печать процесса акта',raw:'сырой вывод CLI/HTTP голоса',chair:'вывод CLI в кресле'}[j.source]||j.source;
+    const src={act:'печать процесса акта (стенограммы у этого акта нет)',raw:'стенограмма акта',chair:'вывод CLI в кресле'}[j.source]||j.source;
     what.textContent='показано: '+src+' · '+Math.round(j.size/1024)+' КБ';
     const ago=TERM.lastByte?Math.round((Date.now()-TERM.lastByte)/1000):null;
     pulse.textContent=(j.done?'■ завершён':'● идёт')+(ago!==null?' · последний байт '+ago+' с назад':'');

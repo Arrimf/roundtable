@@ -65,13 +65,96 @@ def read_key() -> str:
     return k
 
 
+class StreamBroken(Exception):
+    """Поток закрылся без завершающего чанка или дедлайн вышел посреди
+    ответа: усечённый текст нельзя выдавать за полный (ревизия: codex,
+    субагент — «EOF без [DONE] читался как успех»)."""
+
+
+_PRINTED = False       # хоть что-то ушло в stdout/stderr — повтор запрещён
+
+
+def stream_read(r, deadline: float) -> dict:
+    """Собрать ответ из SSE-потока, ПЕЧАТАЯ ПО МЕРЕ ПРИХОДА (правило 17,
+    наказ Автора 2026-09-14: «хочется похожесть на общение в терминале»):
+    мысли — в stderr между маркерами «💭 мысли модели» / «💭 конец
+    мыслей» (по CHOIR_THOUGHTS=1), текст ответа — в stdout. Возвращает
+    словарь той же формы, что обычный ответ, плюс _streamed=True — чтобы
+    main() не печатал текст второй раз."""
+    global _PRINTED
+    thoughts_on = os.environ.get("CHOIR_THOUGHTS") == "1"
+    think: list[str] = []
+    text: list[str] = []
+    usage: dict = {}
+    model = ""
+    opened = closed = done = False
+    try:
+        for raw in r:
+            if time.monotonic() > deadline:
+                raise StreamBroken("дедлайн вышел посреди потока")
+            line = raw.decode("utf-8", "replace").strip()
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if data == "[DONE]":
+                done = True
+                break
+            try:
+                d = json.loads(data)
+            except ValueError:
+                continue
+            model = d.get("model") or model
+            if d.get("usage"):
+                usage = d["usage"]
+            for ch in d.get("choices") or []:
+                if ch.get("finish_reason"):
+                    done = True
+                delta = ch.get("delta") or {}
+                rc = delta.get("reasoning_content")
+                if rc:
+                    think.append(rc)
+                    if thoughts_on:
+                        if not opened:
+                            print("💭 мысли модели (reasoning_content, поток):",
+                                  file=sys.stderr, flush=True)
+                            opened = True
+                        print(rc, end="", file=sys.stderr, flush=True)
+                        _PRINTED = True
+                c = delta.get("content")
+                if c:
+                    if opened and not closed:
+                        print(f"\n💭 конец мыслей ({len(''.join(think))} симв.)",
+                              file=sys.stderr, flush=True)
+                        closed = True
+                    text.append(c)
+                    print(c, end="", flush=True)
+                    _PRINTED = True
+    finally:
+        # Маркер закрывается и при обрыве: иначе strip_thoughts у стола
+        # съел бы всё до следующего «конец мыслей», включая причину
+        # отказа канала (ревизия: субагент).
+        if opened and not closed:
+            print(f"\n💭 конец мыслей ({len(''.join(think))} симв.)",
+                  file=sys.stderr, flush=True)
+    if text:
+        print(flush=True)                  # завершающий перевод строки
+    if not done:
+        raise StreamBroken(f"поток закрылся без завершающего чанка "
+                           f"(получено {len(''.join(text))} симв.)")
+    return {"model": model, "usage": usage, "_streamed": True,
+            "choices": [{"message": {"content": "".join(text),
+                                     "reasoning_content": "".join(think)}}]}
+
+
 def call(prompt: str, model: str, key: str, timeout: int,
-         effort: str | None = None) -> dict:
+         effort: str | None = None, stream: bool = True) -> dict:
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
-        "stream": False,
+        "stream": stream,
     }
+    if stream:
+        payload["stream_options"] = {"include_usage": True}
     if effort:
         # Ручка проверена лесенкой 2026-08-22 (один вопрос, по 3 повтора):
         # low ~520 / medium ~1060 / high ~1390 reasoning-токенов — крутит.
@@ -81,8 +164,21 @@ def call(prompt: str, model: str, key: str, timeout: int,
         f"{BASE}/chat/completions", data=body,
         headers={"Authorization": f"Bearer {key}",
                  "Content-Type": "application/json"})
+    # timeout у urlopen — на КАЖДОЕ чтение сокета; общий потолок потока
+    # считает stream_read по дедлайну (ревизия: субагент, deepseek, codex).
+    deadline = time.monotonic() + timeout
     with urllib.request.urlopen(req, timeout=timeout) as r:
+        if stream:
+            return stream_read(r, deadline)
         return json.loads(r.read().decode())
+
+
+def _partial_out() -> bool:
+    """Что-то уже ушло наружу? Флаг ставит stream_read при первой печати
+    (первая редакция мерила sys.stdout.tell(), а на pipe он недоступен —
+    и любой сбой ДО первого байта отменял повторы; нашли все четверо
+    ревьюеров)."""
+    return _PRINTED
 
 
 def main() -> int:
@@ -94,12 +190,14 @@ def main() -> int:
     ap.add_argument("--effort", default=os.environ.get("DEEPSEEK_EFFORT", "max"),
                     choices=("low", "medium", "high", "max", "none"),
                     help="reasoning_effort; none — не слать параметр")
+    ap.add_argument("--no-stream", action="store_true",
+                    help="ответ целиком по завершении (без печати по мере прихода)")
     ap.add_argument("--version", action="store_true")
     ap.add_argument("--models", action="store_true", help="что видит ключ")
     a = ap.parse_args()
 
     if a.version:
-        print("deepseek-http 1.0")
+        print("deepseek-http 1.1 (stream)")
         return 0
 
     key = read_key()
@@ -127,7 +225,8 @@ def main() -> int:
         try:
             t0 = time.time()
             data = call(prompt, a.model, key, a.timeout,
-                        None if a.effort == "none" else a.effort)
+                        None if a.effort == "none" else a.effort,
+                        stream=not a.no_stream)
             break
         except urllib.error.HTTPError as e:
             raw = e.read().decode(errors="replace")[:300]
@@ -141,6 +240,11 @@ def main() -> int:
         except Exception as e:                                   # noqa: BLE001
             last = f"{type(e).__name__}: {e}"
             log(f"попытка {attempt}/{RETRIES}: {last}")
+            if not a.no_stream and _partial_out():
+                # Часть ответа уже напечатана: повтор дописал бы второй
+                # экземпляр в stdout, и стол прочёл бы удвоенный текст.
+                log("поток оборвался после начала ответа — без повтора")
+                return 1
         if attempt < RETRIES:
             time.sleep(2 * attempt)
     else:
@@ -154,7 +258,8 @@ def main() -> int:
     # (галочка «мысли» в окне стола). Ответ стола в stdout не меняется:
     # мысли — для человека, который смотрит на ход, а не пакет голосам.
     _think = _msg.get("reasoning_content")
-    if os.environ.get("CHOIR_THOUGHTS") == "1" and isinstance(_think, str) and _think.strip():
+    if (not data.get("_streamed") and os.environ.get("CHOIR_THOUGHTS") == "1"
+            and isinstance(_think, str) and _think.strip()):
         print(f"💭 мысли модели (reasoning_content, {len(_think)} симв.):\n"
               f"{_think.rstrip()}\n💭 конец мыслей", file=sys.stderr, flush=True)
     if not text.strip():
@@ -182,7 +287,8 @@ def main() -> int:
     except OSError as e:
         log(f"история не записана: {e}")
 
-    print(text)
+    if not data.get("_streamed"):
+        print(text)
     return 0
 
 
