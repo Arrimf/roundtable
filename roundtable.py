@@ -6384,34 +6384,69 @@ document.getElementById('quick').onclick=()=>sendQuick();
   // МОНИТОР ОКОН (наказ Автора 2026-09-10): какие окна стола живы, где
   // запущены, на каком порту; открыть или остановить. Останавливать можно
   // только чужое окно этого пользователя, сигналом SIGTERM.
-  const wb=document.createElement('button'); wb.textContent='🪟 окна'; wb.className='vtab';
-  wb.title='Окна стола этого пользователя: pid, порт, проект, время запуска. «Открыть» — ссылка на окно; «Остановить» — SIGTERM (окно погасит свои акты и выйдет).';
+  // Кнопка — в конце ряда вкладок, список — ВЫПАДАЮЩИЙ, вне потока
+  // (position:absolute): первая версия вставляла панель в ту же
+  // flex-строку, что переключатели и вкладки, и строка растягивалась на
+  // высоту списка (Автор 2026-09-14: «съезжает форматирование»).
+  const wb=document.createElement('button'); wb.textContent='🪟 окна ▾'; wb.className='vtab'; wb.id='winbtn';
+  wb.title='Окна стола этого пользователя: pid, порт, проект, время запуска. «Открыть» — ссылка на окно; «Остановить» — SIGTERM (окно погасит свои акты и выйдет). Список выпадает поверх ленты; закрыть — клик мимо или Esc.';
   const wp=document.createElement('div'); wp.id='winpanel'; wp.hidden=true;
-  css.textContent+='#winpanel{margin:.4rem 0 0;border:1px solid var(--rule);border-radius:.4rem;padding:.4rem .7rem;font-size:.86rem}'
-    +'#winpanel .row{display:flex;gap:.6rem;align-items:center;flex-wrap:wrap;padding:.15rem 0}#winpanel button{font:inherit;background:var(--bg);color:var(--ink);border:1px solid var(--rule);border-radius:.3rem;padding:.05rem .5rem;cursor:pointer}'
-    +'#winpanel .me{color:var(--acc)}#winpanel .dim{color:var(--dim)}';
-  async function loadWindows(){wp.innerHTML=''; let j=null;
-    try{const r=await fetch('/windows'); j=await r.json()}catch(_){wp.textContent='сервер не ответил';return}
+  const ww=document.createElement('div'); ww.id='winwrap';
+  css.textContent+='#winbtn{margin-left:auto}#winwrap{position:relative;display:flex;flex:1;justify-content:flex-end}'
+    +'#winpanel{position:absolute;right:0;top:calc(100% + .3rem);z-index:20;width:max-content;max-width:calc(100vw - var(--sidew) - 3rem);max-height:60vh;overflow:auto;background:var(--panel);border:1px solid var(--rule);border-radius:.4rem;padding:.4rem .7rem;font-size:.86rem;box-shadow:0 .4rem 1.2rem rgba(0,0,0,.35)}'
+    +'#winpanel .row{display:flex;gap:.6rem;align-items:center;flex-wrap:wrap;padding:.15rem 0;border-top:1px solid var(--rule)}#winpanel .row:first-child{border-top:0}'
+    +'#winpanel button{font:inherit;background:var(--bg);color:var(--ink);border:1px solid var(--rule);border-radius:.3rem;padding:.05rem .5rem;cursor:pointer}'
+    +'#winpanel .me{color:var(--acc)}#winpanel .dim{color:var(--dim)}#winpanel .path{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:22rem;display:inline-block;vertical-align:bottom}';
+  function shortPath(p){if(!p)return '—'; const parts=String(p).split('/').filter(Boolean); return parts.length?parts[parts.length-1]:p}
+  // Время — ЛОКАЛЬНОЕ: карточка окна хранит UTC-ISO, окно без карточки —
+  // локальную строку из ps; резать часы из ISO значило показать UTC без
+  // зоны (ревьюер дифа 2026-09-14). Полная метка сервера — в title.
+  function shortTime(t){if(!t)return ''; const d=new Date(t); if(isNaN(d))return String(t);
+    const now=new Date(), same=d.toDateString()===now.toDateString();
+    return (same?'':d.toLocaleDateString('ru-RU', {day:'2-digit',month:'2-digit'})+' ')+d.toLocaleTimeString('ru-RU', {hour:'2-digit',minute:'2-digit'})}
+  // Поколение запроса: два перекрывающихся loadWindows (закрыть-открыть
+  // до ответа) чистили панель ДО await и оба дописывали строки — список
+  // вдвое (codex, deepseek, субагент). Рисует только последний.
+  let wgen=0;
+  async function loadWindows(){const g=++wgen; let j=null;
+    try{const r=await fetch('/windows'); j=await r.json()}catch(_){if(g===wgen){wp.innerHTML=''; wp.textContent='сервер не ответил'}return}
+    if(g!==wgen)return;
+    wp.innerHTML='';
     (j.windows||[]).forEach(function(w){const row=document.createElement('div'); row.className='row';
-      const lab=document.createElement('span'); lab.className=w.self?'me':''; lab.textContent='pid '+w.pid+(w.port?' · :'+w.port:' · порт неизвестен')+' · '+(w.project||w.cwd||'—')+(w.started?' · с '+w.started:'')+(w.self?' · это окно':'')+(w.unregistered?' · без карточки (старый код)':'');
+      const lab=document.createElement('span'); lab.className=w.self?'me':'';
+      const proj=w.project||w.cwd||'';
+      lab.textContent='pid '+w.pid+(w.port?' · :'+w.port:' · порт неизвестен')+' · ';
+      const ps=document.createElement('span'); ps.className='path'; ps.textContent=shortPath(proj); ps.title=proj||'проект неизвестен'; lab.appendChild(ps);
+      const tail=document.createElement('span'); tail.className='dim';
+      tail.textContent=(w.started?' · с '+shortTime(w.started):'')+(w.self?' · это окно':'')+(w.unregistered?' · без карточки (старый код)':''); tail.title=w.started||''; lab.appendChild(tail);
       row.appendChild(lab);
       const okPort=Number.isInteger(w.port)&&w.port>0&&w.port<65536;   // карточка — данные с диска: порт только числом (grok)
       if(okPort&&!w.self){const a=document.createElement('a'); a.href='http://127.0.0.1:'+w.port+'/'; a.target='_blank'; a.textContent='открыть'; row.appendChild(a)}
       if(!w.self){const b=document.createElement('button'); b.textContent='остановить'; b.onclick=async function(){
-        if(!confirm('Остановить окно pid '+w.pid+' ('+(w.project||w.cwd||'?')+')? Его идущие акты будут прерваны.'))return;
+        if(!confirm('Остановить окно pid '+w.pid+' ('+(proj||'?')+')? Его идущие акты будут прерваны.'))return;
+        b.disabled=true;                          // второй клик — второй SIGTERM и шум «процесса нет»
         try{const r=await fetch('/windows/stop',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pid:w.pid})}); const jj=await r.json();
-          lab.textContent+=' · '+(r.ok?(jj.note||'остановлено'):(jj.error||('ошибка '+r.status)))}catch(_){lab.textContent+=' · сервер не ответил'}
-        setTimeout(loadWindows,1500)}; row.appendChild(b)}
+          tail.textContent+=' · '+(r.ok?(jj.note||'остановлено'):(jj.error||('ошибка '+r.status))); if(r.ok)row.classList.add('dim')}catch(_){tail.textContent+=' · сервер не ответил'; b.disabled=false}
+        // Список не перерисовывается сам: ответ сервера остаётся в строке,
+        // свежий список — при следующем открытии меню.
+        }; row.appendChild(b)}
       wp.appendChild(row)});
     if(!(j.windows||[]).length)wp.textContent='окон не найдено'}
+  function closeWins(){wp.hidden=true}
   wb.onclick=function(){wp.hidden=!wp.hidden; if(!wp.hidden)loadWindows()};
-  if(qb)qb.appendChild(wb);
+  // Закрытие — по ЦЕЛИ клика (мимо кнопки и меню), а не stopPropagation:
+  // клик по «остановить» с confirm и всё, что внутри, меню не гасит (grok:
+  // нативный диалог может отдать клик документу).
+  document.addEventListener('click',function(e){if(!wp.hidden&&!ww.contains(e.target))closeWins()});
+  // Esc — на фазе захвата и только при открытом меню: иначе Esc в поле
+  // реплики закрывал меню И звал abortAll с confirm «прервать ВСЕ ходы».
+  document.addEventListener('keydown',function(e){if(e.key==='Escape'&&!wp.hidden){closeWins(); e.stopPropagation(); e.preventDefault()}},true);
   // вкладки
   const bar=document.createElement('div'); bar.id='viewtabs'; const TABS=[];
   VIEWS.forEach(function(v){const b=document.createElement('button'); b.className='vtab'+(v[0]==='feed'?' on':'');
     b.setAttribute('data-view',v[0]); b.textContent=v[1]; b.title=v[2]; b.onclick=function(){setView(v[0])}; bar.appendChild(b); TABS.push([v[0],b])});
+  ww.appendChild(wb); ww.appendChild(wp); bar.appendChild(ww);
   if(top)top.appendChild(bar);
-  if(top)top.appendChild(wp);
   const wrap=document.createElement('div'); wrap.id='termwrap'; wrap.hidden=true;
   const head=document.createElement('div'); head.id='termhead';
   const sel=document.createElement('select'); sel.id='termact'; sel.title='Какой акт показывать: идущие — первыми, потом завершённые (лог акта переживает окно)';
