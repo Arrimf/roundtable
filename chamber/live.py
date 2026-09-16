@@ -102,7 +102,7 @@ LIVE_VERSION = "0.1"
 # реплик почти всегда вырождается во взаимные любезности.
 MAX_TURNS_WITHOUT_HUMAN = 6     # реплик подряд без человека → комната ждёт
 MAX_VOICES_PER_EVENT = 2        # сколько голосов вступает на одну реплику
-PINGPONG_LIMIT = 2              # столько подряд согласий подряд → гасим
+PINGPONG_LIMIT = 3              # столько согласий голосов ПОДРЯД → гасим (2 при шести голосах гасило живой разговор — ревизия 2026-09-16)
 SKEW_WARN_RATIO = 0.5           # доля реплик одного автора, после которой
                                 # комната вслух говорит о перекосе (правило 7)
 
@@ -163,11 +163,25 @@ ADDRESS_RE = re.compile(r"@([a-zA-Zа-яА-Я]+)")
 # Согласие без содержания. Ловим, чтобы гасить «вежливый пинг-понг»:
 # две модели могут соглашаться друг с другом бесконечно, и со стороны
 # это неотличимо от продуктивного разговора — пока не посмотришь в счёт.
+# «прав[ыа]?» ловило «права на чтение» и «Права не менять» — и одна
+# реплика Кими про права доступа была прочитана как согласие
+# (2026-09-16, запись 894). Согласие — «вы/он правы», не слово «права»;
+# «не согласен», «согласование», «поддерживает формат» — не согласие
+# (ревизия: deepseek, grok, kimi, субагент). Согласие БЕЗ СОДЕРЖАНИЯ —
+# ещё и короткое: реплика на десять абзацев с «согласен в части X» —
+# разговор, не пинг-понг (kimi); см. AGREE_MAX_CHARS.
 AGREE_RE = re.compile(
-    r"\b(соглас|поддержив|верно подмеч|именно так|хорошая мысль|"
-    r"полностью разделяю|прав[ыа]?\b)", re.I)
+    r"(?<!не )(?<!не\s)\b(соглас(?:ен|на|ны|имся|ились)\b|поддержива(?:ю|ем)\b|"
+    r"верно подмеч|именно так|хорошая мысль|разделяю|присоединяюсь|плюсую|"
+    r"(?:вы|ты|он|она|они|коллега|коллеги|абсолютно|совершенно)[\s,—-]+прав[ыа]?\b)", re.I)
+AGREE_MAX_CHARS = 600           # длиннее — в реплике есть содержание
 
 HUMAN = "arr"
+# Метка дирижёра в ленте: «chamber» (комната), как и каталог; прежние
+# записи с «choir» остаются в журнале как есть (2026-09-16, Автор:
+# «choir — мы вроде переименовывали в chamber — давай и тут»).
+CONDUCTOR = "chamber"
+CONDUCTOR_ALIASES = ("chamber", "choir")
 
 # АДРЕСНЫЕ СООБЩЕНИЯ МЕЖДУ ГОЛОСАМИ — ОПЦИЯ (наказ Автора 2026-09-06:
 # «адресные сообщения в общий чат; после ответа адресата могут ответить
@@ -1682,7 +1696,7 @@ def deliver(names: list[str], blind: bool = False) -> list[dict]:
               f"публикую в порядке прихода", file=sys.stderr)
         _tr(f"\nмаяк недоступен ({type(e).__name__}): порядок НЕ разыгран, "
             f"публикую в порядке прихода")
-        post("choir", "note",
+        post(CONDUCTOR, "note",
              f"порядок публикации не разыгран: маяк drand недоступен "
              f"({type(e).__name__}). Очередь ниже — порядок прихода, то есть "
              f"скорость канала, а не жребий.")
@@ -1959,7 +1973,9 @@ def guards(roster: list[str]) -> str | None:
     # человека (12 из них error), прежде чем срабатывал потолок.
     # Пинг-понг ниже по-прежнему меряется только say — согласие ошибкой
     # не выражают.
-    tail = [e for e in ev if e["kind"] in ("say", "pass", "error")]
+    # topic — тоже реплика человека: новая тема сбрасывает счётчики
+    # (kimi: иначе сторож гас на свежем разговоре по старым согласиям)
+    tail = [e for e in ev if e["kind"] in ("say", "pass", "error", "topic")]
 
     since_human = 0
     for e in reversed(tail):
@@ -1970,9 +1986,22 @@ def guards(roster: list[str]) -> str | None:
         return (f"{since_human} реплик подряд без человека — "
                 f"комната ждёт Автора")
 
-    says = [e for e in tail if e["kind"] == "say"][-PINGPONG_LIMIT - 1:]
-    if len(says) > PINGPONG_LIMIT and all(
-            AGREE_RE.search(e["text"]) for e in says[-PINGPONG_LIMIT:]):
+    # Пинг-понг — между ГОЛОСАМИ после последней реплики человека: в
+    # первой редакции в окно попадала и реплика Автора, и после одного
+    # ответа комната гасла «за согласия» (2026-09-16, запись 894).
+    # ПАС или отказ между согласиями рвёт серию: «подряд» значит подряд
+    # (grok, deepseek). Согласие — короткая реплика с формулой согласия.
+    streak = 0
+    for e in reversed(tail):
+        if e["author"] == HUMAN:
+            break
+        if e["kind"] != "say":
+            break
+        if len(e.get("text") or "") <= AGREE_MAX_CHARS and AGREE_RE.search(e["text"]):
+            streak += 1
+        else:
+            break
+    if streak >= PINGPONG_LIMIT:
         return ("подряд идут согласия — это вежливый пинг-понг, "
                 "а не разговор")
     return None
@@ -2025,7 +2054,7 @@ def cmd_ask(a) -> int:
         evs.append(post(**ev))
 
     note = coverage(names, evs)
-    post("choir", "note", note)
+    post(CONDUCTOR, "note", note)
     _out(f"\nслепая фаза закрыта — ответы в ленте, дальше разговор живой\n{note}")
     return 0
 
@@ -2068,7 +2097,7 @@ def hand_word(src_ev: dict, names: list[str], why: str,
         # spawn через RT_ACT_ID): без него заметки двух параллельных
         # действий склеивались в один глобальный список (нашли codex и
         # grok). Текст заметки — человеку, поля — машине.
-        post("choir", "note", note, word_to=list(names),
+        post(CONDUCTOR, "note", note, word_to=list(names),
              act=os.environ.get("RT_ACT_ID", ""),
              **({"thread": THREAD} if THREAD is not None else {}))
         _out(f"вступают ({why}): {', '.join(names)}\n")
@@ -2085,7 +2114,7 @@ def hand_word(src_ev: dict, names: list[str], why: str,
         if not rest or handoffs >= MAX_HANDOFFS:
             reason = ("кандидатов больше нет" if not rest else
                       f"потолок передач ({MAX_HANDOFFS}) исчерпан")
-            post("choir", "note",
+            post(CONDUCTOR, "note",
                  f"ход не состоялся: {fell}. {reason} — слово "
                  f"возвращается человеку", word_to=[],
                  act=os.environ.get("RT_ACT_ID", ""),
@@ -2096,7 +2125,7 @@ def hand_word(src_ev: dict, names: list[str], why: str,
             # Передача — тоже платный ход: потолок реплик без человека
             # проверялся лишь в начале цикла, и передачи его обходили
             # (нашёл codex).
-            post("choir", "note",
+            post(CONDUCTOR, "note",
                  f"ход не состоялся: {fell}. Потолок реплик без человека "
                  f"({MAX_TURNS_WITHOUT_HUMAN}) — слово возвращается человеку",
                  word_to=[], act=os.environ.get("RT_ACT_ID", ""))
@@ -2116,7 +2145,7 @@ def _cap_group(names: list[str]) -> list[str]:
 
 
 def _close_thread(thread: int, why: str) -> None:
-    post("choir", "note", f"ветка закрыта: {why} — слово возвращается человеку",
+    post(CONDUCTOR, "note", f"ветка закрыта: {why} — слово возвращается человеку",
          word_to=[], thread=thread, act=os.environ.get("RT_ACT_ID", ""))
     print(f"ветка закрыта: {why} — слово у человека")
 
@@ -2184,12 +2213,12 @@ def cmd_say(a) -> int:
     while True:
         stop = guards(roster())
         if stop:
-            post("choir", "note", stop)
+            post(CONDUCTOR, "note", stop)
             print(f"\n⏸  {stop}")
             break
         note = skew_note(roster())
         if note:
-            post("choir", "note", note)
+            post(CONDUCTOR, "note", note)
             print(f"\n⚠  {note}")
         # Продолжение решается по РЕЗУЛЬТАТУ СВОЕГО хода, а не по хвосту
         # общей ленты. Хвост подводил дважды: заметка или act_status,
@@ -2328,7 +2357,7 @@ def cmd_reset(a) -> int:
             save_state(v, {"session": None, "cursor": next_id() - 1,
                            "turns": 0}, ch)
     scope = f" проекта {PROJECT}" if PROJECT else ""
-    post("choir", "note", f"нити{scope} сброшены: голоса начинают разговор заново")
+    post(CONDUCTOR, "note", f"нити{scope} сброшены: голоса начинают разговор заново")
     print(f"нити{scope} сброшены, лента сохранена")
     return 0
 

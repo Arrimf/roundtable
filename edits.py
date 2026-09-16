@@ -492,7 +492,17 @@ def open_edit(project: Path, task: str, voice: str,
 # Авторы, чьим event'ам close верит вердикт. Под одним uid подделать
 # можно любую строку (обнаружение, не запрет) — но случайный чужой
 # kind=edit_close от голоса в разговоре не должен закрывать акт.
-_CLOSE_AUTHORS = {"choir", "roundtable"}
+def _conductor_aliases() -> tuple:
+    """Метки дирижёра — из live.py (одна истина); без него — обе известные."""
+    try:
+        sys.path.insert(0, str(CHOIR))
+        import live                                          # noqa: PLC0415
+        return tuple(live.CONDUCTOR_ALIASES)
+    except Exception:                                        # noqa: BLE001
+        return ("chamber", "choir")
+
+
+_CLOSE_AUTHORS = {*_conductor_aliases(), "roundtable"}   # choir — прежняя метка дирижёра
 
 
 def _act_events(act: str) -> list[dict]:

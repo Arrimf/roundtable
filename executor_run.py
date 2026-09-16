@@ -83,7 +83,7 @@ def post(kind: str, text: str, **extra):
     """Событие в ленту — через live.post, как всё в этом проекте."""
     sys.path.insert(0, str(CHOIR))
     import live                                          # noqa: PLC0415
-    return live.post("choir", kind, text, **extra)
+    return live.post(live.CONDUCTOR, kind, text, **extra)
 
 
 # GIT_DIR/GIT_WORK_TREE из окружения окна перенаправили бы наш git в

@@ -5266,7 +5266,7 @@ function add(ev){
   // kind=error с текстом в detail (нашёл kimi, переезд-v1). Рендер по
   // одному лишь text рисовал такой отказ ПУСТОЙ СТРОКОЙ — интерфейс
   // молча врал, что голос ответил ничем.
-  const sys=(a==='choir'||a==='roundtable'||k==='act_status'||
+  const sys=(a==='chamber'||a==='choir'||a==='roundtable'||k==='act_status'||
              k==='lot_commit'||k==='lot_reveal');
   el.className='ev '+(k==='error'?'err':(a==='arr'?'arr':(sys?'sys':'')))+(ev.thread?' thr':'');
   let body=(ev.text||'')||(k==='error'?'(пусто)':'');
