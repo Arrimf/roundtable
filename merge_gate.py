@@ -697,6 +697,12 @@ def rebase_act(act: str, *, post=None) -> dict:
         if new_base is None:
             raise GateRefused(f"ветка {branch} не прочитана: {err}")
         new_base = new_base.strip()
+        # База — ПОД замком, свежим чтением ленты: снимок до flock давал
+        # второму rebase в гонке устаревшую базу — no-op перенос и второе
+        # событие edit_rebase (ревизия 2026-09-16: субагент, codex).
+        st = act_state(act)
+        if st.get("merge"):
+            raise GateRefused("акт уже принят")
         cur_base = _effective_base(st)
         if new_base == cur_base:
             raise GateRefused("база не уезжала — rebase не нужен")

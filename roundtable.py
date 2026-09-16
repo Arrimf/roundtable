@@ -753,6 +753,51 @@ def act_view(act: str) -> dict:
     return out
 
 
+class ReviewNotStarted(RuntimeError):
+    """Веер не запущен по причине, названной в тексте (rebase не прошёл);
+    резерв веера уже снят. Отличается от «ревизия уже идёт» (None)."""
+
+
+_REBASING: set[str] = set()      # акты, чью ветку гейт сейчас переносит на main
+
+
+def _rebase_before_review(act: str) -> dict | None:
+    """Перенести ветку акта на уехавший main перед веером ревизии.
+    Механика гейта, не вердикт; конфликт — честная заметка в ленту и
+    None (ревизии не будет, разруливать — исполнителю или Автору).
+    Зовётся ПОД резервом веера (_spawn_review): иначе повторный запрос
+    переносил бы ветку под уже идущей ревизией и обесценивал её
+    (ревизия 2026-09-16: codex, deepseek, субагент)."""
+    with RUN_LOCK:
+        _REBASING.add(act)       # /edit continue и /edit_drop подождут
+    try:
+        rb = merge_gate.rebase_act(act)
+    except merge_gate.GateRefused as e:
+        try:
+            still = merge_gate.checks(act).get("stale_base")
+        except Exception:                                   # noqa: BLE001
+            still = True
+        if not still:
+            # перенёс кто-то другой (гонка двух запросов): база свежая,
+            # веер можно слать — заметка «не прошёл» была бы ложью
+            return {}
+        feed_append("note", f"правка {act}: main уехал, а rebase не "
+                    f"прошёл — {e}; ревизия не запущена", act=act)
+        return None
+    except Exception as e:                                  # noqa: BLE001
+        feed_append("note", f"правка {act}: rebase перед ревизией упал — "
+                    f"{e}", act=act)
+        return None
+    finally:
+        with RUN_LOCK:
+            _REBASING.discard(act)
+    feed_append("note", f"правка {act}: main уехал — ветка перенесена "
+                f"гейтом на {str(rb.get('base_sha') or '')[:12]} "
+                f"(голова {str(rb.get('head') or '')[:12]}); ревизия идёт "
+                f"на новой голове", act=act)
+    return rb
+
+
 def _spawn_review(act: str, *, auto: bool = False,
                   queue_if_busy: bool = False) -> str | None:
     """Ревизия дифа акта столом — один резерв на все формы (кнопка,
@@ -760,7 +805,9 @@ def _spawn_review(act: str, *, auto: bool = False,
     Возвращает act_id; None — ревизия уже идёт (при queue_if_busy акт
     поставлен в очередь ПОД ТЕМ ЖЕ замком: между проверкой занятости и
     постановкой веер иначе мог освободиться, и очередь зависла бы —
-    ревизия второго круга, codex)."""
+    ревизия второго круга, codex). Уехавший main переносится ЗДЕСЬ, уже
+    под резервом веера (спека п.7: сдвиг main → rebase → ревизия дельты);
+    не прошёл — ReviewNotStarted, резерв снят."""
     with RUN_LOCK:
         if _STOPPING:
             return None          # finally окна уже забрал RUNNING себе (ревьюер дифа)
@@ -773,6 +820,14 @@ def _spawn_review(act: str, *, auto: bool = False,
     if dup:
         return None
     try:
+        try:
+            stale = merge_gate.checks(act).get("stale_base")
+        except Exception as e:                              # noqa: BLE001
+            stale = False
+            print(f"_spawn_review: checks {act}: {e}", file=sys.stderr)
+        if stale and _rebase_before_review(act) is None:
+            raise ReviewNotStarted("main уехал, а rebase не прошёл — "
+                                   "см. заметку в ленте")
         return spawn([sys.executable,
                       str(Path(__file__).resolve().parent / "merge_gate.py"),
                       "review", act],
@@ -836,14 +891,11 @@ def _auto_review(act: str) -> str:
                         f"причина в логе кресла", act=act)
             return "skipped"
         c = merge_gate.checks(act)
-        if c.get("stale_base"):
-            # одобрения на уехавшей базе сгорят при rebase (gate_test):
-            # веер жечь бессмысленно, сначала rebase кнопкой «Принять»
-            feed_append("note", f"правка {act}: main уехал с момента "
-                        f"открытия — авторевизия отложена до rebase "
-                        f"(кнопка «Принять» сделает его и запросит "
-                        f"ревизию дельты)", act=act)
-            return "skipped"
+        # main уехал: rebase сделает _spawn_review под резервом веера
+        # (спека п.7). Прежде авторевизия тут откладывалась «до кнопки
+        # Принять», а кнопка без кворума не показывается — тупик (Автор
+        # 2026-09-16, правка 140adf4a5a91).
+        stale = bool(c.get("stale_base"))
         base = merge_gate._effective_base(st)
         diff, head, _psha = merge_gate.act_diff(
             Path(st["open"].get("project", "")), act, base)
@@ -855,9 +907,13 @@ def _auto_review(act: str) -> str:
         feed_append("note", f"правка {act}: диф пуст — ревизовать нечего "
                     f"(исполнитель ничего не изменил)", act=act)
         return "skipped"
-    if any(r.get("sha") == head for r in st.get("reviews") or []):
+    if not stale and any(r.get("sha") == head for r in st.get("reviews") or []):
         return "skipped"   # на этой голове ревизия уже есть (кнопка успела) — второй веер не нужен (kimi)
-    if _spawn_review(act, auto=True, queue_if_busy=True) is None:
+    try:
+        started = _spawn_review(act, auto=True, queue_if_busy=True)
+    except ReviewNotStarted:
+        return "skipped"          # заметка о rebase уже в ленте
+    if started is None:
         with RUN_LOCK:
             pos = (_REVIEW_QUEUE.index(act) + 1) if act in _REVIEW_QUEUE else 0
         if not pos:
@@ -3623,6 +3679,9 @@ class Handler(BaseHTTPRequestHandler):
                                f"{voice} (random.choice по умеющим "
                                f"правки — НЕ жребий drand)")
             with RUN_LOCK:
+                if cont and cont in _REBASING:
+                    return self._json(409, {"error": "гейт переносит ветку акта "
+                                            "на main — повторите через минуту"})
                 busy_edit = [t for t in RUNNING.values()
                              if t.get("edit")
                              and t.get("edit_project") == proj_key]
@@ -3736,9 +3795,16 @@ class Handler(BaseHTTPRequestHandler):
                 finally:
                     with RUN_LOCK:
                         _EDIT_RESERVED.discard("review")
-            elif _spawn_review(act) is None:
-                return self._json(409, {"error": "ревизия уже идёт — "
-                                        "дождитесь вердиктов"})
+            else:
+                # Уехавший main _spawn_review переносит сам, под резервом
+                # веера: занятость проверяется ДО rebase (ревизия 2026-09-16).
+                try:
+                    started = _spawn_review(act)
+                except ReviewNotStarted as e:
+                    return self._json(409, {"error": str(e)})
+                if started is None:
+                    return self._json(409, {"error": "ревизия уже идёт — "
+                                            "дождитесь вердиктов"})
             return self._json(200, {"batch": batch, "act": act or None,
                                     "started": True})
 
@@ -3795,6 +3861,8 @@ class Handler(BaseHTTPRequestHandler):
                 # ветку читает кресло, одиночный веер (meta.edit=act) и
                 # веер пачки (edit="batch"); резерв — открывающееся
                 # кресло того же проекта (ревизия: субагент, grok, gemini)
+                if act in _REBASING:
+                    return self._json(409, {"error": "гейт переносит ветку акта на main — дождитесь"})
                 if any(t.get("edit") == act for t in RUNNING.values()):
                     return self._json(409, {"error": "по акту идёт кресло или ревизия — дождитесь конца"})
                 if any(t.get("edit") == "batch" for t in RUNNING.values()):
@@ -6560,9 +6628,9 @@ document.getElementById('quick').onclick=()=>sendQuick();
     // те же условия, что у панели coder: гейт при merge сам делает rebase,
     // поэтому «Принять» — по кворуму и отсутствию отказов, не по c.ok
     if(v.stage==='closed'||v.stage==='adopted'){
-      if(!ref&&ap<q)gateBtn(row,'Ревизия',function(){if(!confirm('Ревизия акта '+a+': платный веер всем, кроме исполнителя. Пускаем?'))return;
+      if(!ref&&ap<q)gateBtn(row,c.stale_base?'Rebase + ревизия':'Ревизия',function(){if(!confirm('Ревизия акта '+a+': платный веер всем, кроме исполнителя.'+(c.stale_base?' main уехал — гейт сперва перенесёт ветку на него (rebase), потом разошлёт новую голову.':'')+' Пускаем?'))return;
         gatePost('/edit_review',{act:a},function(){return 'ревизия '+a+' запущена — вердикты придут в ленту'})});
-      if(ap>=q&&!ref)gateBtn(row,'Принять в main',function(){if(!confirm('Принять акт '+a+' в main? Кворум '+ap+'/'+q+(c.stale_base?'; main уехал — гейт сделает rebase, одобрения сгорят, если дельта непуста':'')+'. Ветка сольётся, main сдвинется.'))return;
+      if(ap>=q&&!ref)gateBtn(row,'Принять в main',function(){if(!confirm('Принять акт '+a+' в main? Кворум '+ap+'/'+q+(c.stale_base?'; main уехал — гейт сделает rebase, голова сменится и одобрения сгорят':'')+'. Ветка сольётся, main сдвинется.'))return;
         gatePost('/edit_merge',{act:a},function(j){return 'принято: '+(j.result_sha||'').slice(0,12)})});}
     if(v.stage==='crashed')gateBtn(row,'Adopt',function(){if(!confirm('Adopt акта '+a+': рассмотреть вылетевшую работу из карантина?'))return;
       gatePost('/edit_adopt',{act:a},function(){return 'adopt: '+a})});
@@ -6578,7 +6646,7 @@ document.getElementById('quick').onclick=()=>sendQuick();
         const ta=document.createElement('textarea'); ta.rows=2; ta.placeholder='продолжить: что доработать, что ответить на замечания, куда двигаться дальше — исполнителю уйдёт прежнее задание, замечания ревизии на этой голове и эти слова';
         ta.value=GATE.draft[a]||''; ta.oninput=function(){GATE.draft[a]=ta.value}; cw.appendChild(ta);
         const cb=gateBtn(cr,'Продолжить',function(){const t=(ta.value||'').trim(); if(!t){vnote&&vnote('продолжение пустое: скажите, что доработать');ta.focus();return}
-          if(!confirm('Продолжить правку '+a+' тем же исполнителем ['+(v.voice||'?')+'] на той же ветке? Прежние вердикты в счёт не идут, авторевизия пойдёт снова.'))return;
+          if(!confirm('Продолжить правку '+a+' тем же исполнителем ['+(v.voice||'?')+'] на той же ветке?\n\nИсполнитель получит прежнее задание, замечания ревизии на этой голове дословно и ваш текст. Когда он закончит, стол проверит правку заново (счёт одобрений начнётся с нуля).'))return;
           gatePost('/edit',{continue:a,text:t,thoughts:thoughtsOn()},function(j){GATE.draft[a]=''; return 'продолжение '+a+' ушло исполнителю ['+j.voice+'], эпоха '+j.epoch})});
         cb.title='Тот же акт, та же ветка и рабочее дерево, тот же исполнитель (галочки пула не спрашиваются), новая эпоха аренды. Исполнитель получит прежнее задание, замечания ревизии на текущей голове дословно и ваш текст; ревьюерам прежние вердикты не показываются.'}
       const db=gateBtn(cr,'Отбросить',function(){const why=prompt('Отбросить правку '+a+'? Ветка и рабочее дерево удаляются (коммиты остаются под refs/rt-dropped/act/'+a+'), в ленте — запись с головой ветки. Причина (в ленту):',''); if(why===null)return;
