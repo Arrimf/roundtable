@@ -3051,6 +3051,26 @@ def limits_now() -> tuple[dict, float]:
 
 
 # ── HTTP ─────────────────────────────────────────────────────────────
+class _Server(ThreadingHTTPServer):
+    """Обрыв соединения клиентом (браузер закрыл вкладку или страницу
+    перезагрузили посреди ответа /voices) — не авария окна. Штатный
+    socketserver печатал на это трассу на 20 строк, и она читалась как
+    падение: Автор нажал ^C и прервал идущий веер ревизии (2026-09-16,
+    акт b4874e5c). Теперь — одна строка, без трассы."""
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        # TimeoutError сюда не входит: сокет окна без таймаута, а
+        # таймаут из тела обработчика — чужая авария, не клиент
+        # (ревизия: deepseek, grok, субагент).
+        if isinstance(exc, (BrokenPipeError, ConnectionResetError,
+                            ConnectionAbortedError)):
+            print(f"клиент {client_address[0]}:{client_address[1]} оборвал "
+                  f"соединение ({type(exc).__name__}) — окно живёт дальше",
+                  file=sys.stderr)
+            return
+        super().handle_error(request, client_address)
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):                      # тишина в терминале
         pass
@@ -7282,7 +7302,7 @@ def main(argv: list[str] | None = None) -> int:
         signal.signal(_sig, _bye)
 
     try:
-        srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+        srv = _Server(("127.0.0.1", PORT), Handler)
         PORT = srv.server_address[1]          # --port 0 → фактический порт (карточка окна, реестр)
     except OSError as e:
         # Трейсбек на «порт занят» — грубость: чаще всего это ВТОРОЕ окно
