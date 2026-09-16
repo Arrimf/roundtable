@@ -1988,9 +1988,10 @@ GROK_SUBS = "https://grok.com/rest/subscriptions"
 GEMINI_KEYS = Path.home() / ".gemini" / "keys.txt"
 GEMINI_ROT = Path.home() / ".gemini" / ".rot_last_http"
 
-_LIM = {"ts": 0.0, "data": {}, "busy": False}
+_LIM = {"ts": 0.0, "data": {}, "busy": False, "error": False,
+        "retry_at": 0.0, "waited": False}
 _LIM_LOCK = threading.Lock()
-_LIM_READY = threading.Event()
+_LIM_READY = threading.Event()  # первый сбор завершён (в том числе ошибкой); не сбрасываем
 
 
 def _iso(unix: float) -> str:
@@ -3028,22 +3029,31 @@ def _refresh() -> None:
         with _LIM_LOCK:
             if data is not None:
                 _LIM["data"], _LIM["ts"] = data, time.time()
+            _LIM["error"] = data is None
+            # Ошибка должна быть видна опросу /voices: не запускать
+            # новый сбор каждым GET при оставшемся старом снимке.
+            _LIM["retry_at"] = time.time() + LIMITS_TTL if data is None else 0.0
             _LIM["busy"] = False
-        _LIM_READY.set()
+            _LIM_READY.set()
 
 
-def limits_now() -> tuple[dict, float]:
+def limits_now(force: bool = False) -> tuple[dict, float]:
     """Снимок лимитов и время замера. /voices НЕ ЖДЁТ сбора: устаревший
     снимок отдаётся сразу, обновление уходит в фоновую нить. Ждёт
     только самый первый запрос за жизнь окна и не дольше FIRST_WAIT —
     иначе первая же карточка была бы сплошным «unknown», а окно,
-    задумавшееся на секунды, читается как зависшее."""
+    задумавшееся на секунды, читается как зависшее. force обходит TTL
+    без ожидания; если сбор уже идёт, второй не запускается."""
     with _LIM_LOCK:
-        stale = time.time() - _LIM["ts"] > LIMITS_TTL
-        if stale and not _LIM["busy"]:
+        now = time.time()
+        stale = now - _LIM["ts"] > LIMITS_TTL and now >= _LIM["retry_at"]
+        if (force or stale) and not _LIM["busy"]:
             _LIM["busy"] = True
+            _LIM["error"] = False
             threading.Thread(target=_refresh, daemon=True).start()
-        first = _LIM["ts"] == 0.0
+        first = not force and not _LIM["waited"] and _LIM["ts"] == 0.0
+        if first:
+            _LIM["waited"] = True
     if first:
         _LIM_READY.wait(FIRST_WAIT)
     with _LIM_LOCK:
@@ -3246,9 +3256,14 @@ class Handler(BaseHTTPRequestHandler):
             # Карточки голосов: чем отвечает каждый и что о его лимите
             # известно. Лимиты — из кэша (см. limits_now): окно не имеет
             # права задумываться на секунды, когда его опрашивают.
-            limits, lts = limits_now()
+            limits_now()
+            with _LIM_LOCK:
+                limits, lts = dict(_LIM["data"]), _LIM["ts"]
+                refreshing, error = _LIM["busy"], _LIM["error"]
             self._json(200, {
                 "ts": _now(),
+                "limits_refreshing": refreshing,
+                "limits_error": error,
                 "limits_measured_at": _iso(lts) if lts else None,
                 "limits_age_s": int(time.time() - lts) if lts else None,
                 "voices": [voice_report(
@@ -4483,6 +4498,10 @@ class Handler(BaseHTTPRequestHandler):
                              goal=text, by="arr")
             return self._json(200, {"event": ev["id"], "goal": text})
 
+        if self.path == "/limits_refresh":
+            limits_now(force=True)
+            return self._json(202, {"ok": True})
+
         if self.path == "/models_refresh":
             # Кнопка ⟳ окна (наказ Автора 2026-09-02): разведка списков
             # у самих каналов, без единого модельного вызова — API по
@@ -4845,8 +4864,9 @@ font:.84rem/1.35 ui-sans-serif,system-ui,sans-serif;max-height:28rem;overflow:au
    тексту, лишнее переносится на следующую строку. */
 #coderblk .qrow>button{flex:1 1 auto;min-width:max-content}
 #coderblk .qrow>input{box-sizing:border-box}
-.vhead3row{display:flex;align-items:center;justify-content:space-between;gap:.4rem}
-#mrefresh{font-size:.7rem;padding:0 .45rem;line-height:1.4}
+.vhead3row{display:flex;align-items:center;justify-content:space-between;gap:.4rem;flex-wrap:wrap}
+.vrefresh{display:flex;gap:.4rem;margin-left:auto}
+#mrefresh,#lrefresh{font-size:.7rem;padding:0 .45rem;line-height:1.4;white-space:nowrap}
 #vnote{font:.72rem ui-monospace,monospace;color:var(--muted,#777);
 margin:.2rem 0 .3rem;white-space:pre-wrap;word-break:break-word}
 </style></head><body>
@@ -4859,7 +4879,9 @@ margin:.2rem 0 .3rem;white-space:pre-wrap;word-break:break-word}
 <div id="side">
   <div class="grip grip-v" id="grip-side" title="Ширина правой панели. Тяните; положение запоминается. Двойной щелчок — вернуть по умолчанию."></div>
   <div class="vhead3row"><h3 id="vhead3">Голоса · кому уйдёт</h3>
-    <button id="mrefresh" title="Обновить списки моделей и ступеней у ВСЕХ голосов — для всех трёх вкладок сразу. Без единого модельного вызова: claude — api.anthropic.com/v1/models по OAuth-токену самого Claude Code; codex и grok — кэши их CLI (обновляются самими CLI при их вызовах); kimi — Moonshot /v1/models ключом линии плюс алиасы config.toml; deepseek и gemini — `--models` адаптеров. Итог — событием models_refresh в ленту; отказ источника не стирает прежний список. Наказ Автора 2026-09-02: «появилась новая модель — предусмотрим кнопочку обновить список».">⟳ модели</button></div>
+    <div class="vrefresh">
+    <button id="mrefresh" title="Обновить списки моделей и ступеней у ВСЕХ голосов — для всех трёх вкладок сразу. Без единого модельного вызова: claude — api.anthropic.com/v1/models по OAuth-токену самого Claude Code; codex и grok — кэши их CLI (обновляются самими CLI при их вызовах); kimi — Moonshot /v1/models ключом линии плюс алиасы config.toml; deepseek и gemini — `--models` адаптеров. Итог — событием models_refresh в ленту; отказ источника не стирает прежний список. Наказ Автора 2026-09-02: «появилась новая модель — предусмотрим кнопочку обновить список».">⟳ модели</button>
+    <button id="lrefresh" title="Обновить лимиты всех голосов сейчас">⟳ лимиты</button></div></div>
   <div id="scopebar" title="ОДИН переключатель на весь список (наказ Автора 2026-08-31: «чтобы видно было»). Он выбирает, ЧЬЮ пару модель+усилие показывают и меняют ячейки ниже — у каждого голоса их две, независимые.
 💬 комната: живой разговор, запускает live.py — «Сказать», «Слепой ход», «Быстрый вопрос».
 🎼 раунды: протокол стола, запускает choir.py — «Раунд стола» (жребий, затравка, слепая фаза, витки, свод).
@@ -6083,6 +6105,32 @@ document.getElementById('mrefresh').onclick=async function(){
   vnote('обновлено '+new Date().toLocaleTimeString()+' — '+parts.join(' · '),true);
   if(Array.isArray(j.voices))applyVoices(j.voices,true);
 };
+document.getElementById('lrefresh').onclick=async function(){
+  const b=this;
+  b.disabled=true;b.textContent='⟳ замер…';
+  vnote('обновляю лимиты у всех голосов…',true);
+  try{
+    const r=await fetch('/limits_refresh',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:'{}',signal:AbortSignal.timeout(10000)});
+    if(!r.ok)throw new Error('ошибка '+r.status);
+    const deadline=Date.now()+60000;
+    let pollFailed=false;
+    while(Date.now()<deadline){
+      const j=await loadVoices();
+      pollFailed=!j;
+      if(j&&!j.limits_refreshing){
+        if(j.limits_error)throw new Error('сбор лимитов завершился ошибкой; сохранён прежний замер');
+        vnote('замер лимитов завершён — '+new Date().toLocaleTimeString()+
+          '; доступность источников указана в карточках',true);
+        return;
+      }
+      await new Promise(resolve=>setTimeout(resolve,1000));
+    }
+    vnote(pollFailed?'не удалось проверить завершение замера; карточки обновятся автоматически':
+      'замер ещё идёт; карточки обновятся автоматически',true);
+  }catch(e){vnote('обновление лимитов: '+e.message)}
+  finally{b.disabled=false;b.textContent='⟳ лимиты'}
+};
 function setScope(v){
   SCOPE=v;
   try{localStorage.setItem('rt-scope',v)}catch(_){}
@@ -6283,13 +6331,14 @@ function syncQuick(names){
 }
 async function loadVoices(){
   let r;
-  try{r=await fetch('/voices')}catch(e){return}   // нет — панель живёт на /state
+  try{r=await fetch('/voices',{signal:AbortSignal.timeout(10000)})}catch(e){return}   // нет — панель живёт на /state
   if(!r.ok)return;
   let j;try{j=await r.json()}catch(e){return}
   const list=Array.isArray(j)?j:(j&&Array.isArray(j.voices)?j.voices:null);
   if(!list||!list.length)return;
   LIM_AGE=(j&&typeof j.limits_age_s==='number')?j.limits_age_s:null;
   VOICES_SRC=true;applyVoices(list);
+  return j;
 }
 loadVoices();setInterval(loadVoices,15000);
 

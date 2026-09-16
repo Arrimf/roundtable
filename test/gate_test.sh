@@ -396,6 +396,46 @@ t("событие seal_note легло в ленту",
 t("повторная проба после фиксации молчит",
   mg.seal_probe(proj, "main") is None)
 
+# ── журналы стола — не грязь для обновления копии (2026-09-16) ──
+t("_dirty_paths: журнал не считается рукой Автора, остальное — считается",
+  mg._dirty_paths({"RoundTable/journal/live.jsonl", "RoundTable/journal/rounds/x.md", "a.py", "x"}, "RoundTable/journal/") == {"a.py", "x"})
+t("_journal_rel: журнал вне проекта — пусто", mg._journal_rel(proj) == "")
+_saved = edits.JOURNAL
+try:
+    edits.JOURNAL = proj / "RoundTable" / "journal"
+    t("_journal_rel: журнал внутри проекта — относительный путь с /", mg._journal_rel(proj) == "RoundTable/journal/")
+finally:
+    edits.JOURNAL = _saved
+# _sync_checkout по-настоящему: отдельный репо, журнал ВНУТРИ, HEAD уже на
+# result (как после update-ref), индекс и дерево — на base; в правке —
+# изменение, удаление и файл с пробелом; в журнале — дописанная строка
+import tempfile as _tf
+_sr = Path(_tf.mkdtemp(prefix="sync."))
+def _g(*a):
+    return subprocess.run(["git", "-C", str(_sr), *a], capture_output=True, text=True, check=True).stdout.strip()
+_g("init", "-q", "-b", "main"); _g("config", "user.name", "t"); _g("config", "user.email", "t@t")
+(_sr / "journal").mkdir(); (_sr / "journal" / "live.jsonl").write_text("{1}\n")
+(_sr / "a.py").write_text("old\n"); (_sr / "del.py").write_text("bye\n"); (_sr / "sp ace.txt").write_text("old sp\n")
+_g("add", "-A"); _g("commit", "-qm", "base"); _base = _g("rev-parse", "HEAD")
+_g("checkout", "-q", "-b", "act/x")
+(_sr / "a.py").write_text("new\n"); (_sr / "del.py").unlink(); (_sr / "sp ace.txt").write_text("new sp\n"); (_sr / "journal" / "live.jsonl").write_text("{1}\n{act}\n")
+_g("add", "-A"); _g("commit", "-qm", "act"); _res = _g("rev-parse", "HEAD")
+_g("checkout", "-q", "main"); _g("update-ref", "refs/heads/main", _res)   # ref двинут, индекс и дерево — base
+(_sr / "journal" / "live.jsonl").write_text("{1}\n{late}\n")                # дописано после базы
+(_sr / "keep.txt").write_text("моё, не трогать\n")
+_moved = mg._diff_paths(_sr, _base, _res)
+t("_diff_paths: пути с пробелом целы, удалённый и журнал в списке", _moved == {"a.py", "del.py", "sp ace.txt", "journal/live.jsonl"})
+_dirty = mg._dirty_paths(mg._status_paths(_sr), "journal/")
+t("_status_paths/_dirty_paths: после move ref грязны только файлы правки, журнал отфильтрован", _dirty == {"a.py", "del.py", "sp ace.txt"})
+_msg = mg._sync_checkout(_sr, _res, _moved, "main", "journal/")
+t("_sync_checkout: файлы правки подтянуты, удалённый убран, журнал и чужой untracked целы",
+  _msg.startswith("обновлена") and (_sr / "a.py").read_text() == "new\n" and (_sr / "sp ace.txt").read_text() == "new sp\n"
+  and not (_sr / "del.py").exists() and (_sr / "journal" / "live.jsonl").read_text() == "{1}\n{late}\n"
+  and (_sr / "keep.txt").read_text() == "моё, не трогать\n")
+t("_sync_checkout: трекаемое чисто, кроме журнала", mg._status_paths(_sr) == {"journal/live.jsonl"})
+_g("checkout", "-q", "--detach")
+t("_sync_checkout: checkout не на ветке приёмки — отказ с рецептом", mg._sync_checkout(_sr, _res, _moved, "main", "journal/").startswith("НЕ обновлена: checkout стоит на"))
+
 print(f"\ngate: PASS {ok} · FAIL {bad}")
 sys.exit(1 if bad else 0)
 PY

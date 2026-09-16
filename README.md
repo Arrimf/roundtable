@@ -117,11 +117,15 @@ executor's chair). Defaults are explicit: a cell shows `opus (умолчание
 and names who holds that default (live.py, choir.py, the CLI's own
 config), never a bare dash. Where a dial does not exist the cell says so
 in words (kimi's CLI has no effort flag; `dsh` has no effort knob;
-gemini has no chair). The ⟳ button refreshes the model lists from the
+gemini has no chair). The «⟳ модели» button refreshes the model lists from the
 channels themselves without a single model call: Anthropic `/v1/models`
 via the CLI's OAuth token, the codex and grok CLI caches, Moonshot
 `/v1/models` plus the CLI aliases, `--models` of the HTTP adapters
-(`catalog.py`). The coder controls (edit, review, merge, adopt, act
+(`catalog.py`). The adjacent «⟳ лимиты» button starts a fresh background
+limits check for all voices and updates their cards without model calls.
+If collection fails, the previous snapshot is kept; automatic retries wait
+at least 3 minutes, while the button can retry immediately. An ongoing check is shared.
+The coder controls (edit, review, merge, adopt, act
 feed) live in the side panel under the lottery buttons and appear only
 on the 🔧 tab; the dialog buttons at the bottom never move.
 

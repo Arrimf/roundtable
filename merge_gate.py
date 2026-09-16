@@ -630,11 +630,85 @@ def checks(act: str) -> dict:
     return out
 
 
+def _journal_rel(project: Path) -> str:
+    """Каталог журналов стола относительно проекта («RoundTable/journal/»)
+    или «» — если журналы лежат вне этого репозитория."""
+    try:
+        return str(edits.JOURNAL.resolve().relative_to(Path(project).resolve())) + "/"
+    except ValueError:
+        return ""
+
+
+def _dirty_paths(paths: set | None, journal_rel: str) -> set[str]:
+    """Изменённые пути без журналов стола."""
+    return {p for p in (paths or set())
+            if not (journal_rel and p.startswith(journal_rel))}
+
+
+def _sync_checkout(project: Path, result: str, moved: set[str],
+                   branch: str = "", journal_rel: str = "") -> str:
+    """Подтянуть рабочую копию к принятому result: индекс на result, файлы
+    правки — из индекса; остального (журналы, чужие правки) не касаться.
+    Журналы стола из правки не выписываются — checkout стёр бы строки,
+    дописанные после базы (ревизия: deepseek, grok, субагент)."""
+    if branch:
+        cur, _e = _git(project, "rev-parse", "--abbrev-ref", "HEAD")
+        if (cur or "").strip() != branch:
+            return (f"НЕ обновлена: checkout стоит на "
+                    f"{(cur or '').strip() or 'detached HEAD'}, не на {branch} — "
+                    f"переключитесь и выполните git reset -q {result[:12]} "
+                    f"&& git checkout -- <файлы правки>")
+    ok, err = _git(project, "reset", "-q", result)
+    if ok is None:
+        return f"НЕ обновлена: reset индекса: {err}"
+    files = sorted(p for p in moved
+                   if not (journal_rel and p.startswith(journal_rel)))
+    skipped = len(moved) - len(files)
+    # --literal-pathspecs: имя с * ? [ иначе читалось бы как шаблон, и
+    # файл «не находился» в индексе — его бы удалили с диска (субагент)
+    tracked, _e = _git(project, "--literal-pathspecs", "ls-files", "-z",
+                       "--", *files) if files else ("", "")
+    tracked_set = {t for t in (tracked or "").split("\0") if t}
+    to_checkout = [p for p in files if p in tracked_set]
+    if to_checkout:
+        ok, err = _git(project, "--literal-pathspecs", "checkout", "--",
+                       *to_checkout)
+        if ok is None:
+            return f"НЕ обновлена: checkout файлов правки: {err}"
+    for p in files:
+        if p in tracked_set:
+            continue
+        try:
+            (Path(project) / p).unlink()          # удалено правкой
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            return f"обновлена частично: {p} не удалён ({e})"
+    return (f"обновлена (checkout {len(to_checkout)} файл(ов) правки"
+            + (f", удалено {len(files) - len(to_checkout)}" if len(files) > len(to_checkout) else "")
+            + (f", журналы не тронуты: {skipped}" if skipped else "")
+            + ")")
+
+
 def _diff_paths(project: Path, a: str, b: str) -> set:
     """Пути файлов дифа a..b: их «изменённость» после move ref —
-    ожидаемый артефакт самого merge, не рука Автора."""
-    out, _ = _git(project, "diff", "--name-only", f"{a}..{b}")
-    return {p for p in (out or "").split() if p}
+    ожидаемый артефакт самого merge, не рука Автора. Без детекции
+    переименований (старый и новый путь — оба) и через NUL: пробел или
+    кириллица в имени иначе рвали путь на части или прятали его в
+    кавычки (ревизия 2026-09-16: субагент, grok)."""
+    out, _ = _git(project, "diff", "--name-only", "--no-renames", "-z",
+                  f"{a}..{b}")
+    return {p for p in (out or "").split("\0") if p}
+
+
+def _status_paths(project: Path) -> set | None:
+    """Трекаемые пути с изменениями (индекс или дерево), без детекции
+    переименований и через NUL; None — git не ответил."""
+    out, _ = _git(project, "status", "--porcelain", "--no-renames", "-z",
+                  "-uno")
+    if out is None:
+        return None
+    return {ent[3:] for ent in out.split("\0") if len(ent) > 3}
 
 
 def rebase_act(act: str, *, post=None) -> dict:
@@ -861,8 +935,14 @@ def merge(act: str, *, blind_open: bool = False, blind_check=None,
         # -uno: untracked НЕ грязь для этого решения — reset --hard их
         # не трогает, потерь нет. Живой прогон: __pycache__ от ревизии
         # голоса заморозил бы обновление копии навсегда.
-        st0, _ = _git(project, "status", "--porcelain", "-uno")
-        clean_before = st0 is not None and not st0.strip()
+        st0 = _status_paths(project)
+        # Журналы стола (RoundTable/journal/*) версионируются намеренно и
+        # грязны ВСЕГДА — лента дописывается каждым событием. Считать их
+        # «рукой Автора» значило никогда не обновлять копию: после merge
+        # 140adf4a5a91 (2026-09-16) Автор перезапускал окно и не видел
+        # принятой кнопки — код был в main, а в checkout старый.
+        jrel = _journal_rel(project)
+        clean_before = st0 is not None and not _dirty_paths(st0, jrel)
 
         trailers = "".join(f"Reviewed-by: {v}\n" for v in c2["approvals"])
         msg = (f"act {act}: {task[:60]}\n\n"
@@ -913,25 +993,33 @@ def merge(act: str, *, blind_open: bool = False, blind_check=None,
         # только тем, что ref уехал вперёд, отфильтровать нельзя — но
         # clean_before уже сказал, что ДО ref их не было, а появиться
         # им, кроме рук Автора, неоткуда: сравниваем оба снимка.
-        st1, _ = _git(project, "status", "--porcelain", "-uno")
+        st1 = _status_paths(project)
         # Сравниваем ПУТИ, не строки porcelain: буквы статуса после
         # move ref другие (staged M против worktree M), и строковое
         # сравнение видело «руку Автора» в собственном артефакте гейта
         # (поймано прогоном теста).
         moved = _diff_paths(project, base_sha, result)
-        dirty_paths = {ln[3:] for ln in (st1 or "").splitlines() if ln}
+        dirty_paths = _dirty_paths(st1, jrel)
+        # Порядок для рук Автора: СНАЧАЛА индекс на result (свои правки
+        # остаются в дереве незакоммиченными), потом файлы правки, потом
+        # свой коммит — иначе его коммит из старого индекса откатил бы
+        # правку акта (ревизия: субагент).
+        _files = sorted(p for p in moved if not (jrel and p.startswith(jrel)))
+        how = (f"git reset -q {result[:12]} && git checkout -- "
+               + " ".join(_files[:20]) + (" …" if len(_files) > 20 else "")
+               + "; удалённые правкой файлы уберите руками; потом коммитьте своё")
         if not clean_before:
             wc = ("грязная: НЕ обновлена — закоммитьте/уберите своё и "
-                  "выполните git reset --hard " + result[:12])
+                  "выполните " + how)
         elif dirty_paths - moved:
             wc = ("НЕ обновлена: рабочая копия изменилась во время "
                   "приёмки (" + ", ".join(sorted(dirty_paths - moved)[:3])
-                  + ") — разберитесь и выполните git reset --hard "
-                  + result[:12])
+                  + ") — разберитесь и выполните " + how)
         else:
-            ok_r, err = _git(project, "reset", "--hard", result)
-            wc = ("обновлена (reset --hard)" if ok_r is not None
-                  else f"НЕ обновлена: {err}")
+            # Не reset --hard: он стёр бы недописанные строки журналов.
+            # Индекс — на result, из него — только файлы правки; удалённые
+            # правкой файлы убираются с диска (в индексе их уже нет).
+            wc = _sync_checkout(project, result, moved, branch_now, jrel)
         # Пломба — ЕЩЁ ПОД замком гейта: снаружи probe успевал в щель
         # между update-ref и записью пломбы и называл СВОЙ ЖЕ merge
         # «сдвигом вне гейта» (нашли все четверо).
