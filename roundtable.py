@@ -5232,7 +5232,9 @@ function add(ev){
   // обрезанные ответы»): text события — превью в 400 символов, полный
   // текст в full_text. Длинную сворачиваем, кнопка разворачивает.
   let fold=false;
-  if(k==='edit_review'&&ev.full_text){const m=/^(ревизия [^:]*:)/.exec(ev.text||''); body=(m?m[1]+'\n':'')+ev.full_text; fold=ev.full_text.length>700}
+  if(ev.full_text&&k==='edit_review'){const m=/^(ревизия [^:]*:)/.exec(ev.text||''); body=(m?m[1]+'\n':'')+ev.full_text; fold=ev.full_text.length>700}
+  // отчёт ревизии правки Клода: итог (кто, вердикт, дефекты, файлы) целиком, ниже — запись
+  if(ev.full_text&&k==='review_note'){body=(ev.text||'')+'\n\n'+ev.full_text; fold=true}
   const det=ev.detail?'<div class="det">'+esc(ev.detail)+'</div>':'';
   const badge=(k&&k!=='say'?'<span class="kind">'+esc(k)+'</span>':'')+
     (ev.thread?'<span class="kind" title="ответ в адресной ветке между голосами">↳ ветка '+esc(String(Number(ev.thread)||''))+'</span>':'')+
@@ -6628,12 +6630,15 @@ document.getElementById('quick').onclick=()=>sendQuick();
     // те же условия, что у панели coder: гейт при merge сам делает rebase,
     // поэтому «Принять» — по кворуму и отсутствию отказов, не по c.ok
     if(v.stage==='closed'||v.stage==='adopted'){
-      if(!ref&&ap<q)gateBtn(row,c.stale_base?'Rebase + ревизия':'Ревизия',function(){if(!confirm('Ревизия акта '+a+': платный веер всем, кроме исполнителя.'+(c.stale_base?' main уехал — гейт сперва перенесёт ветку на него (rebase), потом разошлёт новую голову.':'')+' Пускаем?'))return;
+      if(!ref&&ap<q){const rb=gateBtn(row,c.stale_base?'Rebase + ревизия':'Ревизия',function(){if(!confirm('Ревизия акта '+a+': платный веер всем, кроме исполнителя.'+(c.stale_base?' main уехал — гейт сперва перенесёт ветку на него (rebase), потом разошлёт новую голову.':'')+' Пускаем?'))return;
         gatePost('/edit_review',{act:a},function(){return 'ревизия '+a+' запущена — вердикты придут в ленту'})});
-      if(ap>=q&&!ref)gateBtn(row,'Принять в main',function(){if(!confirm('Принять акт '+a+' в main? Кворум '+ap+'/'+q+(c.stale_base?'; main уехал — гейт сделает rebase, голова сменится и одобрения сгорят':'')+'. Ветка сольётся, main сдвинется.'))return;
-        gatePost('/edit_merge',{act:a},function(j){return 'принято: '+(j.result_sha||'').slice(0,12)})});}
-    if(v.stage==='crashed')gateBtn(row,'Adopt',function(){if(!confirm('Adopt акта '+a+': рассмотреть вылетевшую работу из карантина?'))return;
+        rb.title=(c.stale_base?'main уехал с момента открытия акта: гейт сперва перенесёт ветку акта на текущий main (git rebase; конфликт — честный отказ и заметка в ленте), затем ':'')+'разошлёт диф ветки всем голосам, кроме исполнителя (платный веер). Каждый ответ — событие edit_review в ленте с вердиктом первой строкой, по закрытии веера — итог со счётом. Кворум '+q+' одобрения и ни одного отказа на текущей голове открывают «Принять в main».'}
+      if(ap>=q&&!ref){const mb=gateBtn(row,'Принять в main',function(){if(!confirm('Принять акт '+a+' в main? Кворум '+ap+'/'+q+(c.stale_base?'; main уехал — гейт сделает rebase, голова сменится и одобрения сгорят':'')+'. Ветка сольётся, main сдвинется.'))return;
+        gatePost('/edit_merge',{act:a},function(j){return 'принято: '+(j.result_sha||'').slice(0,12)})});
+        mb.title='Перенести ветку акта в main (fast-forward под замком гейта): кворум набран, отказов на этой голове нет. Если main уехал — гейт сперва сделает rebase, голова сменится и одобрения сгорят: понадобится ревизия дельты. После приёмки перезапустите окно, чтобы код из ветки заработал.'}}
+    if(v.stage==='crashed'){const ab=gateBtn(row,'Adopt',function(){if(!confirm('Adopt акта '+a+': рассмотреть вылетевшую работу из карантина?'))return;
       gatePost('/edit_adopt',{act:a},function(){return 'adopt: '+a})});
+      ab.title='Акт вылетел (исполнитель умер, не закрыв аренду). Adopt — ваше явное решение рассмотреть работу из карантина: событие edit_adopt снимает условие закрытой аренды, дальше ревизия и приёмка как обычно.'}
     gateBtn(row,'⟳',function(){loadGate(true)}).title='Обновить карточку сейчас (сама она обновляется раз в 6 с, пока акт не принят)';
     gate.appendChild(row);
     // ПРОДОЛЖИТЬ (наказ Автора 2026-09-14: «продолжить — семантически,
