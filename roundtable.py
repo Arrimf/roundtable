@@ -220,6 +220,7 @@ DRAND = "https://api.drand.sh/v2/beacons/quicknet/rounds/latest"
 # разойдутся, и панель начнёт врать (тем же образом из канона выпал Грок).
 sys.path.insert(0, str(CHOIR))
 import live  # noqa: E402
+import names as fnames                         # noqa: E402  имена файлов раундов латиницей (alias: в do_POST есть локальная names)
 
 VOICES = list(live.VOICES)
 
@@ -3562,7 +3563,7 @@ class Handler(BaseHTTPRequestHandler):
                                         "разных голоса (жребий ведущего и "
                                         "слепая фаза из одного бессмысленны)"})
             rdir = JOURNAL / "rounds" / ((rp.name or "root") if rp else "RoundTable")
-            qfile = rdir / live.names.round_file("QUESTION-", name)
+            qfile = rdir / fnames.round_file("QUESTION-", name)
             # Не переписываем молча: в room.jsonl уже лежит pick с
             # question_sha от старого текста, и файл разошёлся бы с
             # журналом беззвучно (нашёл ревьюер дифа).
@@ -3600,7 +3601,7 @@ class Handler(BaseHTTPRequestHandler):
                 py = shlex.quote(sys.executable)
                 rn = shlex.quote(name)
                 seed = shlex.quote(str(qfile))
-                zt = shlex.quote(str(rdir / live.names.round_file("SEED-", name)))  # его создаст expand
+                zt = shlex.quote(str(rdir / fnames.round_file("SEED-", name)))  # его создаст expand
                 # --voices у pick и ask (expand его не знает: ведущий
                 # уже выбран жребием среди названных).
                 vs = (" --voices " + shlex.quote(",".join(rvoices))
@@ -4450,7 +4451,7 @@ class Handler(BaseHTTPRequestHandler):
                     proj = view.get("project")
                     rdir = JOURNAL / "rounds" / ((Path(proj).name or "root") if proj else "RoundTable")
                     rdir.mkdir(parents=True, exist_ok=True)
-                    cmd += ["--out", str(rdir / live.names.round_file("SUMMARY-", name))]
+                    cmd += ["--out", str(rdir / fnames.round_file("SUMMARY-", name))]
                 who = view.get("summarizer") or view["conductor"]
                 label = (f"round: {name} [виток критики "
                          f"№{view.get('rebuts', 0) + 1}]" if step == "rebut"

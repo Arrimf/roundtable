@@ -55,7 +55,6 @@ import signal
 import sys
 import threading
 
-import names                                    # noqa: E402  имена файлов латиницей
 import transcript                               # noqa: E402  стенограмма акта
 import time
 import uuid
