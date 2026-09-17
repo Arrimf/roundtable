@@ -453,6 +453,81 @@ SUM_LEN = ("**до 400 слов**, плюс, если уместно, одна �
 # таймаутом, а то очень долго думаем». Голос, не уложившийся, получает
 # статус timeout и не держит остальных.
 HARD_TIMEOUT: int | None = None
+# КАНАРЕЙКА СЛЕПОТЫ (раунд стол-v3-изоляция, идея голоса claude,
+# 2026-09-16): в слепой фазе седьмой голос получает задание НАЙТИ чужие
+# ответы этого раунда на машине — журнал, карантин, истории сессий CLI,
+# /tmp, процессы. Вернулся с «ЧИСТО» — фаза получает метку «слепота
+# проверена», иначе найденное ложится в журнал. Правило 8.5 из обещания
+# становится измерением; работает и до изоляции, и после. Голос — с
+# диском (не gemini/deepseek) и не из участников фазы.
+CANARY = ""
+
+
+def canary_prompt(round_id: str, names: list[str]) -> str:
+    return (f"Вы — КАНАРЕЙКА СЛЕПОТЫ стола. Прямо сейчас идёт слепая фаза "
+            f"раунда «{round_id}»: голоса {', '.join(names)} отвечают на "
+            f"затравку одновременно, и их ответы не должны быть доступны на "
+            f"диске до закрытия фазы. Ваша задача — попытаться найти ЧУЖИЕ "
+            f"ответы этого раунда на этой машине: журналы RoundTable/journal/"
+            f"room.jsonl и live.jsonl (свежие записи раунда), карантин "
+            f"~/.cache/choir, истории сессий CLI (~/.codex, ~/.claude, "
+            f"~/.gemini/choir-http, ~/.deepseek/choir-http, ~/.kimi-code, "
+            f"~/.grok), временные файлы /tmp, процессы (ps, /proc/*/fd), "
+            f"tmux. Ищите только для раунда «{round_id}» и только чужое; "
+            f"свой промпт и файлы *.prompt в карантине не считаются — "
+            f"ищите ответы. Ничего не записывайте и не меняйте.\n\n"
+            f"Ответ: первой строкой ровно одно слово ЧИСТО, если ничего не "
+            f"найдено; иначе первой строкой НАЙДЕНО и ниже список: путь "
+            f"(файл, процесс, окно), размер и sha256 первых 4 КБ. Чужой "
+            f"текст НЕ цитируйте — цитата осела бы в вашей истории и в "
+            f"журнале (ревизия: codex). Кратко.")
+
+
+def _canary_arg(voice: str, names: list[str]) -> str:
+    """Проверить голос-канарейку: известен, с диском, не участник фазы."""
+    voice = (voice or "").strip()
+    if not voice:
+        return ""
+    if voice not in VOICES:
+        print(f"--canary: неизвестный голос {voice!r}", file=sys.stderr)
+        return ""
+    if _no_files(voice):                 # спрашиваем live.py, как везде
+        print(f"--canary: {voice} без диска — искать ему нечем", file=sys.stderr)
+        return ""
+    if voice in names:
+        print(f"--canary: {voice} сам участник фазы — канарейкой быть не "
+              f"может", file=sys.stderr)
+        return ""
+    return voice
+
+
+def _canary_probe(voice: str, round_id: str, phase: str,
+                  names: list[str]) -> dict:
+    rec = ask_one(voice, canary_prompt(round_id, names), round_id, phase,
+                  None, "blind", use_role=False)
+    rec["role"] = "canary"
+    rec["canary"] = canary_verdict(rec.get("status"), rec.get("text") or "")
+    return rec
+
+
+def canary_verdict(status: str | None, text: str) -> str:
+    """clean — первая непустая строка ровно «ЧИСТО» (без хвоста: «ЧИСТО,
+    но нашёл» — не чисто; ревизия: codex, субагент); found — начинается с
+    «НАЙДЕНО»; unclear — ответ не по форме; absent — канал не ответил."""
+    if status != "ok":
+        return "absent"
+    first = ""
+    for ln in text.splitlines():
+        s = ln.strip().strip("*#>` ").strip()
+        if s:
+            first = s
+            break
+    word = first.rstrip(".!").upper()
+    if word == "ЧИСТО":
+        return "clean"
+    if word.startswith("НАЙДЕНО"):
+        return "found"
+    return "unclear"
 
 # ─────────────────────────────────────────────────────────────────────
 # Сила размышления. Наказ arr 2026-08-19: стол «стал неприлично долго
@@ -1725,13 +1800,39 @@ def _run_phase(names: list[str], prompts: dict[str, str], round_id: str,
     with _BLIND_NOTES_LOCK:
         BLIND_TR.clear()          # остатки упавшей фазы — не в этот акт (ревизия: субагент)
     HOLD_OPEN = (not blind and len(names) > 1)
+    canary = CANARY if (blind and CANARY and CANARY not in names) else ""
     try:
-      with ThreadPoolExecutor(max_workers=len(names)) as ex:
+      with ThreadPoolExecutor(max_workers=len(names) + (1 if canary else 0)) as ex:
         futs = {ex.submit(ask_one, n, prompts[n], round_id, phase, parent,
                           visibility): n for n in names}
+        if canary:
+            def _probe_safe():
+                try:
+                    return _canary_probe(canary, round_id, phase, names)
+                except Exception as e:                   # noqa: BLE001
+                    # канарейка вспомогательная: её исключение не роняет
+                    # слепую фазу шести голосов (ревизия: субагент)
+                    return {"id": uuid.uuid4().hex[:12], "ts": _now(),
+                            "round": round_id, "phase": phase, "voice": canary,
+                            "role": "canary", "status": "error", "text": "",
+                            "detail": f"{type(e).__name__}: {e}",
+                            "canary": "absent", "elapsed_s": 0}
+            futs[ex.submit(_probe_safe)] = canary
         deferred: list[str] = []
         for f in as_completed(futs):
             rec = f.result()
+            if rec.get("role") == "canary":
+                # в held — публикуется с фазой; в results не входит: это
+                # не ответ на затравку, и в счёт покрытия/каскада не идёт
+                held.append(rec)
+                verdict = {"clean": "ЧИСТО — слепота проверена",
+                           "found": "НАЙДЕНО чужое — см. запись canary",
+                           "unclear": "ответ не по форме — метки нет",
+                           "absent": "канарейка не ответила"}[rec["canary"]]
+                deferred.append(f"🐤 {rec['voice']:<8} {rec.get('elapsed_s', 0):>6.1f} с  "
+                                f"канарейка слепоты: {verdict}")
+                _out(f"· канарейка отчиталась")
+                continue
             results[rec["voice"]] = rec
             if HOLD_OPEN:
                 # открытая фаза: поток голоса — в стенограмму, как только
@@ -1781,6 +1882,8 @@ def _run_phase(names: list[str], prompts: dict[str, str], round_id: str,
     # общий сбой (сеть, шлюз), а не мнение стола. Молча записать четыре
     # «error» значило бы показать человеку «стол единогласно упал»
     # (замечание Gemini).
+    if blind and canary and not any(r.get("role") == "canary" for r in held):
+        _out("· канарейка не вернулась — фаза без метки «слепота проверена»")
     if blind:
         # Фаза закрыта — только теперь ответы становятся видимыми.
         for rec in sorted(held, key=lambda r: r["ts"]):
@@ -1814,6 +1917,11 @@ def cmd_ask(a: argparse.Namespace) -> int:
     seed = Path(a.seed).read_text(encoding="utf-8")
     names = [n.strip() for n in a.voices.split(",")] if a.voices else list(VOICES)
     bad = [n for n in names if n not in VOICES]
+    global CANARY
+    if getattr(a, "canary", ""):
+        CANARY = _canary_arg(a.canary, names)
+        if not CANARY:
+            return 2
     if bad:
         print(f"неизвестные голоса: {', '.join(bad)}", file=sys.stderr)
         return 2
@@ -2510,11 +2618,14 @@ def cmd_run(a: argparse.Namespace) -> int:
     # пишет один голос на длинном промпте, и «маленький таймаут на
     # ревизию» (наказ arr 19.08) должен резать и их — иначе такт с
     # --hard-timeout 300 всё равно висит час на своде.
-    global TIMEOUT_OVERRIDE, HARD_TIMEOUT
+    global TIMEOUT_OVERRIDE, HARD_TIMEOUT, CANARY
     if getattr(a, "timeout", None):
         TIMEOUT_OVERRIDE = int(a.timeout)
     if getattr(a, "hard_timeout", None):
         HARD_TIMEOUT = int(a.hard_timeout)
+    CANARY = _canary_arg(getattr(a, "canary", ""), names)
+    if getattr(a, "canary", "") and not CANARY:
+        return 2
 
     stop = _stop_flag(a.round)
     stop.parent.mkdir(parents=True, exist_ok=True)
@@ -4481,6 +4592,8 @@ def main() -> int:
     q.add_argument("--round", required=True, help="имя раунда (метка в журнале)")
     q.add_argument("--seed", required=True, help="файл с затравкой")
     q.add_argument("--voices", help="через запятую; по умолчанию все")
+    q.add_argument("--canary", default="", help="голос-канарейка слепоты: ищет "
+                   "чужие ответы во время слепой фазы (не участник, с диском)")
     q.add_argument("--out", help="каталог, куда разложить ответы .md")
     q.add_argument("--timeout", type=int,
                    help="лимит на голос, с (по умолчанию — из VOICES)")
@@ -4557,6 +4670,8 @@ def main() -> int:
     rn.add_argument("--seed", required=True,
                     help="файл с КОРОТКИМ вопросом Автора (затравку напишет "
                          "ведущий: правило 11.5)")
+    rn.add_argument("--canary", default="", help="голос-канарейка слепоты в "
+                    "слепой фазе (см. ask --canary)")
     rn.add_argument("--rebuts", type=_rebuts_arg, default=1,
                     help=f"витков открытой критики, 0…{MAX_REBUT_ROUNDS} "
                          "(по умолчанию 1; больше потолка — ошибка, "

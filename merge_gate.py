@@ -234,6 +234,8 @@ def act_state(act: str) -> dict:
             st["reviews"].append(e)
         elif k == "edit_drop" and st["drop"] is None:
             st["drop"] = e
+        elif k == "canary":
+            st.setdefault("canaries", []).append(e)   # все; жизнь и род — ниже
         elif k == "edit_merge":
             st.setdefault("merge", e)
     # ПРОДОЛЖЕНИЕ акта (edits.continue_edit) — новое edit_open с новой
@@ -262,6 +264,16 @@ def act_state(act: str) -> dict:
             st[k] = None
     st["reviews_all"] = list(st["reviews"])
     st["reviews"] = [r for r in st["reviews"] if (r.get("id") or 0) > oid]
+    # Канарейки прав ТЕКУЩЕЙ жизни (id > open; у кресла ещё и эпоха):
+    # кресла — st["canary"] (свежая), ревизий — st["canary_reviews"] (все).
+    # Первая редакция брала одну «свежую» на акт: чистая канарейка
+    # авторевизии маскировала нарушенную канарейку кресла (нашли codex,
+    # grok, kimi, deepseek, субагент).
+    cur = [e for e in st.pop("canaries", []) if (e.get("id") or 0) > oid]
+    chair = [e for e in cur if e.get("of") != "review"
+             and (oe is None or e.get("epoch") in (None, oe))]
+    st["canary"] = chair[0] if chair else None
+    st["canary_reviews"] = [e for e in cur if e.get("of") == "review"]
     return st
 
 
@@ -542,6 +554,23 @@ def checks(act: str) -> dict:
     if st.get("drop"):
         out["reasons"].append("акт отброшен Автором — ветки больше нет")
         return out
+    cn = st.get("canary")
+    if cn is not None:
+        out["canary"] = {"status": cn.get("status"), "text": cn.get("text")}
+        if cn.get("status") == "broken":
+            # Канарейка прав кресла (обещание 1): исполнитель тронул то,
+            # что трогать не обещал — гейт не принимает, пока Автор не
+            # разберёт (продолжение акта открывает новую жизнь).
+            out["reasons"].append("канарейка прав нарушена ИСПОЛНИТЕЛЕМ: "
+                                  + ("; ".join((cn.get("broken") or [])[:3]) or "подробности в событии"))
+    rb = [e for e in st.get("canary_reviews") or [] if e.get("status") == "broken"]
+    if rb:
+        # Обещание 2 нарушил рецензент — это порочит ревизию, не код:
+        # merge не закрываем, но в карточке и причинах — вслух (deepseek)
+        out["canary_review_broken"] = [e.get("text") for e in rb]
+        out["reasons_soft"] = out.get("reasons_soft", []) + [
+            "канарейка прав нарушена РЕЦЕНЗЕНТОМ: " + "; ".join(
+                (rb[0].get("broken") or [])[:2]) + " — ревизии на этой голове не верить слепо"]
     if not st["close"]:
         if st["crash"] and st["adopt"]:
             out["adopted"] = True        # спека п.9: adopt снимает

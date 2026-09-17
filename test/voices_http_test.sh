@@ -288,6 +288,12 @@ printf 'старая эпоха\n' > "$W/leases/edit-abc123def456.1.log"; sleep 
 curl -s "$B/act_log?id=deadbeef&kind=chair&edit=abc123def456" | python3 -c '
 import json,sys; d=json.load(sys.stdin); assert d["source"]=="chair" and d["text"]=="кресло пишет\n", d' && pass "/act_log kind=chair: лог CLI кресла, свежая эпоха" || fail "/act_log chair"
 curl -s "$B/" | grep -q "viewtabs" && pass "страница: вкладки вывода в скрипте" || fail "страница без вкладок вывода"
+# ── канарейка слепоты в раунде (--canary) ──
+[ "$(code /round "{\"question\":\"q\",\"name\":\"cn1\",\"auto\":true,\"voices\":[\"kimi\",\"codex\"],\"canary\":\"grok\",\"project\":\"$W\"}")" = 200 ] && pass "/round: канарейка grok принята" || fail "/round canary"
+sleep 1; grep -q "^run --round cn1 .*--canary grok" "$W/chamber/argv.log" && pass "/round: --canary grok ушёл в choir.py run" || fail "argv canary: $(grep cn1 "$W/chamber/argv.log")"
+[ "$(code /round "{\"question\":\"q\",\"name\":\"cn2\",\"auto\":true,\"voices\":[\"kimi\",\"codex\"],\"canary\":\"kimi\",\"project\":\"$W\"}")" = 400 ] && pass "/round: канарейка из участников — отказ" || fail "/round canary participant"
+[ "$(code /round "{\"question\":\"q\",\"name\":\"cn3\",\"auto\":true,\"voices\":[\"kimi\",\"codex\"],\"canary\":\"gemini\",\"project\":\"$W\"}")" = 400 ] && pass "/round: канарейка без диска — отказ" || fail "/round canary no_files"
+
 # ── /acts, /windows, проект как поле события (наказ Автора 2026-09-10) ──
 python3 - "$W/journal/live.jsonl" <<'PY'
 import json,sys

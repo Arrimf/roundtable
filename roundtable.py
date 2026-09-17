@@ -221,6 +221,7 @@ DRAND = "https://api.drand.sh/v2/beacons/quicknet/rounds/latest"
 sys.path.insert(0, str(CHOIR))
 import live  # noqa: E402
 import names as fnames                         # noqa: E402  имена файлов раундов латиницей (alias: в do_POST есть локальная names)
+import canary                                  # noqa: E402  канарейки прав (обещания 1 и 2)
 
 VOICES = list(live.VOICES)
 
@@ -731,7 +732,10 @@ def act_view(act: str) -> dict:
                          "approvals": c.get("approvals") or [],
                          "refused": c.get("refuted_by") or c.get("refused") or [],
                          "quorum": c.get("quorum", merge_gate.QUORUM),
-                         "stale_base": c.get("stale_base"), "scope": c.get("scope")}
+                         "stale_base": c.get("stale_base"), "scope": c.get("scope"),
+                         "canary": c.get("canary"),
+                         "canary_review_broken": c.get("canary_review_broken") or [],
+                         "reasons_soft": c.get("reasons_soft") or []}
         out["head"] = c.get("head")
     except Exception as e:                                  # noqa: BLE001
         out["checks"] = {"ok": False, "reasons": [str(e)], "approvals": [], "refused": [],
@@ -822,18 +826,24 @@ def _spawn_review(act: str, *, auto: bool = False,
         return None
     try:
         try:
-            stale = merge_gate.checks(act).get("stale_base")
+            c0 = merge_gate.checks(act)
+            stale = c0.get("stale_base")
         except Exception as e:                              # noqa: BLE001
-            stale = False
+            c0, stale = {}, False
             print(f"_spawn_review: checks {act}: {e}", file=sys.stderr)
         if stale and _rebase_before_review(act) is None:
             raise ReviewNotStarted("main уехал, а rebase не прошёл — "
                                    "см. заметку в ленте")
+        # канарейки и ревизорам (обещание 2: рецензент ничего не пишет)
+        ckey = f"{act}.review.{uuid.uuid4().hex[:6]}"
+        if not _canary_lay(ckey, c0.get("project")):
+            ckey = ""
         return spawn([sys.executable,
                       str(Path(__file__).resolve().parent / "merge_gate.py"),
                       "review", act],
                      f"review: акт {act}" + (" (авто)" if auto else ""), VOICES,
-                     meta={"edit": act, "gate": "review"},
+                     meta={"edit": act, "gate": "review",
+                           **({"canary": ckey} if ckey else {})},
                      fields={"edit": act, "gate": "review",
                              **({"auto": True} if auto else {})},
                      note=("АВТОРЕВИЗИЯ: диф кресла ушёл столу сам. Правка "
@@ -1037,6 +1047,84 @@ def _scope_reap(act_id: str, unit: str, label: str,
                 act=act_id, cgroup_left=left[:20], cgroup_still=(still or [])[:20])
 
 
+def _canary_lay(key: str, project: str | Path | None) -> bool:
+    """Разложить приманки перед актом с записью на диск (кресло) или
+    чтением чужого кода (ревизия): корень проекта, HOME, каталог
+    worktree'ов, кэш стола. Пломбы — в каталоге актов под ключом."""
+    try:
+        rec = canary.lay(key, canary.default_spots(Path(project) if project else None,
+                                                   edits.WT_DIR),
+                         ACT_DIR, project=Path(project) if project else None,
+                         owner={"pid": os.getpid(), "start_tick": _proc_start(os.getpid())})
+        return bool(rec.get("files"))
+    except Exception as e:                                  # noqa: BLE001
+        print(f"канарейки для {key} не разложены: {e}", file=sys.stderr)
+        return False
+
+
+def _canary_check(key: str, edit_act: str, label: str) -> dict | None:
+    """Сверить пломбы по закрытии акта; итог — событием canary в ленту
+    (act — акт правки: его читает гейт; of — чья канарейка: кресла или
+    ревизии, эпоха у кресла — чтобы гейт отличал жизни акта)."""
+    of = "review" if ".review." in key else "chair"
+    epoch = None
+    if of == "chair":
+        try:
+            epoch = int(key.rsplit(".", 1)[1])
+        except (ValueError, IndexError):
+            epoch = None
+    try:
+        r = canary.check(key, ACT_DIR)
+    except Exception as e:                                  # noqa: BLE001
+        print(f"канарейки {key} не сверены: {e}", file=sys.stderr)
+        return None
+    if r is None:
+        return None
+    who = "кресло" if of == "chair" else "ревизия"
+    if r.get("unreadable"):
+        feed_append("note", f"канарейка прав ({who}) акта {edit_act}: пломбы не "
+                    f"прочитаны — сверки нет ({label})", act=edit_act, key=key)
+        return r
+    if r["clean"]:
+        text = (f"канарейка прав ({who}) акта {edit_act}: цело {r['laid']}/{r['laid']}"
+                + (f" (не разложено: {len(r['skipped'])})" if r.get("skipped") else "")
+                + f" — {label}")
+    else:
+        text = (f"канарейка прав ({who}) акта {edit_act} НАРУШЕНА: "
+                + "; ".join(r["broken"][:4]) + f" — {label}")
+    feed_append("canary", text, act=edit_act, status="clean" if r["clean"] else "broken",
+                broken=r["broken"], laid=r["laid"], key=key, of=of,
+                **({"epoch": epoch} if epoch is not None else {}))
+    return r
+
+
+def _canary_sweep(live_keys: set[str]) -> int:
+    """Приманки актов, у которых не случилось reap (окно закрыто, spawn
+    не удался): сверить и убрать, итог — заметкой; иначе .rt-canary-*
+    копились бы в HOME навсегда (ревизия: все пятеро)."""
+    n = 0
+    try:
+        for f in sorted(ACT_DIR.glob("*.canary.json")):
+            key = f.name[:-len(".canary.json")]
+            if key in live_keys or key in _CANARY_BUSY:
+                continue
+            own = canary.owner_of(key, ACT_DIR) or {}
+            opid = own.get("pid")
+            if (opid and opid != os.getpid() and _is_window_pid(opid)
+                    and own.get("start_tick") == _proc_start(opid)):
+                continue            # живой акт ДРУГОГО окна — его reap сверит
+            # настоящее событие canary (act из ключа), чтобы гейт его видел
+            edit_act = key.split(".", 1)[0]
+            _canary_check(key, edit_act, "без reap (окно закрыто или spawn не удался)")
+            n += 1
+    except Exception as e:                                  # noqa: BLE001
+        print(f"уборка канареек: {e}", file=sys.stderr)
+    return n
+
+
+_CANARY_BUSY: set[str] = set()      # ключи, которые reap сверяет прямо сейчас
+
+
 def _scope_orphans() -> list[str]:
     """Scope прежних окон (rt-act-*), ещё живые: акты пережили окно —
     автопрогон по замыслу, остальное — сироты, о которых надо сказать."""
@@ -1162,9 +1250,21 @@ def spawn(cmd: list[str], label: str, voices: list[str],
         # действия два разных финала (нашёл ревьюер дифа).
         with RUN_LOCK:
             mine = RUNNING.pop(act_id, None)
+            if mine and mine.get("canary"):
+                _CANARY_BUSY.add(mine["canary"])
         if mine is None:
             return
         try:
+            if mine.get("canary"):
+                # ДО scope_reap (там до 2,5 с сна — уборка успевала первой,
+                # второй круг) и до авторевизии: гейт читает событие canary
+                with RUN_LOCK:
+                    _CANARY_BUSY.add(mine["canary"])
+                try:
+                    _canary_check(mine["canary"], mine.get("edit") or "", label)
+                finally:
+                    with RUN_LOCK:
+                        _CANARY_BUSY.discard(mine["canary"])
             if mine.get("unit"):
                 _scope_reap(act_id, mine["unit"], label)
             if rc == 0:
@@ -3657,6 +3757,12 @@ class Handler(BaseHTTPRequestHandler):
             # протокол, а монолог.
             raw_rv = req.get("voices")
             rvoices = sorted({v for v in (raw_rv or []) if v in VOICES})
+            cnr = str(req.get("canary") or "").strip()
+            if cnr and (cnr not in VOICES or cnr in (rvoices or list(VOICES))
+                        or live.VOICES.get(cnr, {}).get("no_files")):
+                return self._json(400, {"error": "канарейка: голос с диском, не "
+                                        "из участников раунда (claude/codex/grok/kimi)"})
+            cflag = ["--canary", cnr] if cnr else []
             # Проект раунда (2026-09-03): без него раунд из окна,
             # запущенного в Cursor_W, шёл про каталог стола (тогда Choir/) — «первый
             # боевой вызов» Автора. Та же проверка, что у комнаты.
@@ -3715,8 +3821,8 @@ class Handler(BaseHTTPRequestHandler):
                 cmd = [sys.executable, str(CHAMBER / "choir.py"), "run", "--round", name,
                        "--seed", str(qfile), "--rebuts", str(rebuts),
                        *(["--voices", ",".join(rvoices)] if rvoices else []),
-                       *pflag]
-                label = f"round: {name} [авто, витков: {rebuts}]"
+                       *cflag, *pflag]
+                label = f"round: {name} [авто, витков: {rebuts}]" + (f" 🐤 {cnr}" if cnr else "")
                 note = (f"АВТОПРОГОН: такт идёт сам — pick → expand → ask → "
                         f"rebut ×{rebuts} → summarize, без остановки на "
                         f"человека. Остановить: кнопка «Стоп» "
@@ -3730,13 +3836,14 @@ class Handler(BaseHTTPRequestHandler):
                 # уже выбран жребием среди названных).
                 vs = (" --voices " + shlex.quote(",".join(rvoices))
                       if rvoices else "")
+                cs = (" --canary " + shlex.quote(cnr)) if cnr else ""
                 # --project только у pick: он пишет проект в запись
                 # жребия, остальные фазы читают его оттуда (choir.py).
                 pj = (" --project " + shlex.quote(str(rp))) if rp else ""
                 cmd = ["bash", "-c",
                        f"{py} choir.py pick --round {rn} --seed {seed}{vs}{pj} && "
                        f"{py} choir.py expand --round {rn} --seed {seed} && "
-                       f"{py} choir.py ask --round {rn} --seed {zt}{vs}"]
+                       f"{py} choir.py ask --round {rn} --seed {zt}{vs}{cs}"]
                 label = f"round: {name}"
                 note = ("ПО ШАГАМ: pick → expand → ask; после слепой фазы "
                         "такт останавливается — rebut и summarize "
@@ -3887,6 +3994,9 @@ class Handler(BaseHTTPRequestHandler):
                     # 500 здесь оставил бы дерево брошенным (deepseek).
                     print(f"/edit: наблюдатель {act} не взведён: {e}",
                           file=sys.stderr)
+                ckey = f"{act}.{epoch}"
+                if not _canary_lay(ckey, ed["project"]):
+                    ckey = ""
                 spawn([sys.executable,
                        str(Path(__file__).resolve().parent
                            / "executor_run.py"),
@@ -3899,7 +4009,8 @@ class Handler(BaseHTTPRequestHandler):
                       (f"edit: [{voice}] продолжение {act}: {task[:50]}"
                        if cont else f"edit: [{voice}] {task[:60]}"), [voice],
                       meta={"edit": act, "epoch": epoch,
-                            "edit_project": str(ed["project"])},
+                            "edit_project": str(ed["project"]),
+                            **({"canary": ckey} if ckey else {})},
                       note=picked_note,
                       fields={"edit": act, "epoch": epoch, "voice": voice,
                               **({"continues": cont} if cont else {})},
@@ -5097,6 +5208,12 @@ margin:.2rem 0 .3rem;white-space:pre-wrap;word-break:break-word}
         <option value="1" selected>×1</option>
         <option value="2">×2</option>
         <option value="3">×3</option>
+      </select>
+      <select id="canary" title="Канарейка слепоты (раунд стол-v3-изоляция, 2026-09-16): в слепой фазе седьмой голос получает задание НАЙТИ чужие ответы этого раунда на машине — журнал, карантин, истории сессий CLI, /tmp, процессы. Вернулся с «ЧИСТО» — фаза получает метку «слепота проверена»; нашёл — запись canary в журнале раунда с путями. Платный вызов; голос с диском и не из участников раунда (сам он в ответах не участвует).">
+        <option value="" selected>🐤 нет</option>
+        <option value="codex">🐤 codex</option>
+        <option value="claude">🐤 claude</option>
+        <option value="grok">🐤 grok (сессия по cwd: станет «последней» для комнаты)</option>
       </select>
     </div>
     <div class="qrow" id="quickrow">
@@ -6836,6 +6953,8 @@ document.getElementById('quick').onclick=()=>sendQuick();
     if(v.close)gate.appendChild(el('div',v.close.status==='done'?'':'no','закрытие: '+(v.close.text||'')+(v.close.autocommit?' · коммит сделала обёртка':'')+(v.close.excluded&&v.close.excluded.length?' · вне коммита: '+v.close.excluded.join(', '):'')));
     if(v.crash)gate.appendChild(el('div','no','вылет: '+(v.crash.text||'')));
     if(v.merge)gate.appendChild(el('div','ok','принят: '+(v.merge.result_sha||'').slice(0,12)));
+    if(v.checks&&v.checks.canary)gate.appendChild(el('div',v.checks.canary.status==='clean'?'ok':'no','🐤 '+(v.checks.canary.text||'')));
+    if(v.checks&&v.checks.canary_review_broken&&v.checks.canary_review_broken.length)v.checks.canary_review_broken.forEach(function(t){gate.appendChild(el('div','no','🐤 '+t))});
     const c=v.checks||{}; const ap=(c.approvals||[]).length, q=c.quorum||2, ref=(c.refused||[]).length;
     const st=el('div',c.ok?'ok':'', 'гейт: '+(c.ok?'открыт — можно принимать':'закрыт')+' · одобрений '+ap+'/'+q+(ref?' · ОТКАЗ: '+c.refused.join(', '):'')+(c.stale_base?' · main уехал, нужен rebase':''));
     gate.appendChild(st);
@@ -7108,7 +7227,7 @@ document.getElementById('round').onclick=async()=>{
       ' — платно. Пускаем?'))return;
   const r=await fetch('/round',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({question,name,auto,rebuts,brief:briefOn(),thoughts:thoughtsOn(),
-                         voices:rvoices,
+                         voices:rvoices,canary:(document.getElementById('canary')||{}).value||'',
                          project:document.getElementById('project').value.trim()})});
   if(r.ok)msg.value='';
   else alert((await r.json()).error||'ошибка');
@@ -7562,11 +7681,20 @@ def main(argv: list[str] | None = None) -> int:
                             lg.unlink()
                     except OSError:
                         pass
+                # приманки актов без reap — сверить и убрать (ревизия)
+                with RUN_LOCK:
+                    live_keys = {t.get("canary") for t in RUNNING.values()
+                                 if t.get("canary")}
+                _canary_sweep(live_keys)
             except Exception as e:              # noqa: BLE001
                 print(f"edit-sweep: {e}", file=sys.stderr)
             time.sleep(60)
     threading.Thread(target=_edit_sweep, daemon=True).start()
     register_window()
+    try:
+        _canary_sweep(set())          # приманки прошлого окна: сверить, убрать
+    except Exception as e:                                  # noqa: BLE001
+        print(f"уборка канареек при старте: {e}", file=sys.stderr)
     # Scope живут в app.slice, не в сессии терминала: акты переживают и
     # вкладку konsole, и падение окна (автопрогон — по замыслу, прочее —
     # сироты, которых reap уже не увидит). Прежние — назвать в ленте.
@@ -7664,6 +7792,13 @@ def main(argv: list[str] | None = None) -> int:
             except Exception as e:                  # noqa: BLE001
                 print(f"act {aid}: статус не записан: {e}", file=sys.stderr)
         for aid, t in unfinished:
+            if t.get("canary") and t["proc"].poll() is not None:
+                # успел завершиться — вердикт настоящим событием (второй круг)
+                try:
+                    _canary_check(t["canary"], t.get("edit") or "", t.get("label", ""))
+                except Exception:                   # noqa: BLE001
+                    pass
+        for aid, t in unfinished:
             # Три проверки, и каждая оплачена: живость (poll) — чтобы не
             # целиться в освобождённый pid; сохранённый pgid — чтобы не
             # спрашивать его у ядра задним числом; сверка со своей
@@ -7701,6 +7836,14 @@ def main(argv: list[str] | None = None) -> int:
                       + (f", scope {t['unit']}" if t.get("unit") else "") + ")")
             except (ProcessLookupError, PermissionError, OSError):
                 pass            # уже умер сам — это норма, не ошибка
+        for _aid, t in unfinished:
+            if t.get("canary") and t["proc"].poll() is None:
+                # ещё жив и получил сигнал: вердикта нет по праву, но
+                # приманки не должны остаться в HOME навсегда
+                try:
+                    canary.check(t["canary"], ACT_DIR)
+                except Exception:                   # noqa: BLE001
+                    pass
         # Упрямые внуки: секунда на SIGTERM, затем SIGKILL всему cgroup
         # (окно уходит — ждать некому)
         units = [t["unit"] for _a, t in unfinished
