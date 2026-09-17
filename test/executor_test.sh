@@ -15,6 +15,10 @@ git -C "$W/base" -c user.name=t -c user.email=t@t commit -q --allow-empty -m bas
 git -C "$W/base" worktree add -q -b act/one "$W/wt" >/dev/null
 git -C "$W/base" worktree add -q -b act/two "$W/wt2" >/dev/null
 export CHOIR_LEASE_DIR="$W/leases" ROUNDTABLE_CHOIR="$W/room"
+# Кресло идёт в клетку bwrap с rw на каталоги состояния CLI из ~ —
+# дом подменный, чтобы тест не открывал настоящие ~/.claude и
+# ~/.kimi-code (субагент-ревьюер).
+mkdir -p "$W/home"; export HOME="$W/home"
 
 # 1–2: успех и честная ошибка CLI
 python3 "$RT/executor_run.py" --act e1 --epoch 1 --worktree "$W/wt" --voice codex \
@@ -41,8 +45,10 @@ python3 "$RT/executor_run.py" --act e4 --epoch 4 --worktree "$W/wt" --voice deep
   --cmd-json '["true"]' >/dev/null 2>&1 || true
 chmod u+w "$W/room/live.jsonl"
 
-# 6: git молчит (снесли .git прямо из-под CLI) — «неизвестно», а не «чисто»
-python3 "$RT/executor_run.py" --act e5 --epoch 5 --worktree "$W/wt2" --voice claude \
+# 6: git молчит (снесли .git прямо из-под CLI) — «неизвестно», а не «чисто».
+# БЕЗ клетки: в клетке gitfile .git — ro (jail_test.sh это проверяет), и
+# снести его из-под CLI нельзя — сценарий «молчащий git» тогда не собрать.
+CHOIR_RT_NO_BWRAP=1 python3 "$RT/executor_run.py" --act e5 --epoch 5 --worktree "$W/wt2" --voice claude \
   --cmd-json '["bash","-c","rm -rf .git"]' >/dev/null 2>&1 || true
 
 # 7: --worktree не корень дерева (подкаталог) — отказ ДО запуска CLI

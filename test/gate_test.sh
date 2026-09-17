@@ -12,6 +12,9 @@ printf 'x = 1\n' > a.py
 git add -A && git -c user.name=arr -c user.email=a@a commit -qm base
 cd "$RT"
 export CHOIR_LEASE_DIR="$W/leases" CHOIR_WT_DIR="$W/wts" ROUNDTABLE_CHOIR="$W/room"
+# Рецензенты идут в клетку bwrap с rw на состояние CLI из ~ — дом
+# подменный, чтобы тест не открывал настоящие каталоги (субагент).
+mkdir -p "$W/home"; export HOME="$W/home"
 
 RT="$RT" python3 - "$W" <<'PY'
 import json, os, subprocess, sys, time

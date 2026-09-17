@@ -20,9 +20,11 @@ worktree, ждёт его и пишет событие close В ЛЕНТУ ДО 
 закроет акт статусом error — правило 4, отказ фиксируется как есть.
 
 ЧЕМ ОБЁРТКА НЕ ЯВЛЯЕТСЯ (потребовали все четверо ревьюеров):
-— не песочница: cwd=worktree направляет CLI, но записи ВНЕ дерева не
-  ловит — это работа гейта (сверка дифа с заявленным) и пломбы
-  refs/heads/main, спека §5, и там это обнаружение, не запрет;
+— не песочница САМА ПО СЕБЕ: cwd=worktree направляет CLI, а записи ВНЕ
+  дерева с 2026-09-17 отбивает клетка bwrap (jail.py: ro-корень, rw —
+  worktree и корни ветки акта); без bwrap — как прежде, ловит только
+  гейт (сверка дифа с заявленным, канарейки, пломба refs/heads/main),
+  и close честно несёт jail=none;
 — не сторож зависаний: таймаута у wait() НЕТ НАМЕРЕННО (спор
   deepseek↔codex решён по спеке §4: автоубийства нет, зависание ловит
   наблюдатель прогресса ОКНА — mtime/коммиты worktree — и жёлтый
@@ -50,6 +52,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import leases                                            # noqa: E402
+import jail                                              # noqa: E402
 
 # Раскладка (переезд 2026-09-06): код стола — chamber/, журналы — journal/
 # рядом; ROUNDTABLE_CHAMBER / ROUNDTABLE_JOURNAL переопределяют каждый.
@@ -371,10 +374,13 @@ def main() -> int:
         return _run(a, wt, cmd, lease)
     except BaseException as e:          # noqa: BLE001
         import traceback
+        # Факт клетки — и на прерванном ходе: CLI уже работал в ней
+        # (или без неё), и карточка не должна молчать (grok).
         _close_act(a, status="error", rc=-2,
                    text=f"правка {a.act}: обёртка прервана/упала: "
                         f"{type(e).__name__}: {e}",
-                   tail=traceback.format_exc()[-1500:])
+                   tail=traceback.format_exc()[-1500:],
+                   **getattr(a, "jail_fact", {}))
         if isinstance(e, Exception):
             return 1
         raise
@@ -397,8 +403,48 @@ def _run(a, wt: Path, cmd: list, lease) -> int:
     log_path = _durable_log()
     if log_path is not None:
         log_path.parent.mkdir(parents=True, exist_ok=True)
+
     else:
         log_path = leases.LEASE_DIR / f"edit-{a.act}.{a.epoch}.log"
+
+    # КЛЕТКА (обещание 1 правила 8.5 механикой, раунд стол-v3-изоляция):
+    # CLI без своей песочницы (claude, kimi, grok, dsh) идёт в bwrap с
+    # ro-корнем; rw — только worktree и git-корни ветки act/ (те же, что
+    # у Кодекса в writable_roots), плюс каталоги состояния самого CLI.
+    # Общий .git подкладывается ro ЯВНО: /tmp в клетке — свежий tmpfs,
+    # и репозиторий под /tmp (тесты) иначе исчез бы. Факт клетки — в
+    # close (jail, jail_sha): без bwrap ход честно помечен «none», гейт
+    # называет это мягкой причиной. Сама обёртка остаётся снаружи:
+    # автокоммит, close, аренда — её работа, не CLI. Собирается ДО ворот
+    # серийного канала: молчащий git здесь — FAIL-CLOSED (кресло не
+    # выдаётся, close error), а не «ход без ограды с пометкой»: main()
+    # эти пути уже видел, повторный отказ — симптом сломанного дерева
+    # (kimi, deepseek).
+    sys.path.insert(0, str(_HERE))
+    from edits import codex_roots                        # noqa: PLC0415
+    gitdir = (_git_at(wt, "rev-parse", "--absolute-git-dir") or "").strip()
+    common = (_git_at(wt, "rev-parse", "--path-format=absolute",
+                      "--git-common-dir") or "").strip()
+    if not (gitdir and common):
+        # Поля jail здесь НЕТ намеренно: «none» читалось бы карточкой как
+        # «работал без клетки», а CLI не запускался (субагент).
+        _close_act(a, status="error", rc=-4,
+                   text=f"правка {a.act}: git не назвал gitdir/common — "
+                        f"клетку не из чего собрать, кресло не выдано")
+        return 1
+    # gitfile `<wt>/.git` — снова ro поверх rw-worktree: иначе CLI
+    # перенаправил бы его на свой репозиторий с core.fsmonitor/hooks, а
+    # обёртка после его выхода зовёт git СНАРУЖИ клетки (status, add,
+    # commit) — и чужая команда получила бы права обёртки (codex).
+    cmd, jail_fact = jail.wrap(
+        cmd, a.voice,
+        rw=[str(wt), *codex_roots(common, a.act, gitdir)],
+        ro=[common], ro_after=[str(wt / ".git")] if (wt / ".git").is_file() else [],
+        cwd=str(wt))
+    a.jail_fact = jail_fact                  # для close при прерывании
+    if jail_fact.get("jail") == "none":
+        print(f"кресло БЕЗ клетки: {jail_fact.get('jail_why')}",
+              file=sys.stderr)
 
     my_pid = os.getpid()
 
@@ -525,7 +571,7 @@ def _run(a, wt: Path, cmd: list, lease) -> int:
         except OSError:
             pass
     except OSError as e:
-        _close_act(a, status="error", rc=-1,
+        _close_act(a, status="error", rc=-1, **jail_fact,
                    text=f"правка {a.act}: CLI не запустился: {e}")
         return 1
     finally:
@@ -581,7 +627,7 @@ def _run(a, wt: Path, cmd: list, lease) -> int:
                text=f"правка {a.act} [{a.voice}]: CLI завершился rc={rc}"
                     f" за {el} с{note}",
                head=head, dirty=dirty, autocommit=autocommit,
-               excluded=excluded or None,
+               excluded=excluded or None, **jail_fact,
                elapsed_s=el, tail=out[-1500:] if out else "")
     return 0 if rc == 0 else 1
 

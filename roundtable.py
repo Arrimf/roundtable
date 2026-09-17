@@ -721,11 +721,13 @@ def act_view(act: str) -> dict:
         if e:
             out[k] = {kk: e.get(kk) for kk in
                       ("ts", "text", "status", "rc", "head", "dirty", "autocommit",
-                       "excluded", "elapsed_s", "result_sha", "by") if kk in e}
+                       "excluded", "elapsed_s", "result_sha", "by",
+                       "jail", "jail_sha", "jail_why") if kk in e}
     for r in reversed(st.get("reviews_all") or st.get("reviews") or []):   # старые первыми; прежней жизни — тоже (карточке)
         out["reviews"].append({kk: r.get(kk) for kk in
                                ("ts", "voice", "verdict", "status", "sha",
-                                "elapsed_s", "eyes", "seat", "full_text", "text")})
+                                "elapsed_s", "eyes", "seat", "jail",
+                                "full_text", "text")})
     try:
         c = merge_gate.checks(act)
         out["checks"] = {"ok": c.get("ok"), "reasons": c.get("reasons"),
@@ -735,6 +737,7 @@ def act_view(act: str) -> dict:
                          "stale_base": c.get("stale_base"), "scope": c.get("scope"),
                          "canary": c.get("canary"),
                          "canary_review_broken": c.get("canary_review_broken") or [],
+                         "jail": c.get("jail"),
                          "reasons_soft": c.get("reasons_soft") or []}
         out["head"] = c.get("head")
     except Exception as e:                                  # noqa: BLE001
@@ -6954,7 +6957,9 @@ document.getElementById('quick').onclick=()=>sendQuick();
     if(v.crash)gate.appendChild(el('div','no','вылет: '+(v.crash.text||'')));
     if(v.merge)gate.appendChild(el('div','ok','принят: '+(v.merge.result_sha||'').slice(0,12)));
     if(v.checks&&v.checks.canary)gate.appendChild(el('div',v.checks.canary.status==='clean'?'ok':'no','🐤 '+(v.checks.canary.text||'')));
+    if(v.checks&&v.checks.jail)gate.appendChild(el('div',v.checks.jail==='none'?'no':'dim','🔒 клетка кресла: '+({bwrap:'bwrap — корень ro, запись только в worktree и ветку акта',own:'своя песочница CLI (writable_roots)',none:'НЕТ — запись была возможна во весь диск'}[v.checks.jail]||v.checks.jail)+(v.close&&v.close.jail_sha?' · jail_sha '+v.close.jail_sha:'')));
     if(v.checks&&v.checks.canary_review_broken&&v.checks.canary_review_broken.length)v.checks.canary_review_broken.forEach(function(t){gate.appendChild(el('div','no','🐤 '+t))});
+    if(v.checks&&v.checks.reasons_soft&&v.checks.reasons_soft.length)v.checks.reasons_soft.forEach(function(t){if(!/канарейка/.test(t))gate.appendChild(el('div','no','⚠ '+t))});
     const c=v.checks||{}; const ap=(c.approvals||[]).length, q=c.quorum||2, ref=(c.refused||[]).length;
     const st=el('div',c.ok?'ok':'', 'гейт: '+(c.ok?'открыт — можно принимать':'закрыт')+' · одобрений '+ap+'/'+q+(ref?' · ОТКАЗ: '+c.refused.join(', '):'')+(c.stale_base?' · main уехал, нужен rebase':''));
     gate.appendChild(st);
@@ -6994,7 +6999,7 @@ document.getElementById('quick').onclick=()=>sendQuick();
     if(v.reviews&&v.reviews.length){const rv=el('div','','ревизии:'); gate.appendChild(rv);
       v.reviews.forEach(function(r){const k='r'+r.ts+'|'+r.voice; const d=document.createElement('details'); d.open=!!GATE.open[k];
         d.ontoggle=function(){GATE.open[k]=d.open};
-        const sm=document.createElement('summary'); sm.textContent=(r.voice||'?')+': '+(r.verdict||'?')+' ('+(r.status||'?')+(r.elapsed_s?', '+r.elapsed_s+' с':'')+')'+(v.head&&r.sha&&r.sha!==v.head?' · на прежней голове':'');
+        const sm=document.createElement('summary'); sm.textContent=(r.voice||'?')+': '+(r.verdict||'?')+' ('+(r.status||'?')+(r.elapsed_s?', '+r.elapsed_s+' с':'')+')'+(v.head&&r.sha&&r.sha!==v.head?' · на прежней голове':'')+(r.jail==='none'?' · БЕЗ клетки':r.jail==='bwrap'?' · 🔒':'');
         sm.className=r.verdict==='approve'?'ok':r.verdict==='refuted'?'no':'dim'; d.appendChild(sm);
         d.appendChild(el('pre','',r.full_text||r.text||'(текста нет)')); rv.appendChild(d)})}
     const dd=document.createElement('details'); dd.open=!!GATE.open.diff; dd.ontoggle=function(){GATE.open.diff=dd.open};

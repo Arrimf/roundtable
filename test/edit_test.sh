@@ -10,6 +10,10 @@ mkdir -p "$W/room"; cp "$RT/chamber/"*.py "$W/room/"; : > "$W/room/live.jsonl"
 git init -q "$W/proj"
 git -C "$W/proj" -c user.name=t -c user.email=t@t commit -q --allow-empty -m base
 export CHOIR_LEASE_DIR="$W/leases" CHOIR_WT_DIR="$W/wts" ROUNDTABLE_CHOIR="$W/room"
+# Стабы кресла здесь пишут метки ВНЕ worktree ($W/*.ts — проверка ворот
+# и порядка), клетка bwrap это отбила бы. Клетка проверяется своим
+# тестом (jail_test.sh), тут — механика правок без неё.
+export CHOIR_RT_NO_BWRAP=1
 
 RT="$RT" python3 - "$W" <<'PY'
 import json, os, signal, subprocess, sys, time

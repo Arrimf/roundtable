@@ -56,6 +56,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import edits                                             # noqa: E402
+import jail                                              # noqa: E402
 import leases                                            # noqa: E402
 
 QUORUM = 2          # минимум одобрений (спека п.6)
@@ -79,6 +80,10 @@ REVIEWER_EYES = {"codex": "files", "claude": "files", "grok": "files",
                  "deepseek": "files",  # контролёр dsh
                  "gemini": "dossier"}
 REVIEWER_SEATS = {"deepseek": "dsh"}   # чем физически исполняется голос
+# Кого сажать в клетку bwrap (jail.py): те, у кого нет своей read-only
+# песочницы. codex (-s read-only) и grok (--sandbox read-only) — нет.
+JAIL_REVIEWERS = {"claude", "kimi", "deepseek", "gemini"}
+OWN_SANDBOX_REVIEWERS = {"codex", "grok"}   # факт для события: jail=own
 
 REVIEWERS = {
     # Кодекс — ЗАКРУЧЕН ДО MEDIUM в ревизиях гейта (наказ Автора
@@ -384,6 +389,15 @@ git». Сверяйте содержимое ветки: git -C {op.get('project
 {diff}"""
 
 
+def _git_common(cwd: str) -> str:
+    """Общий .git проекта — рецензенту ro явно: linked worktree под /tmp
+    (тесты) держит gitdir снаружи cwd, и tmpfs клетки его спрятал бы —
+    пакет читается, а `git show <sha>:<путь>` уже нет (codex)."""
+    out, _ = _git(Path(cwd), "rev-parse", "--path-format=absolute",
+                  "--git-common-dir")
+    return (out or "").strip()
+
+
 def _run_reviewers(picked: dict, pf: Path, timeout: int, *, cwd: str):
     """Параллельные вызовы ревьюеров; (имя, результат) по мере готовности.
 
@@ -406,7 +420,25 @@ def _run_reviewers(picked: dict, pf: Path, timeout: int, *, cwd: str):
                 return _plain(name, argv, t0)
         return _plain(name, argv, t0)
 
+    common = _git_common(cwd)
+
     def _plain(name, argv, t0):
+        # КЛЕТКА рецензента (обещание 2 правила 8.5 механикой): корень
+        # ro, rw — только состояние самого CLI, пакет подкладывается
+        # ro (в клетке /tmp — свежий tmpfs, иначе пакета не видно).
+        # codex и grok не вкладываем — у них своя read-only песочница;
+        # gemini-http — адаптер, ему rw нужен только ~/.gemini (история,
+        # ротация ключей). Факт — в событии (jail: bwrap/own/none), как у
+        # кресла, и на отказах канала тоже: молчащий рецензент без
+        # поля jail — ровно тот случай, где по ленте важнее всего
+        # видеть, был ли он в клетке (codex, grok, kimi).
+        fact: dict = {"jail": "own"} if name in OWN_SANDBOX_REVIEWERS else {}
+        if name in JAIL_REVIEWERS:
+            # cwd — тоже ro явно: проект под /tmp (тесты) tmpfs прячет,
+            # и bwrap падал бы на --chdir.
+            argv, fact = jail.wrap(argv, REVIEWER_SEATS.get(name, name),
+                                   ro=[str(pf), cwd, *([common] if common else [])],
+                                   cwd=cwd)
         try:
             r = subprocess.run(argv, capture_output=True, text=True,
                                stdin=subprocess.DEVNULL, timeout=timeout,
@@ -417,18 +449,21 @@ def _run_reviewers(picked: dict, pf: Path, timeout: int, *, cwd: str):
                 return name, {"status": "error", "text": out,
                               "detail": (r.stderr or "")[-300:]
                               or f"rc={r.returncode}",
-                              "elapsed_s": el}
+                              "elapsed_s": el, **fact}
             if not out:
                 return name, {"status": "empty", "text": "",
-                              "elapsed_s": el}
-            return name, {"status": "ok", "text": out, "elapsed_s": el}
+                              "elapsed_s": el, **fact}
+            return name, {"status": "ok", "text": out, "elapsed_s": el,
+                          **fact}
         except subprocess.TimeoutExpired:
             return name, {"status": "timeout", "text": "",
                           "detail": f"не уложился в {timeout} с",
-                          "elapsed_s": round(time.monotonic() - t0, 1)}
+                          "elapsed_s": round(time.monotonic() - t0, 1),
+                          **fact}
         except OSError as e:
             return name, {"status": "error", "text": "", "detail": str(e),
-                          "elapsed_s": round(time.monotonic() - t0, 1)}
+                          "elapsed_s": round(time.monotonic() - t0, 1),
+                          **fact}
 
     with ThreadPoolExecutor(max_workers=len(picked) or 1) as ex:
         futs = [ex.submit(_call, n, f) for n, f in picked.items()]
@@ -507,7 +542,7 @@ def review(act: str, *, reviewers=None, timeout: int = REVIEW_TIMEOUT,
                       elapsed_s=res.get("elapsed_s"),
                       eyes=REVIEWER_EYES.get(name, "files"),
                       seat=REVIEWER_SEATS.get(name, name),
-                      full_text=full)
+                      jail=res.get("jail"), full_text=full)
             events.append(ev)
         # ИТОГ ВЕЕРА одной строкой (Автор 2026-09-14: «отказ от Грока
         # вылез сильно после» — ответы ложатся по мере прихода, и без
@@ -563,6 +598,28 @@ def checks(act: str) -> dict:
             # разберёт (продолжение акта открывает новую жизнь).
             out["reasons"].append("канарейка прав нарушена ИСПОЛНИТЕЛЕМ: "
                                   + ("; ".join((cn.get("broken") or [])[:3]) or "подробности в событии"))
+    cl = st.get("close") or {}
+    if "jail" in cl:
+        # Клетка кресла (jail.py) — факт close, не обещание: «none» —
+        # CLI без своей песочницы работал с записью во весь диск. Не
+        # блокирует (вчера так работали все), но названо вслух.
+        out["jail"] = cl.get("jail")
+        if cl.get("jail") == "none":
+            out["reasons_soft"] = out.get("reasons_soft", []) + [
+                "кресло работало БЕЗ клетки bwrap ("
+                + str(cl.get("jail_why") or "причина не названа")
+                + ") — запись была возможна во весь диск, канарейки — "
+                  "единственная проверка"]
+    rj = sorted({r.get("voice") or "?" for r in st.get("reviews") or []
+                 if r.get("jail") == "none"})
+    if rj:
+        # Рецензент без клетки — та же мягкая причина, что у кресла:
+        # его «одобряю» действительно, но писать он мог куда угодно
+        # (grok, deepseek: «несимметрично и небезопасно»).
+        out["jail_reviews_none"] = rj
+        out["reasons_soft"] = out.get("reasons_soft", []) + [
+            "ревизия БЕЗ клетки bwrap: " + ", ".join(rj)
+            + " — запись рецензента была возможна, канарейка — единственная проверка"]
     rb = [e for e in st.get("canary_reviews") or [] if e.get("status") == "broken"]
     if rb:
         # Обещание 2 нарушил рецензент — это порочит ревизию, не код:
@@ -1425,7 +1482,7 @@ def review_batch(acts: list[str] | None = None, *, reviewers=None,
                     elapsed_s=res.get("elapsed_s"), batch=True,
                     eyes=REVIEWER_EYES.get(name, "files"),
                     seat=REVIEWER_SEATS.get(name, name),
-                    batch_acts=acts, full_text=full))
+                    jail=res.get("jail"), batch_acts=acts, full_text=full))
         # итог веера — по каждому акту пачки (см. _post_tally)
         for act in acts:
             head, _ps, _st = heads[act]
