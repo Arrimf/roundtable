@@ -517,11 +517,17 @@ VOICES: dict[str, dict] = {
         # нить у Кодекса адресуется по id, поэтому cwd можно менять
         # свободно, в отличие от Грока и Кими.
         "cwd_project": True,
-        "cont": lambda p, f, a, s, d: ["codex", "exec", "resume", s,
-                                       "-c", 'sandbox_mode="read-only"',
+        # -s и --add-dir у `exec resume` ставятся ДО слова resume: после
+        # него парсер codex-cli 0.154.0 отвечает «unexpected argument»
+        # (первая редакция ставила их после — нашли субагент и codex в
+        # ревизии, проверено на фиктивном id: доходит до «no rollout
+        # found»). Прежний вызов держал только -c sandbox_mode и был без
+        # каталога проекта (раунд стол-v3-изоляция).
+        "cont": lambda p, f, a, s, d: ["codex", "exec", "-s", "read-only",
+                                       *_add_dir(d),
                                        "--skip-git-repo-check",
                                        *_codex_tune(),
-                                       "-o", str(a), p],
+                                       "resume", s, "-o", str(a), p],
         # Ответ Кодекса берём из файла: stdout у него — лог вперемешку с
         # репликой, и однажды в архив попадёт прогресс-бар (нашёл Кими).
         "answer_file": True,
@@ -1130,9 +1136,9 @@ _CHILD_LOCK = threading.Lock()
 
 
 def _on_term(signum, frame) -> None:                      # noqa: ARG001
-    with _CHILD_LOCK:
-        pgids = list(_CHILD_PGIDS)
-    for pg in pgids:
+    # без замка: обработчик в главной нити, где _run_capture мог держать
+    # _CHILD_LOCK — самозахват (второй круг ревизии cgroup); list() атомарен
+    for pg in list(_CHILD_PGIDS):
         try:
             os.killpg(pg, signal.SIGKILL)
         except (ProcessLookupError, PermissionError):

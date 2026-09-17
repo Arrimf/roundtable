@@ -39,6 +39,7 @@ import json
 import os
 import re
 import shlex
+import signal
 import shutil
 import subprocess
 import sys
@@ -629,6 +630,72 @@ def _pump(stream, sink: list[str], clock: list[float], tee=None) -> None:
             pass
 
 
+_CHILD_PGIDS: set[int] = set()
+_CHILD_LOCK = threading.Lock()
+
+
+def _on_term(signum, frame) -> None:                      # noqa: ARG001
+    """SIGTERM дирижёру (окно закрывает акт) — SIGKILL группам голосов:
+    голос в своей группе (process_group=0) иначе выпадал бы из killpg
+    акта без systemd (ревизия: grok). Как в live.py."""
+    # без замка: обработчик бежит в главной нити, где run_watched мог
+    # держать _CHILD_LOCK — самозахват повесил бы дирижёра (второй круг);
+    # list() под GIL атомарен
+    for pg in list(_CHILD_PGIDS):
+        try:
+            os.killpg(pg, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+    signal.signal(signum, signal.SIG_DFL)
+    os.kill(os.getpid(), signum)
+
+
+try:
+    # Только если SIGTERM ещё никто не взял: live.py импортирует choir
+    # лениво из turn() (проба Кими), и обработчик choir подменил бы
+    # обработчик комнаты с пустым списком групп (второй круг ревизии).
+    if (threading.current_thread() is threading.main_thread()
+            and signal.getsignal(signal.SIGTERM) is signal.SIG_DFL):
+        signal.signal(signal.SIGTERM, _on_term)
+except (ValueError, OSError):
+    pass
+
+
+def _group_alive(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def _killpg_tree(pgid: int, proc) -> None:
+    """Снять группу голоса целиком: SIGTERM, потом SIGKILL — и ждать
+    ПУСТОТЫ ГРУППЫ, а не смерти лидера: первая редакция делала break по
+    proc.wait(), и внук, игнорирующий SIGTERM, переживал обёртку (нашли
+    все четверо ревьюеров и субагент). Пустая группа даёт ESRCH."""
+    for sig, grace in ((signal.SIGTERM, 5.0), (signal.SIGKILL, 5.0)):
+        try:
+            os.killpg(pgid, sig)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            proc.wait(timeout=grace)         # лидер — зомби не держит группу
+        except subprocess.TimeoutExpired:
+            pass
+        deadline = time.monotonic() + grace
+        while _group_alive(pgid) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        if not _group_alive(pgid):
+            break
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        pass
+
+
 def run_watched(argv: list[str], *, cwd: str, hard_limit: int,
                 idle_limit: int = IDLE_LIMIT, sink=None) -> dict:
     """Запуск с двумя лимитами: на тишину и на общее время.
@@ -636,9 +703,17 @@ def run_watched(argv: list[str], *, cwd: str, hard_limit: int,
     Возвращает stdout/stderr целиком (собранные по ходу), код возврата,
     статус (`ok`/`stalled`/`timeout`) и сколько голос молчал напоследок.
     """
+    # СВОЯ ГРУППА: снятый по тишине голос убивался одним pid, а его внуки
+    # (узлы Node, pty script) жили дальше и жгли квоту (раунд
+    # стол-v3-изоляция: «run_watched убивает один PID»). Группа снимается
+    # целиком: SIGTERM, потом SIGKILL.
     proc = subprocess.Popen(argv, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, text=True,
-                            stdin=subprocess.DEVNULL, cwd=cwd, bufsize=1)
+                            stdin=subprocess.DEVNULL, cwd=cwd, bufsize=1,
+                            process_group=0)
+    pgid = proc.pid
+    with _CHILD_LOCK:
+        _CHILD_PGIDS.add(pgid)
     out: list[str] = []
     err: list[str] = []
     clock = [time.monotonic()]
@@ -667,11 +742,9 @@ def run_watched(argv: list[str], *, cwd: str, hard_limit: int,
 
     silence = round(time.monotonic() - clock[0], 1)
     if status != "ok":
-        proc.kill()
-        try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            pass
+        _killpg_tree(pgid, proc)
+    with _CHILD_LOCK:
+        _CHILD_PGIDS.discard(pgid)
     for t in pumps:
         t.join(timeout=5)
     return {"returncode": proc.returncode, "stdout": "".join(out),

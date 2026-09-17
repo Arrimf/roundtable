@@ -291,8 +291,13 @@ EDIT_VOICES = {
         # json.dumps даёт валидную TOML basic string: путь с кавычкой
         # или бэкслешем иначе ломал конфиг или РАСШИРЯЛ песочницу
         # (нашли kimi, codex и grok независимо).
-        "-c", f"sandbox_workspace_write.writable_roots="
-              f"[{json.dumps(str(base_git))}]",
+        # Корни записи — СПИСОК из codex_roots(): весь <base>/.git давал
+        # Кодексу hooks, refs/heads/main и config (раунд стол-v3-изоляция,
+        # 2026-09-16); строка — прежний вызов (тесты), тоже допустима.
+        "-c", "sandbox_workspace_write.writable_roots="
+              + json.dumps([str(r) for r in
+                            (base_git if isinstance(base_git, (list, tuple))
+                             else [base_git])]),
         *(["-c", f"model={_exec_over('codex', 'model')}"]
           if _exec_over("codex", "model") else []),
         # значение БЕЗ кавычек: -c 'k="v"' вешает codex до таймаута
@@ -389,6 +394,36 @@ class EditRefused(RuntimeError):
     """Правка не открыта — причина в тексте, следов не осталось."""
 
 
+def codex_roots(common: str, act: str, gitdir: str = "") -> list[str]:
+    """Куда Кодексу в кресле можно писать помимо worktree: свой gitdir
+    (HEAD, index, logs), объекты и ТОЛЬКО ветки act/ с их reflog. Не весь
+    .git: hooks, config, refs/heads/main остаются недоступны (раунд
+    стол-v3-изоляция: «writable_roots открывает весь .git»).
+    gitdir — фактический `rev-parse --absolute-git-dir` дерева: git
+    именует его по basename каталога и при совпадении дописывает число,
+    так что «<common>/worktrees/<акт>» — лишь умолчание (ревизия: codex,
+    субагент). Каталоги refs/heads/act и logs/refs/heads/act создаются
+    заранее: `git pack-refs` Автора их удаляет, и кресло падало бы на
+    «cannot lock ref» (субагент, наблюдал). Известная цена: в конце
+    commit git пишет «Unable to create packed-refs.lock: Read-only file
+    system» — это транзакция удаления CHERRY_PICK_HEAD, коммит при этом
+    проходит; кресло об этом предупреждается в задании."""
+    c = str(common).rstrip("/")
+    for d in (f"{c}/refs/heads/act", f"{c}/logs/refs/heads/act"):
+        try:
+            Path(d).mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+    return [gitdir or f"{c}/worktrees/{act}", f"{c}/objects",
+            f"{c}/refs/heads/act", f"{c}/logs/refs/heads/act"]
+
+
+CODEX_CHAIR_NOTE = ("ПЕСОЧНИЦА: запись разрешена только в этом рабочем дереве и "
+                    "в ветку act/… . Строка git «Unable to create packed-refs.lock: "
+                    "Read-only file system» после commit — норма, коммит прошёл: "
+                    "проверяйте `git log -1`, не повторяйте commit.\n\n")
+
+
 def open_edit(project: Path, task: str, voice: str,
               files: list[str] | None = None) -> dict:
     """Открыть акт правки: эпоха → worktree → интент в ленту.
@@ -455,7 +490,10 @@ def open_edit(project: Path, task: str, voice: str,
         raise EditRefused(f"git-common-dir не взят: {err}")
 
     try:
-        cmd = EDIT_VOICES[voice](task, base_git.strip())
+        gitdir, _e = _git(wt, "rev-parse", "--absolute-git-dir")
+        cmd = EDIT_VOICES[voice](
+            (CODEX_CHAIR_NOTE + task) if voice == "codex" else task,
+            codex_roots(base_git.strip(), act, (gitdir or "").strip()))
     except (ValueError, OSError) as e:
         # argv не собрался (кривое имя модели, диск под патч dsh) — до
         # интента; worktree уже есть, и без отката он остался бы сиротой.
@@ -619,7 +657,10 @@ def continue_edit(project: Path, act: str, text: str,
         raise EditRefused(f"эпоха {epoch} не старше эпохи интента "
                           f"{opn.get('epoch')} — продолжение не различимо")
     try:
-        cmd = EDIT_VOICES[voice](prompt, base_git.strip())
+        gitdir, _e = _git(wt, "rev-parse", "--absolute-git-dir")
+        cmd = EDIT_VOICES[voice](
+            (CODEX_CHAIR_NOTE + prompt) if voice == "codex" else prompt,
+            codex_roots(base_git.strip(), act, (gitdir or "").strip()))
     except (ValueError, OSError) as e:
         raise EditRefused(f"argv исполнителя не собрался: {e}")
     # В ленту — ИСХОДНОЕ задание и слова Автора, не собранный промпт:

@@ -935,6 +935,122 @@ def _act_fields(rec: dict | None) -> dict:
     return f
 
 
+# ── cgroup НА АКТ (раунд стол-v3-изоляция, 2026-09-16: обещание 4 «акт
+# умирает целиком» первым в порядке стола). Каждое действие окна идёт в
+# своём transient scope systemd (--user): внуки CLI, пережившие обёртку,
+# остаются в его cgroup — их видно (cgroup.procs) и их снимает
+# `systemctl --user stop`, а не охота по pid. Нет systemd — прежний путь
+# (своя группа + killpg), об этом одна строка при старте.
+_SCOPE: dict = {"ok": None}
+
+
+def _scope_available() -> bool:
+    if _SCOPE["ok"] is None:
+        ok = False
+        if (os.environ.get("CHOIR_RT_NO_SYSTEMD") != "1"
+                and shutil.which("systemd-run") and shutil.which("systemctl")):
+            try:
+                r = subprocess.run(["systemd-run", "--user", "--scope", "--quiet",
+                                    "--collect", "--", "true"],
+                                   capture_output=True, text=True, timeout=15)
+                ok = r.returncode == 0
+                if not ok:
+                    print(f"systemd-run недоступен ({r.stderr.strip()[:120]}) — "
+                          f"акты без cgroup, снимаются по группе процессов",
+                          file=sys.stderr)
+            except (OSError, subprocess.SubprocessError) as e:
+                print(f"systemd-run недоступен ({e}) — акты без cgroup",
+                      file=sys.stderr)
+        _SCOPE["ok"] = ok
+    return _SCOPE["ok"]
+
+
+def _scope_unit(act_id: str) -> str:
+    return f"rt-act-{act_id}-{os.getpid()}"
+
+
+def _scope_procs(unit: str) -> list[int] | None:
+    """pid, оставшиеся в cgroup акта: [] — scope пуст или уже собран;
+    None — не удалось прочитать (systemctl/cgroup): «не знаю», а не
+    «никого» (ревизия: codex, deepseek, grok)."""
+    try:
+        r = subprocess.run(["systemctl", "--user", "show", "-p", "ControlGroup",
+                            "--value", f"{unit}.scope"],
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode != 0:
+            return None
+        cg = r.stdout.strip()
+        if not cg:
+            return []
+        try:
+            txt = Path("/sys/fs/cgroup" + cg, "cgroup.procs").read_text()
+        except FileNotFoundError:
+            # systemd уже снёс каталог, а show ещё отдавал путь — гонка в
+            # момент выхода акта (второй круг: 16 из 30 прогонов); снесён
+            # значит пуст, а не «не знаю»
+            return []
+        return [int(x) for x in txt.split() if x.isdigit()]
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def _scope_kill(unit: str, sig: str = "SIGTERM") -> bool:
+    """Сигнал всему cgroup акта. Именно `kill --signal`, не `stop`: stop —
+    это SIGTERM и ожидание TimeoutStopSec (90 с у user-manager), а не
+    SIGKILL (субагент замерил: stop висел >30 с, kill -9 — 10 мс)."""
+    try:
+        r = subprocess.run(["systemctl", "--user", "kill", f"--signal={sig}",
+                            f"{unit}.scope"], capture_output=True, text=True,
+                           timeout=10)
+        return r.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _scope_reap(act_id: str, unit: str, label: str,
+                grace: float = 2.0) -> None:
+    """Акт закончился — в его cgroup никого не должно остаться (идея голоса
+    claude на витке раунда: cgroup.procs при закрытии — измеримое
+    обещание 4). Остались — SIGTERM, grace, SIGKILL, и заметка в ленту
+    только про то, что проверено: «сняты» лишь когда cgroup пуст."""
+    left = _scope_procs(unit)
+    if left is None:
+        feed_append("note", f"акт {act_id}: cgroup не прочитан — не знаю, "
+                    f"умер ли акт целиком ({label})", act=act_id)
+        return
+    if not left:
+        return
+    _scope_kill(unit, "SIGTERM")
+    time.sleep(grace)
+    still = _scope_procs(unit)
+    how = "SIGTERM"
+    if still:
+        _scope_kill(unit, "SIGKILL")
+        time.sleep(0.5)
+        still = _scope_procs(unit)
+        how = "SIGKILL"
+    outcome = ("сняты через cgroup (" + how + ")" if not still
+               else f"НЕ сняты: {len(still)} процесс(ов) ещё живы после {how}")
+    feed_append("note", f"акт {act_id} не умер целиком: {len(left)} процесс(ов) "
+                f"пережили обёртку (pid {', '.join(map(str, left[:6]))}) — "
+                f"{outcome}: {label}",
+                act=act_id, cgroup_left=left[:20], cgroup_still=(still or [])[:20])
+
+
+def _scope_orphans() -> list[str]:
+    """Scope прежних окон (rt-act-*), ещё живые: акты пережили окно —
+    автопрогон по замыслу, остальное — сироты, о которых надо сказать."""
+    try:
+        r = subprocess.run(["systemctl", "--user", "list-units", "--no-legend",
+                            "--plain", "rt-act-*.scope"],
+                           capture_output=True, text=True, timeout=10)
+        mine = f"-{os.getpid()}.scope"
+        return [ln.split()[0] for ln in r.stdout.splitlines()
+                if ln.strip() and not ln.split()[0].endswith(mine)]
+    except (OSError, subprocess.SubprocessError):
+        return []
+
+
 def spawn(cmd: list[str], label: str, voices: list[str],
           cwd: Path | None = None, meta: dict | None = None,
           note: str = "", fields: dict | None = None,
@@ -973,8 +1089,11 @@ def spawn(cmd: list[str], label: str, voices: list[str],
         # заговорить. Сужение списка не давало изоляции (переменные и так
         # именованы по голосу), зато панель показывала одну модель, а голос
         # шёл другой — поле врало (нашёл ревьюер 2026-08-26).
+        unit = _scope_unit(act_id) if _scope_available() else ""
+        run_cmd = (["systemd-run", "--user", "--scope", "--quiet", "--collect",
+                    f"--unit={unit}", "--", *cmd] if unit else cmd)
         proc = subprocess.Popen(
-            cmd, cwd=str(cwd or CHOIR), stdin=subprocess.DEVNULL,
+            run_cmd, cwd=str(cwd or CHOIR), stdin=subprocess.DEVNULL,
             stdout=log, stderr=subprocess.STDOUT,
             start_new_session=True,
             # RT_ACT_ID — чтобы заметки live.py («слово → …») несли
@@ -1013,6 +1132,8 @@ def spawn(cmd: list[str], label: str, voices: list[str],
                 os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
             except (ProcessLookupError, PermissionError, OSError):
                 pass
+            if unit:
+                _scope_kill(unit, "SIGTERM")
             log.close()
             feed_append("act_status",
                         f"act {act_id} прерван: {label} — окно закрывается",
@@ -1026,6 +1147,7 @@ def spawn(cmd: list[str], label: str, voices: list[str],
                            "label": label, "voices": voices,
                            "since": time.time(), "pid": proc.pid,
                            "proc": proc, "pgid": os.getpgid(proc.pid),
+                           "unit": unit,
                            # Поля события (round, step, auto…) — И В
                            # ФИНАЛ: карточка раунда вешается на done/error,
                            # а они шли без round (нашли codex, grok, claude).
@@ -1043,6 +1165,8 @@ def spawn(cmd: list[str], label: str, voices: list[str],
         if mine is None:
             return
         try:
+            if mine.get("unit"):
+                _scope_reap(act_id, mine["unit"], label)
             if rc == 0:
                 feed_append("act_status", f"act {act_id} done: {label}",
                             act_id=act_id, status="done",
@@ -3779,7 +3903,12 @@ class Handler(BaseHTTPRequestHandler):
                       note=picked_note,
                       fields={"edit": act, "epoch": epoch, "voice": voice,
                               **({"continues": cont} if cont else {})},
-                      env_extra={"CHOIR_THOUGHTS": "1" if req.get("thoughts") else "0"})
+                      env_extra={"CHOIR_THOUGHTS": "1" if req.get("thoughts") else "0",
+                                 # gc --auto из кресла ломился бы в packed-refs
+                                 # вне суженных корней записи (ревизия: kimi)
+                                 "GIT_CONFIG_COUNT": "1",
+                                 "GIT_CONFIG_KEY_0": "gc.auto",
+                                 "GIT_CONFIG_VALUE_0": "0"})
             finally:
                 with RUN_LOCK:
                     _EDIT_RESERVED.discard(proj_key)
@@ -4034,6 +4163,7 @@ class Handler(BaseHTTPRequestHandler):
                     continue
                 rnd = t.get("round")
                 killed = False
+                alive_before = t["proc"].poll() is None
                 try:
                     # ПОВТОРНЫЙ poll вплотную к сигналу. Раньше между
                     # первым poll и killpg стояла дисковая запись
@@ -4053,6 +4183,14 @@ class Handler(BaseHTTPRequestHandler):
                         killed = True
                 except (ProcessLookupError, PermissionError, OSError):
                     pass
+                if t.get("unit"):
+                    # НЕЗАВИСИМО от killpg: лидер мог уже выйти (poll
+                    # → ProcessLookupError), а внук в scope жив (ревизия:
+                    # субагент, codex, grok). killed — только если акт был
+                    # жив до сигнала: умерший сам с rc≠0 остаётся error, а
+                    # не «прерван» (второй круг).
+                    if _scope_kill(t["unit"], "SIGTERM") and alive_before:
+                        killed = True
                 if rnd:
                     # Флаг-стоп ПОСЛЕ сигнала: такт уведён в свою сессию
                     # и мог SIGTERM пережить — тогда флаг остановит его
@@ -4073,6 +4211,12 @@ class Handler(BaseHTTPRequestHandler):
                     rc = t["proc"].wait(timeout=1.5)
                 except Exception:                       # noqa: BLE001
                     rc = None
+                if t.get("unit"):
+                    # запись уже вынута из RUNNING — reap-нить сюда не
+                    # придёт, эскалация и заметка — наша работа
+                    threading.Thread(target=_scope_reap,
+                                     args=(aid, t["unit"], t.get("label", "")),
+                                     daemon=True).start()
                 if rc == 0:
                     feed_append("act_status",
                                 f"act {aid} done (успел завершиться, пока "
@@ -7423,6 +7567,24 @@ def main(argv: list[str] | None = None) -> int:
             time.sleep(60)
     threading.Thread(target=_edit_sweep, daemon=True).start()
     register_window()
+    # Scope живут в app.slice, не в сессии терминала: акты переживают и
+    # вкладку konsole, и падение окна (автопрогон — по замыслу, прочее —
+    # сироты, которых reap уже не увидит). Прежние — назвать в ленте.
+    try:
+        _orph = _scope_orphans() if _scope_available() else []
+    except Exception:                                   # noqa: BLE001
+        _orph = []
+    if _orph:
+        print(f"живые акты прежних окон: {', '.join(_orph)} — "
+              f"смотрите systemctl --user status <unit>", file=sys.stderr)
+        try:
+            feed_append("note", f"при старте окна найдены живые акты прежних "
+                        f"окон (scope): {', '.join(_orph[:8])} — автопрогон "
+                        f"продолжается по замыслу, остальное снимите "
+                        f"`systemctl --user kill --signal=SIGKILL <unit>`",
+                        units=_orph[:20])
+        except Exception as e:                          # noqa: BLE001
+            print(f"заметка о прежних актах не легла: {e}", file=sys.stderr)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
@@ -7524,16 +7686,32 @@ def main(argv: list[str] | None = None) -> int:
                 # (нашёл ревьюер автопрогона: раньше экспозиция была одна
                 # фаза, с галочкой стала весь раунд).
                 rnd = t.get("round")
-                if t.get("auto") and rnd:
+                if (t.get("auto") or t.get("detach")) and rnd:
+                    # detach — ручной шаг раунда: статус выше уже сказал
+                    # «продолжается», убивать его нельзя (второй круг)
                     stop_file(rnd).write_text("окно закрыто\n",
                                               encoding="utf-8")
                     print(f"act {aid}: автопрогон «{rnd}» продолжается, "
                           f"выставлен флаг-стоп")
                     continue
+                if t.get("unit"):
+                    _scope_kill(t["unit"], "SIGTERM")   # до killpg: лидер мог выйти
                 os.killpg(t["pgid"], signal.SIGTERM)
-                print(f"снята группа хода {aid} (pgid {t['pgid']})")
+                print(f"снята группа хода {aid} (pgid {t['pgid']}"
+                      + (f", scope {t['unit']}" if t.get("unit") else "") + ")")
             except (ProcessLookupError, PermissionError, OSError):
                 pass            # уже умер сам — это норма, не ошибка
+        # Упрямые внуки: секунда на SIGTERM, затем SIGKILL всему cgroup
+        # (окно уходит — ждать некому)
+        units = [t["unit"] for _a, t in unfinished
+                 if t.get("unit") and not ((t.get("auto") or t.get("detach"))
+                                           and t.get("round"))]
+        if units:
+            time.sleep(1.0)
+            for u in units:
+                if _scope_procs(u):
+                    _scope_kill(u, "SIGKILL")
+                    print(f"scope {u}: SIGKILL упрямым внукам")
     return 0
 
 
