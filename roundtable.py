@@ -473,7 +473,7 @@ def round_view(name: str) -> dict:
     def slim(r: dict) -> dict:
         return {k: r.get(k) for k in ("id", "ts", "phase", "role", "voice",
                                       "status", "model", "model_fallback",
-                                      "elapsed_s", "queued_s", "cli", "text",
+                                      "elapsed_s", "queued_s", "cli", "jail", "jail_sha", "text",
                                       "recovered", "error", "detail", "eyes",
                                       "visibility", "late", "nonblind",
                                       "channel", "role_declared")
@@ -5464,6 +5464,7 @@ function rline(label,rec){
   const meta=[rec.voice||'',rec.status||'',rec.model?('модель '+rec.model+(rec.model_fallback?' (запасная)':'')):'',
     (rec.elapsed_s!=null)?(Math.round(rec.elapsed_s)+' с'):'',
     (rec.text?(rec.text.length+' симв.'):''),rec.recovered?'восстановлено из истории CLI':'',
+    (rec.jail&&String(rec.jail).indexOf('bwrap')===0)?'🔒':(rec.jail==='none'?'⚠ без клетки':''),
     // Пометки журнала — не снимать: опоздавший ответ добран после
     // раскрытия и слепым не является (правила 4 и 8.5; субагент).
     rec.nonblind?'НЕСЛЕПОЙ (добран после раскрытия)':'',rec.late&&!rec.nonblind?'поздний':''].filter(Boolean);

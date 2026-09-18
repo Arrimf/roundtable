@@ -47,6 +47,7 @@ import threading
 
 import names as fnames                          # noqa: E402  имена файлов латиницей (alias: в cmd_* есть локальная names — список голосов)
 import transcript                               # noqa: E402  стенограмма акта
+import jail                                     # noqa: E402  клетка bwrap голоса
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -271,6 +272,23 @@ def find_round_file(path_or_name) -> Path:
         raise SystemExit(f"файл раунда {p.name} есть в нескольких проектах: "
                          + ", ".join(str(f) for f in found) + " — укажи --project")
     return p            # внешний или относительный путь: как дан (проверит читающий)
+
+
+def _hide_dirs() -> list[str]:
+    """РОДИТЕЛИ чужого, скрываемые целиком (jail.prefix: сокрытия, потом
+    своё поверх): карантин (промпты и fifo соседей), каталоги голосов в
+    журнале (state.json, prompt/answer комнаты) и нейтральные cwd.
+    Перечислять соседей нельзя: появившийся при живой клетке был бы
+    виден (codex)."""
+    roots = [QUARANTINE, JOURNAL / "voices",
+             Path.home() / ".cache" / "choir-voices"]
+    for r in roots:
+        # родителя создаём ДО клетки: точку монтирования под ro bwrap
+        # сделать не может, и voices/, появившийся посреди раунда
+        # (комната), был бы виден через ro песочницы (grok)
+        with contextlib.suppress(OSError):
+            r.mkdir(parents=True, exist_ok=True)
+    return [str(r) for r in roots]
 
 
 def voice_cwd(name: str) -> str:
@@ -1303,6 +1321,24 @@ def _sweep_stale_quarantine() -> None:
     оставшийся файл был бы дырой в слепоте следующего раунда."""
     for p in QUARANTINE.glob("pending_*.jsonl"):
         p.unlink(missing_ok=True)
+    # Плоские <stem>.prompt/.answer — до переезда в каталог на вызов
+    # (2026-09-18); карантин теперь скрыт от голосов целиком, но чужой
+    # промпт на диске всё равно лишний (субагент: 28 файлов).
+    for p in [*QUARANTINE.glob("*.prompt"), *QUARANTINE.glob("*.answer")]:
+        with contextlib.suppress(OSError):
+            p.unlink()
+    # Каталоги вызовов (<round>_<phase>_<voice>_<6hex>), пережившие
+    # смерть дирижёра: голосам они скрыты, но это мусор с fifo внутри
+    # (kimi). Старше суток — параллельный раунд их не держит.
+    cut = time.time() - 86400
+    for d in QUARANTINE.glob("*_*_*_??????"):
+        try:
+            if d.is_dir() and d.stat().st_mtime < cut:
+                for f in d.iterdir():
+                    f.unlink(missing_ok=True)
+                d.rmdir()
+        except OSError:
+            pass
 
 
 def available(name: str) -> bool:
@@ -1557,8 +1593,14 @@ def ask_one(name: str, prompt: str, round_id: str, phase: str,
     # таких вызовов совпадает. Промпт пишется до ворот, и общий файл
     # означал бы, что один вызов молча подсунул другому свой текст.
     stem = f"{round_id}_{phase}_{name}_{uuid.uuid4().hex[:6]}"
-    pfile = QUARANTINE / f"{stem}.prompt"
-    afile = QUARANTINE / f"{stem}.answer"
+    # СВОЙ КАТАЛОГ НА ВЫЗОВ: в клетке карантин скрыт целиком, голосу
+    # открывается только этот каталог — соседний fifo иначе можно было
+    # открыть вторым читателем и перехватить или подменить чужой ответ
+    # (нашёл codex, ревизия «свой HOME на голос»).
+    cdir = QUARANTINE / stem
+    cdir.mkdir(parents=True, exist_ok=True)
+    pfile = cdir / "prompt"
+    afile = cdir / "answer"
     pfile.write_text(prompt, encoding="utf-8")
     # (создание fifo — ниже, внутри try: mkfifo/open, упавшие здесь,
     # иначе пробрасывались мимо контракта «отказ записывается», а
@@ -1618,14 +1660,30 @@ def ask_one(name: str, prompt: str, round_id: str, phase: str,
                 # (нашёл codex). Берём девять десятых лимита.
                 argv += ["--timeout", str(max(5, min(limit - 5,
                                                      limit * 9 // 10)))]
+            # КЛЕТКА (обязательства 2 и 3 правила 8.5 механикой): корень
+            # ro, rw — только состояние своего CLI; карантин (промпт и
+            # fifo ответа), песочница и проект видны ro (явно — под /tmp
+            # тесты, tmpfs клетки их прячет); чужие каталоги скрыты.
+            # Кодекс — своя песочница ВНУТРИ клетки (замерено живьём).
+            # Запись в fifo на ro-bind проходит: запрет ro касается
+            # обычных файлов, не каналов (проверено пробником).
+            hide = _hide_dirs()
+            cwd = voice_cwd(name)
+            argv_run, fact = jail.wrap(
+                argv, name,
+                ro=[str(SANDBOX), *([str(PROJECT)] if PROJECT else [])],
+                hide=hide, ro_after=[str(cdir)], cwd=cwd, nest_own=True)
             tee = _tr_sink(name, visibility)
             if tee is not None:
-                tee(transcript.head(name, argv, prompt,
-                                    channel=(ch or {}).get("name", ""))
+                tee((transcript.head(name, argv, prompt,
+                                     channel=(ch or {}).get("name", ""))
+                     + jail.mark(fact, hide) + "\n")
                     .encode("utf-8", "replace"))
-            return run_watched(argv, cwd=voice_cwd(name), hard_limit=limit,
-                               idle_limit=idle if idle is not None else limit,
-                               sink=tee)
+            res = run_watched(argv_run, cwd=cwd, hard_limit=limit,
+                              idle_limit=idle if idle is not None else limit,
+                              sink=tee)
+            res.update(fact)
+            return res
 
         if v.get("serial"):
             # ВОРОТА. Очередь вместо падения — и очередь, названная вслух:
@@ -1686,6 +1744,10 @@ def ask_one(name: str, prompt: str, round_id: str, phase: str,
             run = _call()
         rec["returncode"] = run["returncode"]
         rec["silence_s"] = run["silence_s"]
+        if run.get("jail"):
+            rec["jail"] = run["jail"]           # факт клетки, не обещание
+            if run.get("jail_sha"):
+                rec["jail_sha"] = run["jail_sha"]
         # Ответ — из файла, если CLI умеет его туда положить (см. Codex);
         # из потока событий, если голос переведён на stream-json (Клод);
         # иначе — просто stdout.
@@ -1777,6 +1839,8 @@ def ask_one(name: str, prompt: str, round_id: str, phase: str,
                 pass
         pfile.unlink(missing_ok=True)
         afile.unlink(missing_ok=True)
+        with contextlib.suppress(OSError):
+            cdir.rmdir()
     rec["elapsed_s"] = round(time.monotonic() - t0, 1)
     r_new = declared_role(rec.get("text", ""))
     if r_new:

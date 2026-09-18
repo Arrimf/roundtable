@@ -52,7 +52,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import leases                                            # noqa: E402
-import jail                                              # noqa: E402
 
 # Раскладка (переезд 2026-09-06): код стола — chamber/, журналы — journal/
 # рядом; ROUNDTABLE_CHAMBER / ROUNDTABLE_JOURNAL переопределяют каждый.
@@ -75,6 +74,8 @@ CHAMBER = _abs(os.environ.get("ROUNDTABLE_CHAMBER") or _legacy or _HERE / "chamb
 JOURNAL = _abs(os.environ.get("ROUNDTABLE_JOURNAL") or os.environ.get("CHOIR_JOURNAL")
                or _legacy or CHAMBER.parent / "journal")
 CHOIR = CHAMBER
+sys.path.insert(0, str(CHAMBER))
+import jail                                              # noqa: E402
 # live.py/choir.py в дочерних процессах обязаны видеть ТОТ ЖЕ журнал, что
 # окно: присваивание, не setdefault — унаследованный CHOIR_JOURNAL иначе
 # перекрыл бы явный ROUNDTABLE_JOURNAL тестового окна, и дирижёр писал бы в
@@ -436,10 +437,15 @@ def _run(a, wt: Path, cmd: list, lease) -> int:
     # перенаправил бы его на свой репозиторий с core.fsmonitor/hooks, а
     # обёртка после его выхода зовёт git СНАРУЖИ клетки (status, add,
     # commit) — и чужая команда получила бы права обёртки (codex).
+    # Журнал ревизий стола — ro: хук review-gate Клода читает его перед
+    # коммитом, в пустом доме файла не было бы, и коммит кресла падал
+    # «остановлен» (субагент). Не секрет.
+    rev_log = Path.home() / ".cache" / "choir" / "reviews.jsonl"
     cmd, jail_fact = jail.wrap(
         cmd, a.voice,
         rw=[str(wt), *codex_roots(common, a.act, gitdir)],
-        ro=[common], ro_after=[str(wt / ".git")] if (wt / ".git").is_file() else [],
+        ro=[common, *([str(rev_log)] if rev_log.is_file() else [])],
+        ro_after=[str(wt / ".git")] if (wt / ".git").is_file() else [],
         cwd=str(wt))
     a.jail_fact = jail_fact                  # для close при прерывании
     if jail_fact.get("jail") == "none":

@@ -68,12 +68,20 @@ python3 "$RT/executor_run.py" --act ../evil --epoch 1 --worktree "$W/wt" --voice
   --cmd-json '["true"]' >/dev/null 2>&1; echo $? > "$W/rc_act"
 set -e
 
-# 8: ВНУК. PDEATHSIG достаётся только прямому потомку — граница честная,
-#    и тест её ЗАКРЕПЛЯЕТ, а не делает вид, что её нет: внук переживает
-#    вылет, и снять его окно может только по pgid из meta.
+# 8: ВНУК. PDEATHSIG достаётся только прямому потомку — но с клеткой
+#    (2026-09-18: --unshare-pid) внук живёт в pid-namespace клетки и
+#    умирает с ней: --die-with-parent роняет bwrap, ядро — всех внутри.
+#    Граница «внук переживает вылет» остаётся только БЕЗ клетки
+#    (jail=none), и тест закрепляет ОБА факта.
 python3 "$RT/executor_run.py" --act e7 --epoch 7 --worktree "$W/wt" --voice grok \
   --cmd-json '["bash","-c","sleep 61.17 & sleep 60"]' >/dev/null 2>&1 & GPID=$!
 sleep 2; kill -9 "$GPID" 2>/dev/null || true; wait "$GPID" 2>/dev/null || true
+sleep 1
+# 8b: тот же сценарий БЕЗ клетки (codex в кресле — своя песочница, jail=own):
+#     внук переживает вылет — граница по-прежнему честно названа.
+python3 "$RT/executor_run.py" --act e9 --epoch 9 --worktree "$W/wt" --voice codex \
+  --cmd-json '["bash","-c","sleep 61.18 & sleep 60"]' >/dev/null 2>&1 & GPID2=$!
+sleep 2; kill -9 "$GPID2" 2>/dev/null || true; wait "$GPID2" 2>/dev/null || true
 sleep 1
 
 RT="$RT" python3 - "$W" <<'PY'
@@ -82,6 +90,9 @@ w = sys.argv[1]
 sys.path.insert(0, os.environ["RT"])
 os.environ["CHOIR_LEASE_DIR"] = f"{w}/leases"
 import leases
+sys.path.insert(0, os.environ["RT"] + "/chamber")
+import jail
+jail_ok = jail.available()
 evs = [json.loads(l) for l in open(f"{w}/room/live.jsonl") if l.strip()]
 cl = {e["act"]: e for e in evs if e.get("kind") == "edit_close"}
 # Сироту ищем по ЗАПИСАННОМУ pid, а не по шаблону в cmdline: шаблон
@@ -91,6 +102,9 @@ cl = {e["act"]: e for e in evs if e.get("kind") == "edit_close"}
 meta = json.loads(leases.meta_path("e3").read_text())
 grandchild = len([1 for ln in os.popen("ps -eo args=").read().splitlines()
                   if ln.strip() == "sleep 61.17"])
+grandchild_own = len([1 for ln in os.popen("ps -eo args=").read().splitlines()
+                      if ln.strip() == "sleep 61.18"])
+os.system("pkill -x -f 'sleep 61.18' >/dev/null 2>&1")   # уборка сироты без клетки
 try:
     os.kill(meta["cli_pid"], 0)
     orphan = 1
@@ -126,8 +140,11 @@ checks = [
      open(f"{w}/rc_act").read().strip() == "2"),
     ("подкаталог вместо корня worktree → отказ ДО запуска CLI",
      open(f"{w}/rc_sub").read().strip() == "2"),
-    ("ВНУК переживает вылет — граница названа, а не спрятана",
-     grandchild == 1),
+    ("ВНУК в клетке умирает вместе с обёрткой (pid-namespace), не переживает вылет"
+     + ("" if jail_ok else " [без bwrap: переживает]"),
+     grandchild == (0 if jail_ok else 1)),
+    ("ВНУК без клетки (codex, jail=own) переживает вылет — граница названа, а не спрятана",
+     grandchild_own == 1),
     ("молчащий git → head/dirty = неизвестно (null), а не «чисто»",
      cl.get("e5", {}).get("head") is None and cl.get("e5", {}).get("dirty") is None
      and "неизвестно" in cl.get("e5", {}).get("text", "")),

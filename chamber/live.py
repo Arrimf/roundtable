@@ -56,6 +56,7 @@ import sys
 import threading
 
 import transcript                               # noqa: E402  стенограмма акта
+import jail                                     # noqa: E402  клетка bwrap голоса
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -875,6 +876,20 @@ def per_channel(name: str, make):
     return {c["name"]: make(load_state(name, c)) for c in chans}
 
 
+def _hide_dirs() -> list[str]:
+    """РОДИТЕЛИ чужого, скрываемые целиком (jail.prefix: сокрытия, потом
+    своё поверх): каталоги голосов в журнале (prompt.txt, answer.txt
+    текущего хода, state.json с id сессий) и нейтральные cwd. Свой
+    каталог голоса открывается rw ПОВЕРХ; перечислять соседей нельзя —
+    появившийся при живой клетке был бы виден (codex)."""
+    roots = [VOICEDIR, Path.home() / ".cache" / "choir-voices",
+             Path.home() / ".cache" / "choir"]        # карантин раундов (grok)
+    for r in roots:                    # родитель — до клетки (см. choir)
+        with contextlib.suppress(OSError):
+            r.mkdir(parents=True, exist_ok=True)
+    return [str(r) for r in roots]
+
+
 def _voice_cmd(v: dict, key: str, prompt: str, pfile: Path, afile: Path,
                session, ch: dict | None) -> list[str]:
     """argv хода: у голоса с линиями команда знает ещё и канал."""
@@ -1337,6 +1352,7 @@ def turn(name: str, prompt) -> dict:
                         # обрезка берёт хвост, но искать всё равно надо
                         # в полном: хвост тоже может не вместить.
     ptext = prompt if isinstance(prompt, str) else ""
+    fact: dict = {}          # факт клетки — в событие при любом исходе
     try:
         # Ворота держим вокруг самого вызова — и вокруг выбора линии:
         # от неё зависят нить, каталог и промпт, а разбор ответа уже
@@ -1381,14 +1397,24 @@ def turn(name: str, prompt) -> dict:
                 use_cont = False
             cmd = _voice_cmd(v, "cont" if use_cont else "start", ptext,
                              pfile, afile, session, ch)
+            # КЛЕТКА (обязательства 2 и 3 правила 8.5 механикой): корень
+            # ro, rw — только свой каталог голоса (answer.txt Кодекса) и
+            # состояние своего CLI; журнал, проект и cwd видны ro (под
+            # /tmp — тесты — их прячет tmpfs, потому явно); чужие
+            # каталоги скрыты. Кодекс — своя песочница ВНУТРИ клетки.
+            hide = _hide_dirs()
+            cmd_run, fact = jail.wrap(
+                cmd, name, rw=[str(home)],
+                ro=[str(JOURNAL), *([str(PROJECT)] if PROJECT else [])],
+                hide=hide, cwd=str(cwd), nest_own=True)
             t0 = time.monotonic()  # отсчёт РАБОТЫ, очередь сюда не входит
             wall_t0 = time.time()  # для пробы логов Кими (mtime файлов)
             vt = v.get("turn_timeout", TURN_TIMEOUT)
             sink = _tr_sink(name)
             if sink is not None:
-                sink(_tr_head(name, cmd, ptext, ch, bool(use_cont))
-                     .encode("utf-8", "replace"))
-            r = _run_capture(cmd, cwd, vt, sink)
+                sink((_tr_head(name, cmd, ptext, ch, bool(use_cont))
+                      + jail.mark(fact, hide) + "\n").encode("utf-8", "replace"))
+            r = _run_capture(cmd_run, cwd, vt, sink)
         rc = r.returncode
         if v.get("answer_file") and afile.exists():
             out = afile.read_text(encoding="utf-8").strip()
@@ -1553,6 +1579,10 @@ def turn(name: str, prompt) -> dict:
         save_state(name, st, ch)
     if HAND_RE.search(ev.get("text", "")):
         ev["hand"] = True                              # поднял руку
+    if fact:
+        ev.setdefault("jail", fact.get("jail"))
+        if fact.get("jail_sha"):
+            ev.setdefault("jail_sha", fact["jail_sha"])
     return ev
 
 
@@ -1630,6 +1660,8 @@ def deliver(names: list[str], blind: bool = False) -> list[dict]:
             done_n += 1
             _note(f"{mark} {n:<8} {ev.get('elapsed_s', 0):>6.1f} с  "
                   f"{len(ev.get('text', '')):>5} симв."
+                  f"{'  🔒' if str(ev.get('jail', '')).startswith('bwrap') else ''}"
+                  f"{'  ⚠ без клетки' if ev.get('jail') == 'none' else ''}"
                   f"{'' if ev['kind'] != 'error' else '  ' + ev.get('detail', '')[:70]}")
             if blind:
                 _out(f"· готово {done_n}/{len(names)}")   # обезличенный счётчик — можно на диск

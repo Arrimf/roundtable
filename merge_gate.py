@@ -41,6 +41,7 @@ SPEC-ispolnitel-v1 (v2), пп. 6–8:
 """
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import hashlib
 import json
@@ -56,6 +57,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import edits                                             # noqa: E402
+sys.path.insert(0, str(edits.CHOIR))
 import jail                                              # noqa: E402
 import leases                                            # noqa: E402
 
@@ -436,9 +438,25 @@ def _run_reviewers(picked: dict, pf: Path, timeout: int, *, cwd: str):
         if name in JAIL_REVIEWERS:
             # cwd — тоже ro явно: проект под /tmp (тесты) tmpfs прячет,
             # и bwrap падал бы на --chdir.
-            argv, fact = jail.wrap(argv, REVIEWER_SEATS.get(name, name),
-                                   ro=[str(pf), cwd, *([common] if common else [])],
-                                   cwd=cwd)
+            # каталог стола — ro: dsh берёт --patch из RoundTable/, а дом
+            # в клетке пустой (tmpfs), проект может быть и вне песочницы
+            # чужое под открытым ro проекта — каталоги голосов комнаты и
+            # карантин раундов, идущих параллельно ревизии (grok)
+            hide = [edits.JOURNAL / "voices", Path.home() / ".cache" / "choir"]
+            for h in hide:
+                with contextlib.suppress(OSError):
+                    h.mkdir(parents=True, exist_ok=True)
+            try:
+                argv, fact = jail.wrap(argv, REVIEWER_SEATS.get(name, name),
+                                       ro=[str(pf), cwd, *([common] if common else []),
+                                           str(Path(__file__).resolve().parent)],
+                                       hide=[str(h) for h in hide], cwd=cwd)
+            except RuntimeError as e:
+                # строгий режим без bwrap или путь, накрывающий дом —
+                # отказ ОДНОГО рецензента, не всего гейта (kimi)
+                return name, {"status": "error", "text": "", "detail": str(e),
+                              "elapsed_s": round(time.monotonic() - t0, 1),
+                              "jail": "none"}
         try:
             r = subprocess.run(argv, capture_output=True, text=True,
                                stdin=subprocess.DEVNULL, timeout=timeout,
