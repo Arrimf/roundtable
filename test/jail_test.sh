@@ -344,8 +344,8 @@ t("prefix: «/дом/x/..», симлинк на дом и ro ровно на с
 (w / "home/.cache/choir/dsh-patches").mkdir(parents=True, exist_ok=True)
 _patch = w / "home/.cache/choir/dsh-patches/model-x.yaml"; _patch.write_text("m")
 t("argv_paths(): существующий путь из аргументов (--patch dsh, --flag=/путь) открывается ro",
-  str(_patch) in jail.argv_paths(["dsh", "--patch", str(_patch), f"--x={stub}", "текст /nonexistent"], "dsh")
-  and str(stub) in jail.argv_paths([f"--x={stub}"], "dsh")
+  str(_patch) in jail.argv_paths(["dsh", "--patch", str(_patch), f"--x={w}/proj", "текст /nonexistent"], "dsh")
+  and str(w / "proj") in jail.argv_paths([f"--x={w}/proj"], "dsh")
   and str(_patch) in jail.wrap(["dsh", "--patch", str(_patch)], "dsh")[0])
 (w / "home/.kimi-code").mkdir(exist_ok=True)
 (w / "home/.cache/choir/other_blind_kimi_ab12").mkdir(parents=True, exist_ok=True)
@@ -359,6 +359,11 @@ t("wrap(): путь из argv под скрытым карантином — т�
 _h0 = (w / "home/.codex").exists(); jail._AVAIL = None; jail.available()
 t("_probe(): пробник не создаёт каталоги состояния (голос «probe» вне STATE)",
   (w / "home/.codex").exists() == _h0 and not (w / "home/.probe").exists())
+t("argv_paths(): /dev/null, /proc, /tmp, «/./dev/null», «/tmp/../dev/null», «/» из аргументов не bind'ятся",
+  jail.argv_paths(["script", "-qec", "grok", "/dev/null", "/proc/self", str(stub), "/./dev/null", "/tmp/../dev/null", "/", "/var/run"], "grok") == [])
+(w / "home/.codex/out.log").write_text("")
+t("wrap(): путь из argv под своим rw не bind'ится ro (иначе закрыл бы запись)",
+  str(w / "home/.codex/out.log") not in jail.wrap(["x", f"--output={w}/home/.codex/out.log"], "codex", nest_own=True)[0][:-2])
 t("argv_paths(): путь под домом вне кэша стола и своего состояния (чужое) НЕ открывается",
   str(w / "home/.kimi-code") not in jail.argv_paths(["-p", str(w / "home/.kimi-code")], "codex")
   and str(w / "home/.codex") in jail.argv_paths(["-p", str(w / "home/.codex")], "codex"))

@@ -412,6 +412,15 @@ def argv_paths(cmd, voice: str = "") -> list[str]:
         for c in cand:
             if not (c.startswith("/") and len(c) < 512 and "\n" not in c):
                 continue
+            c = os.path.normpath(c)     # «/./dev/null», «/tmp/../dev/null» (codex, grok)
+            if c == "/":
+                continue
+            # Виртуальные деревья и tmpfs клетки не трогать: ro-bind
+            # /dev/null поверх устройства сломал `script … /dev/null`
+            # Грока — раунд ранние-отказы, оба хода «Permission denied»
+            skip = ["/dev", "/proc", "/sys", "/run", "/tmp"]
+            if _under(c, skip) or _under(os.path.realpath(c), skip):
+                continue        # и через симлинк: /var/run → /run (субагент)
             if _under(c, [h]) and not _under(c, ok_home):
                 continue
             if os.path.lexists(c) and c not in out:
@@ -572,9 +581,13 @@ def wrap(cmd: list[str], voice: str, *, rw=(), ro=(), ro_after=(),
     # ro_after/rw/состоянием): промпт, равный пути чужого вызова в
     # карантине, иначе переоткрыл бы его через after (субагент, пробник)
     own = [str(p) for p in ro_after] + [str(p) for p in rw] + state_dirs(voice)
+    writable = [str(p) for p in rw] + state_dirs(voice)
     hide_l = [os.path.normpath(str(p)) for p in hide]
+    # под своим rw — не bind'ить вовсе: ro поверх закрыл бы запись в
+    # выходной файл из аргументов (codex)
     ro = [*ro, *[p for p in argv_paths(cmd, voice)
-                 if not (_under(p, hide_l) and not _under(p, own))]]
+                 if not _under(p, writable)
+                 and not (_under(p, hide_l) and not _under(p, own))]]
     if disabled():
         return list(cmd), {"jail": "none", "jail_why": "CHOIR_RT_NO_BWRAP=1"}
     if not available():
