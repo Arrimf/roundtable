@@ -577,10 +577,16 @@ VOICES: dict[str, dict] = {
         # сессия); столу нужен один вопрос и один ответ той моделью,
         # которой голос подписан — урок Gemini CLI, молча подменявшего
         # модель. У deepseek-http сессий нет: start и cont совпадают.
+        # --timeout КОРОЧЕ хода (как у Джемини): общий дедлайн адаптера на
+        # все попытки, иначе умолчание 900 с и сторож комнаты (180)
+        # снимал бы адаптер снаружи без причины в журнале (субагент,
+        # ревизия «ранние отказы»)
         "start": lambda p, f, a, s, d: ["deepseek-http", "--prompt-file",
-                                        str(f)],
+                                        str(f), "--timeout",
+                                        str(VOICES["deepseek"]["turn_timeout"] - 30)],
         "cont": lambda p, f, a, s, d: ["deepseek-http", "--prompt-file",
-                                       str(f)],
+                                       str(f), "--timeout",
+                                       str(VOICES["deepseek"]["turn_timeout"] - 30)],
         # Прямой вызов API, а не агент: файлы не читает (как Джемини).
         "no_files": True,
         # exit 3 — кончился предоплаченный баланс: штатный отказ, как

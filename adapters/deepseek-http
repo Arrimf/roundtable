@@ -48,7 +48,13 @@ PRICE_IN_MISS, PRICE_IN_HIT, PRICE_OUT = 0.435, 0.0036, 0.87
 RETRIES = 3
 # Дедлайн первого байта (раунд «ранние-отказы»): см. gemini-http — одна
 # молчащая попытка не должна съедать весь бюджет вызова.
-FIRST_BYTE_S = max(10, int(os.environ.get("DEEPSEEK_FIRST_BYTE_S", "60")))
+# 90, не 60: v4-pro с рассуждениями в пробный день дважды не дал первого
+# байта за 60 с и ответил с третьей попытки — при потолке 60 три попытки
+# (180 с) перекрывали ход комнаты (180). STREAM_IDLE_S — сторож тишины
+# МЕЖДУ порциями после первого байта (двое часов из свода раунда):
+# поток, молчащий полторы минуты, мёртв, весь бюджет ему не отдаётся.
+FIRST_BYTE_S = max(10, int(os.environ.get("DEEPSEEK_FIRST_BYTE_S", "90")))
+STREAM_IDLE_S = max(10, int(os.environ.get("DEEPSEEK_STREAM_IDLE_S", "90")))
 
 
 def log(msg: str) -> None:
@@ -116,7 +122,7 @@ def stream_read(r, deadline: float, t_open: float | None = None,
                 if t_open is not None:           # живой вызов, не разбор потока в тесте
                     log(f"первый байт через {first_byte} с")
                 if timeout:
-                    _set_sock_timeout(r, timeout)
+                    _set_sock_timeout(r, min(timeout, STREAM_IDLE_S))
             if time.monotonic() > deadline:
                 raise StreamBroken("дедлайн вышел посреди потока")
             line = raw.decode("utf-8", "replace").strip()
@@ -254,10 +260,19 @@ def main() -> int:
         return 2
 
     last = None
+    # ОБЩИЙ дедлайн на все попытки: три по FIRST_BYTE_S без него
+    # перекрывали ход комнаты, и её сторож снимал адаптер снаружи без
+    # причины в журнале (пробник 2026-09-20: 180 с при ответе за 20)
+    t_all = time.monotonic()
     for attempt in range(1, RETRIES + 1):
+        left = a.timeout - (time.monotonic() - t_all)
+        if left < 5:
+            log(f"дедлайн {a.timeout} с исчерпан после {attempt - 1} попыток; "
+                f"последняя ошибка: {last or 'нет'}")
+            return 1
         try:
             t0 = time.time()
-            data = call(prompt, a.model, key, a.timeout,
+            data = call(prompt, a.model, key, int(left),
                         None if a.effort == "none" else a.effort,
                         stream=not a.no_stream)
             break
@@ -275,8 +290,9 @@ def main() -> int:
             if isinstance(e, (TimeoutError, socket.timeout)):
                 # честно: до первого байта — «нет первого байта», после —
                 # «тишина после первого байта» (субагент, grok)
-                last = (f"нет первого байта за {FIRST_BYTE_S} с ({last})"
-                        if not _FIRST_BYTE_SEEN else f"тишина после первого байта ({last})")
+                cap = int(min(left, FIRST_BYTE_S)) if not a.no_stream else int(left)
+                last = (f"нет первого байта за {cap} с ({last})"
+                        if not _FIRST_BYTE_SEEN else f"тишина после первого байта дольше {STREAM_IDLE_S} с ({last})")
             _FIRST_BYTE_SEEN = False
             log(f"попытка {attempt}/{RETRIES}: {last}")
             if not a.no_stream and _partial_out():
@@ -285,7 +301,8 @@ def main() -> int:
                 log("поток оборвался после начала ответа — без повтора")
                 return 1
         if attempt < RETRIES:
-            time.sleep(2 * attempt)
+            # пауза — в остатке бюджета, не сверх него (codex)
+            time.sleep(min(2 * attempt, max(0, a.timeout - (time.monotonic() - t_all))))
     else:
         log(f"не ответил после {RETRIES} попыток: {last}")
         return 1

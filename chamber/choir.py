@@ -1703,7 +1703,7 @@ def ask_one(name: str, prompt: str, round_id: str, phase: str,
             # сторож убивал его раньше, чем он успевал сказать причину,
             # и в журнал шло «(пусто) не уложился» без объяснения —
             # ровно та беда, что уже чинилась в комнате (нашёл kimi).
-            if name == "gemini" and "--timeout" not in argv:
+            if name in ("gemini", "deepseek") and "--timeout" not in argv:
                 # Заведомо КОРОЧЕ лимита: max(30, limit-30) при
                 # --hard-timeout 45 давал адаптеру те же 30 с… нет,
                 # ровно 30 при лимите 45 — уже меньше, но при лимите 40

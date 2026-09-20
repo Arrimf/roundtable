@@ -80,6 +80,9 @@ NET_RETRIES = 3
 # байта — свой потолок; дальше сокету возвращается полный дедлайн
 # (мысли модели могут идти долго между порциями).
 FIRST_BYTE_S = max(10, int(os.environ.get("GEMINI_FIRST_BYTE_S", "60")))
+# Сторож тишины между порциями после первого байта (двое часов из
+# свода раунда ранние-отказы): весь дедлайн молчащему потоку не отдаётся
+STREAM_IDLE_S = max(10, int(os.environ.get("GEMINI_STREAM_IDLE_S", "90")))
 NET_BACKOFF_S = 4
 
 
@@ -194,7 +197,7 @@ def post_stream(url: str, payload: dict, timeout: int,
                     _FIRST_BYTE_SEEN = True
                     first_byte = round(time.monotonic() - t_open, 1)
                     log(f"первый байт через {first_byte} с")
-                    _set_sock_timeout(r, timeout)
+                    _set_sock_timeout(r, min(timeout, STREAM_IDLE_S))
                 if deadline is not None and time.monotonic() > deadline:
                     # timeout у urlopen — на каждое чтение сокета, не на
                     # весь ответ: капающий поток пережил бы дедлайн, и
@@ -472,8 +475,8 @@ def ask(prompt: str, model: str, timeout: int, session: str | None,
             except Exception as e:                     # noqa: BLE001
                 last_err = f"{type(e).__name__}: {e}"
                 if isinstance(e, (TimeoutError, socket.timeout)) and "посреди" not in str(e):
-                    last_err = (f"нет первого байта за {FIRST_BYTE_S} с ({last_err})"
-                                if not _FIRST_BYTE_SEEN else f"тишина после первого байта ({last_err})")
+                    last_err = (f"нет первого байта за {int(min(left(), FIRST_BYTE_S))} с ({last_err})"
+                                if not _FIRST_BYTE_SEEN else f"тишина после первого байта дольше {STREAM_IDLE_S} с ({last_err})")
                 _FIRST_BYTE_SEEN = False
                 last_why = "gateway"
                 # Ранний уход обязан работать и здесь: сетевой отказ
