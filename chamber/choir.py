@@ -48,6 +48,7 @@ import threading
 import names as fnames                          # noqa: E402  имена файлов латиницей (alias: в cmd_* есть локальная names — список голосов)
 import transcript                               # noqa: E402  стенограмма акта
 import jail                                     # noqa: E402  клетка bwrap голоса
+import early                                    # noqa: E402  ранние отказы: тень и снятие
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -699,13 +700,20 @@ def _from_stream_json(out: str, ev_type: str, field: str) -> str:
     return text.strip()
 
 
-def _pump(stream, sink: list[str], clock: list[float], tee=None) -> None:
+def _pump(stream, sink: list[str], clock: list[float], tee=None,
+          on_line=None) -> None:
     """Тянуть поток построчно, отмечая КАЖДУЮ строку как признак жизни.
-    tee — приёмник стенограммы: строка уходит туда по мере прихода."""
+    tee — приёмник стенограммы: строка уходит туда по мере прихода;
+    on_line(line) — тень ранних отказов (early.py), только для stderr."""
     try:
         for line in iter(stream.readline, ""):
             sink.append(line)
             clock[0] = time.monotonic()
+            if on_line is not None:
+                try:
+                    on_line(line)
+                except Exception as e:             # noqa: BLE001  тень — не ответ
+                    print(f"тень отказов: {e}", file=sys.stderr)
             if tee is not None:
                 try:
                     # только целыми строками: хвост без \n склеивался бы со
@@ -790,11 +798,16 @@ def _killpg_tree(pgid: int, proc) -> None:
 
 
 def run_watched(argv: list[str], *, cwd: str, hard_limit: int,
-                idle_limit: int = IDLE_LIMIT, sink=None) -> dict:
+                idle_limit: int = IDLE_LIMIT, sink=None,
+                voice: str = "", round_id: str = "",
+                phase: str = "", warn_sink: list | None = None,
+                blind: bool = False) -> dict:
     """Запуск с двумя лимитами: на тишину и на общее время.
 
     Возвращает stdout/stderr целиком (собранные по ходу), код возврата,
-    статус (`ok`/`stalled`/`timeout`) и сколько голос молчал напоследок.
+    статус (`ok`/`stalled`/`timeout`/`dropped`), сколько голос молчал
+    напоследок, `early_warns` тени (early.py) и `ended_by` — кто снял
+    (флаг drop/<pgid> от кнопки «снять сейчас» в окне).
     """
     # СВОЯ ГРУППА: снятый по тишине голос убивался одним pid, а его внуки
     # (узлы Node, pty script) жили дальше и жгли квоту (раунд
@@ -807,18 +820,41 @@ def run_watched(argv: list[str], *, cwd: str, hard_limit: int,
     pgid = proc.pid
     with _CHILD_LOCK:
         _CHILD_PGIDS.add(pgid)
+    early.clear_drop(pgid)            # хвост чужой жизни этого pgid — не команда
     out: list[str] = []
     err: list[str] = []
     clock = [time.monotonic()]
+    # ТЕНЬ (early.py): читает stderr, ничего не убивает; предупреждение —
+    # в стенограмму (жёлтой строкой) и в ленту событием early_warn с pgid,
+    # чтобы у кнопки «снять сейчас» было, что снимать. В слепой фазе в
+    # ленту идёт класс и sha строки, строка — в запись голоса.
+    shadow = early.Shadow(voice or "?")
+    act_id = os.environ.get("RT_ACT_ID") or None
+
+    def on_err(line: str) -> None:
+        info = shadow.feed(line, "err")
+        if info is None:
+            return
+        if sink is not None:
+            try:
+                sink((early.mark(info, voice or "?") + "\n").encode("utf-8", "replace"))
+            except Exception:                      # noqa: BLE001
+                pass
+        early.warn_to_feed(voice or "?", info, pgid=pgid, act=act_id,
+                           round_id=round_id or None, phase=phase or None,
+                           blind=blind)
+
     pumps = [threading.Thread(target=_pump, args=(proc.stdout, out, clock, sink),
                               daemon=True),
-             threading.Thread(target=_pump, args=(proc.stderr, err, clock, sink),
+             threading.Thread(target=_pump, args=(proc.stderr, err, clock, sink,
+                                                  on_err),
                               daemon=True)]
     for t in pumps:
         t.start()
 
     t0 = time.monotonic()
     status = "ok"
+    ended_by = None
     while True:
         try:
             proc.wait(timeout=2)
@@ -826,6 +862,11 @@ def run_watched(argv: list[str], *, cwd: str, hard_limit: int,
         except subprocess.TimeoutExpired:
             pass
         now = time.monotonic()
+        who = early.drop_requested(pgid, act_id or "", voice or "")
+        if who:
+            status = "dropped"
+            ended_by = who
+            break
         if now - clock[0] > idle_limit:
             status = "stalled"
             break
@@ -836,12 +877,20 @@ def run_watched(argv: list[str], *, cwd: str, hard_limit: int,
     silence = round(time.monotonic() - clock[0], 1)
     if status != "ok":
         _killpg_tree(pgid, proc)
+    early.clear_drop(pgid)            # голос вышел сам — флаг, поставленный в ту же секунду, гасим
     with _CHILD_LOCK:
         _CHILD_PGIDS.discard(pgid)
     for t in pumps:
         t.join(timeout=5)
-    return {"returncode": proc.returncode, "stdout": "".join(out),
-            "stderr": "".join(err), "status": status, "silence_s": silence}
+    res = {"returncode": proc.returncode, "stdout": "".join(out),
+           "stderr": "".join(err), "status": status, "silence_s": silence}
+    if shadow.warns:
+        res["early_warns"] = shadow.summary()
+        if warn_sink is not None:
+            warn_sink.extend(shadow.summary())   # копится через повторы with_retry
+    if ended_by:
+        res["ended_by"] = ended_by
+    return res
 
 
 def eff(name: str) -> str:
@@ -1321,6 +1370,7 @@ def _sweep_stale_quarantine() -> None:
     оставшийся файл был бы дырой в слепоте следующего раунда."""
     for p in QUARANTINE.glob("pending_*.jsonl"):
         p.unlink(missing_ok=True)
+    early.sweep_stale()               # флаги снятия, чей дирижёр умер
     # Плоские <stem>.prompt/.answer — до переезда в каталог на вызов
     # (2026-09-18); карантин теперь скрыт от голосов целиком, но чужой
     # промпт на диске всё равно лишний (субагент: 28 файлов).
@@ -1641,6 +1691,8 @@ def ask_one(name: str, prompt: str, round_id: str, phase: str,
 
         chans = v.get("channels") or ()
 
+        warns_acc: list[dict] = []          # тень всех попыток этого хода
+
         def _call(ch: dict | None = None) -> dict:
             # argv зависит от линии: у голоса с каналами модель приходит
             # флагом, у остальных команда как была.
@@ -1681,7 +1733,9 @@ def ask_one(name: str, prompt: str, round_id: str, phase: str,
                     .encode("utf-8", "replace"))
             res = run_watched(argv_run, cwd=cwd, hard_limit=limit,
                               idle_limit=idle if idle is not None else limit,
-                              sink=tee)
+                              sink=tee, voice=name, round_id=round_id,
+                              phase=phase, warn_sink=warns_acc,
+                              blind=(visibility == "blind"))   # по видимости, не по имени фазы (expand — слепой)
             res.update(fact)
             return res
 
@@ -1736,6 +1790,7 @@ def ask_one(name: str, prompt: str, round_id: str, phase: str,
                 run = with_retry(
                     lambda: _call(ch),
                     blob_of=lambda r: (r["stdout"] or "") + (r["stderr"] or ""),
+                    stop_if=lambda r: r.get("status") == "dropped",
                     on_retry=lambda p: _say(
                         visibility,
                         f"  ⏳ {name}: провайдер занят (concurrency), "
@@ -1744,6 +1799,11 @@ def ask_one(name: str, prompt: str, round_id: str, phase: str,
             run = _call()
         rec["returncode"] = run["returncode"]
         rec["silence_s"] = run["silence_s"]
+        if warns_acc:
+            # Тень пишет ВСЕГДА, и при ok тоже: иначе ложные признаки
+            # ненаблюдаемы, а порог не откалибровать (раунд ранние-отказы);
+            # с повторами with_retry — предупреждения всех попыток (субагент)
+            rec["early_warns"] = list(warns_acc)
         if run.get("jail"):
             rec["jail"] = run["jail"]           # факт клетки, не обещание
             if run.get("jail_sha"):
@@ -1774,8 +1834,14 @@ def ask_one(name: str, prompt: str, round_id: str, phase: str,
         #     уходил в `error`, то есть снова врал: не поломка канала, а
         #     отказ в обслуживании. Поймано на своде раунда `патент-v1`:
         #     «max organization concurrency: 1» упало за 17 секунд.
-        blob = (run["stdout"] or "") + strip_thoughts(run["stderr"] or "")
-        looks_429 = "429" in blob or "rate_limit" in blob or "rate limit" in blob
+        # Строго, ПО СТРОКАМ и через классификатор: `"429" in blob` ловил
+        # uuid в stdout — три сентябрьские «quota» по 1800 с были ложными
+        # (раунд ранние-отказы, все четверо). stdout тоже смотрим — у
+        # grok/kimi под pty stderr склеен в stdout (kimi); concurrency —
+        # busy, не quota, линию на сутки не гасит (grok).
+        blob = (run["stdout"] or "") + "\n" + strip_thoughts(run["stderr"] or "")
+        quota_line = early.quota_in(blob)
+        looks_429 = quota_line is not None
         quota_detail = None
         if probe and run["status"] in ("stalled", "timeout"):
             # Спрашиваем про СВОЙ канал: у каждой организации своя
@@ -1784,11 +1850,21 @@ def ask_one(name: str, prompt: str, round_id: str, phase: str,
             quota_detail = probe(t0_wall, ch)
         if quota_detail is None and looks_429 and run["returncode"] != 0:
             # текст самого клиента точнее наших догадок — берём его строкой
-            line = next((l.strip() for l in blob.splitlines()
-                         if "429" in l or "rate limit" in l), "")
+            line = quota_line or ""
             quota_detail = f"429 от провайдера: {line[:300]}" if line else \
                            "429 от провайдера: лимит исчерпан"
-        if quota_detail:
+        if run["status"] == "dropped":
+            # Снят человеком по кнопке «снять сейчас» — не timeout и не
+            # stalled: кто снял и по какому признаку — полями (раунд
+            # ранние-отказы: статус не плодить, разделять что/как/кто).
+            last = (warns_acc or run.get("early_warns") or [{}])[-1]   # всех попыток (kimi)
+            rec |= {"status": "dropped", "text": out,
+                    "ended_by": run.get("ended_by") or "arr",
+                    "detail": f"снят до таймаута ({run.get('ended_by') or 'arr'}) "
+                              f"на {round(time.monotonic() - t0)} с"
+                              + (f"; последний признак: {last.get('cause')} — "
+                                 f"{last.get('line')}" if last else "")}
+        elif quota_detail:
             rec |= {"status": "quota", "text": out, "detail": quota_detail}
             # Пометить линию на сутки: следующий вызов пойдёт по живой,
             # а не будет добивать исчерпанную (см. mark_quota).

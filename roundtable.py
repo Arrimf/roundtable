@@ -222,6 +222,7 @@ sys.path.insert(0, str(CHOIR))
 import live  # noqa: E402
 import names as fnames                         # noqa: E402  имена файлов раундов латиницей (alias: в do_POST есть локальная names)
 import canary                                  # noqa: E402  канарейки прав (обещания 1 и 2)
+import early                                   # noqa: E402  ранние отказы: снятие голоса по кнопке
 
 VOICES = list(live.VOICES)
 
@@ -476,7 +477,8 @@ def round_view(name: str) -> dict:
                                       "elapsed_s", "queued_s", "cli", "jail", "jail_sha", "text",
                                       "recovered", "error", "detail", "eyes",
                                       "visibility", "late", "nonblind",
-                                      "channel", "role_declared")
+                                      "channel", "role_declared",
+                                      "ended_by", "early_warns")
                 if r.get(k) is not None}
     ok = ("ok", "pass")
     # Витки считаются, как у cmd_rebut: только ok/pass — виток, где все
@@ -4160,6 +4162,43 @@ class Handler(BaseHTTPRequestHandler):
                 "reviewed_by": ev.get("reviewed_by"),
                 "worktree_copy": ev.get("worktree_copy")})
 
+        if self.path == "/drop":
+            # «СНЯТЬ СЕЙЧАС» (раунд ранние-отказы): человек снимает ОДИН
+            # голос до таймаута — не весь акт, как /abort. Окно ничего не
+            # убивает само: ставит флаг drop/<pgid>, а снимает группу
+            # дирижёр, который её породил и проверяет флаг каждые 2 с.
+            # pgid берётся не из запроса на веру, а из события early_warn
+            # ленты по идущему акту: чужую группу этим не снять.
+            act = (req.get("act") or "").strip()
+            try:
+                pgid = int(req.get("pgid") or 0)
+            except (TypeError, ValueError):
+                pgid = 0
+            if not re.fullmatch(r"[0-9a-f]{8,32}", act) or pgid <= 1:
+                return self._json(400, {"error": "нужны act и pgid из события early_warn"})
+            with RUN_LOCK:
+                running = act in RUNNING
+            if not running:
+                return self._json(409, {"error": f"акт {act} не идёт — снимать нечего"})
+            voice = str(req.get("voice") or "")
+            if voice and voice not in VOICES:
+                return self._json(400, {"error": "voice не из состава стола"})
+            # по ВСЕЙ ленте, не хвосту: длинный акт вытеснял событие из
+            # последних 400 и кнопка давала 404 (субагент, kimi)
+            ew = next((e for e in reversed(live.read_events(all_projects=True))
+                       if e.get("kind") == "early_warn" and e.get("act") == act
+                       and e.get("pgid") == pgid), None)
+            if ew is None:
+                return self._json(404, {"error": "в ленте нет early_warn с таким act и pgid"})
+            voice = str(ew.get("voice") or voice)     # голос — из события, не из тела (субагент)
+            if not early.group_alive(pgid):
+                return self._json(409, {"error": f"голос {voice} уже завершился — снимать нечего"})
+            path = early.request_drop(pgid, "arr", act, voice)
+            feed_append("early_drop", f"снять сейчас: {voice or 'голос'} "
+                        f"(pgid {pgid}) — флаг поставлен, дирижёр снимет группу",
+                        act=act, pgid=pgid, voice=voice)
+            return self._json(200, {"flag": str(path)})
+
         if self.path == "/edit_drop":
             # Отбросить правку: ветка и дерево удаляются, в ленте —
             # edit_drop с головой ветки; история акта остаётся.
@@ -4920,6 +4959,8 @@ color:var(--acc)}
 .ev .t.fold{max-height:13em;overflow:hidden}
 .ev .unfold{font:inherit;font-size:.76rem;background:none;border:1px solid var(--rule);color:var(--dim);border-radius:.3rem;padding:0 .4rem;cursor:pointer;margin-top:.2rem}
 .ev.sys .t{color:var(--dim);font-size:.86rem}
+.ev.warn .who,.ev.warn .t{color:var(--acc)}
+.ev.warn .dropnow{margin-left:.5rem;font-size:.78rem;border-color:var(--acc);color:var(--acc)}
 .ev.err .who{color:var(--err)}
 .ev.err .t{color:var(--err)}
 .ev .kind{font:600 .66rem/1 ui-monospace,monospace;letter-spacing:.08em;
@@ -5503,6 +5544,7 @@ function rline(label,rec){
     (rec.elapsed_s!=null)?(Math.round(rec.elapsed_s)+' с'):'',
     (rec.text?(rec.text.length+' симв.'):''),rec.recovered?'восстановлено из истории CLI':'',
     (rec.jail&&String(rec.jail).indexOf('bwrap')===0)?'🔒':(rec.jail==='none'?'⚠ без клетки':''),
+    rec.ended_by?('снят: '+rec.ended_by):'',(rec.early_warns&&rec.early_warns.length)?('⚠ признаков отказа: '+rec.early_warns.length):'',
     // Пометки журнала — не снимать: опоздавший ответ добран после
     // раскрытия и слепым не является (правила 4 и 8.5; субагент).
     rec.nonblind?'НЕСЛЕПОЙ (добран после раскрытия)':'',rec.late&&!rec.nonblind?'поздний':''].filter(Boolean);
@@ -5580,7 +5622,7 @@ function add(ev){
   // молча врал, что голос ответил ничем.
   const sys=(a==='chamber'||a==='choir'||a==='roundtable'||k==='act_status'||
              k==='lot_commit'||k==='lot_reveal');
-  el.className='ev '+(k==='error'?'err':(a==='arr'?'arr':(sys?'sys':'')))+(ev.thread?' thr':'');
+  el.className='ev '+(k==='error'?'err':(k==='early_warn'?'warn':(a==='arr'?'arr':(sys?'sys':''))))+(ev.thread?' thr':'');
   let body=(ev.text||'')||(k==='error'?'(пусто)':'');
   // Ревизия — ЦЕЛИКОМ (правило 3; Автор 2026-09-14: «в ленте я вижу
   // обрезанные ответы»): text события — превью в 400 символов, полный
@@ -5604,6 +5646,23 @@ function add(ev){
   // приходит из ленты, то есть снаружи; строка вида `x" onmouseover=…`
   // вырвалась бы из атрибута. Свойству разметка не страшна вовсе.
   const tsEl=el.querySelector('.ts'); if(tsEl)tsEl.title=tv.full;
+  // Тень ранних отказов: жёлтая строка + «снять сейчас» — снимает ОДИН
+  // голос через флаг дирижёру (POST /drop), не весь акт.
+  if(k==='early_warn'&&ev.pgid&&ev.act){
+    const b=document.createElement('button');b.textContent='снять сейчас';b.className='dropnow';
+    b.title='Снять голос '+(ev.voice||'')+' до таймаута: дирижёр убьёт его группу процессов (pgid '+ev.pgid+') и запишет статус dropped с этим признаком. Остальные голоса хода продолжают. Молча ничего не снимается — только по этой кнопке.';
+    b.onclick=async function(){
+      if(!confirm('Снять голос '+(ev.voice||'')+' сейчас? Его ответ в этом ходе пропадёт, остальные продолжат.'))return;
+      b.disabled=true;
+      let r,j={};
+      try{r=await fetch('/drop',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({act:ev.act,pgid:ev.pgid,voice:ev.voice||''})});j=await r.json();}
+      catch(e){b.disabled=false;return acterr('сервер не ответил: '+e)}
+      if(!r.ok){b.disabled=false;return acterr((j&&j.error)||('ошибка '+r.status))}
+      b.textContent='флаг поставлен';
+    };
+    el.appendChild(b);
+  }
   const stick=feed.scrollHeight-feed.scrollTop-feed.clientHeight<60;
   feed.appendChild(el); if(stick)feed.scrollTop=feed.scrollHeight;
   // Раунд: под его завершающим событием — карточка с ответами.
@@ -7776,6 +7835,7 @@ def main(argv: list[str] | None = None) -> int:
     threading.Thread(target=_edit_sweep, daemon=True).start()
     register_window()
     try:
+        early.sweep_stale()               # флаги «снять сейчас» без дирижёра
         _canary_sweep(set())          # приманки прошлого окна: сверить, убрать
     except Exception as e:                                  # noqa: BLE001
         print(f"уборка канареек при старте: {e}", file=sys.stderr)

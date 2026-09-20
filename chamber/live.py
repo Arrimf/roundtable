@@ -57,6 +57,7 @@ import threading
 
 import transcript                               # noqa: E402  стенограмма акта
 import jail                                     # noqa: E402  клетка bwrap голоса
+import early                                    # noqa: E402  ранние отказы: тень и снятие
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -1169,8 +1170,11 @@ except (ValueError, OSError):
     pass
 
 
+BLIND_TURN = False        # deliver(blind=True) идёт: улика early_warn — sha, не строка
+
+
 def _run_capture(cmd: list[str], cwd, timeout: float,
-                 sink) -> subprocess.CompletedProcess:
+                 sink, voice: str = "") -> subprocess.CompletedProcess:
     """subprocess.run(capture_output=True, text=True) с тройником.
 
     Без sink — прежний вызов, бит-в-бит. С sink (callable(bytes)) — Popen
@@ -1199,6 +1203,7 @@ def _run_capture(cmd: list[str], cwd, timeout: float,
         pgid = proc.pid                      # == pid при process_group=0
         with _CHILD_LOCK:
             _CHILD_PGIDS.add(pgid)
+        early.clear_drop(pgid)               # хвост чужой жизни pgid — не команда
 
         def _put(data: bytes) -> None:
             with lock:
@@ -1207,6 +1212,22 @@ def _run_capture(cmd: list[str], cwd, timeout: float,
                         sink(data)
                     except Exception as e:        # noqa: BLE001  приёмник — не ответ
                         print(f"стенограмма не пишется: {e}", file=sys.stderr)
+
+        # ТЕНЬ ранних отказов (early.py): stderr построчно; предупреждение
+        # — в стенограмму и в ленту (early_warn с pgid для кнопки).
+        shadow = early.Shadow(voice or "?")
+        act_id = os.environ.get("RT_ACT_ID") or None
+
+        def _shadow(block: bytes) -> None:
+            for ln in block.decode("utf-8", "replace").splitlines():
+                info = shadow.feed(ln, "err")
+                if info is None:
+                    continue
+                _put((early.mark(info, voice or "?") + "\n").encode("utf-8", "replace"))
+                # слепой ход (HOLD_TR держит стенограмму) — в ленту только
+                # класс и sha строки, не строка (codex)
+                early.warn_to_feed(voice or "?", info, pgid=pgid, act=act_id,
+                                   blind=BLIND_TURN)
 
         def pump(stream, key: str) -> None:
             # В файл — только ЦЕЛЫМИ строками: два читателя пишут в один
@@ -1220,12 +1241,16 @@ def _run_capture(cmd: list[str], cwd, timeout: float,
                 if not chunk:
                     if rest:
                         _put(rest + b"\n")
+                        if key == "err":
+                            _shadow(rest)
                     return
                 bufs[key].append(chunk)
                 rest += chunk
                 cut = max(rest.rfind(b"\n"), rest.rfind(b"\r"))
                 if cut >= 0:
                     _put(rest[:cut + 1])
+                    if key == "err":
+                        _shadow(rest[:cut + 1])
                     rest = rest[cut + 1:]
 
         def _killpg() -> None:
@@ -1243,20 +1268,46 @@ def _run_capture(cmd: list[str], cwd, timeout: float,
         for t in ts:
             t.start()
         timed_out = False
+        dropped_by = None
         try:
-            proc.wait(timeout=timeout)
+            # Ожидание по 2 с: между ними — флаг «снять сейчас» (early.py)
+            while True:
+                try:
+                    proc.wait(timeout=min(2.0, max(0.1, deadline - time.monotonic())))
+                    break
+                except subprocess.TimeoutExpired:
+                    if time.monotonic() >= deadline:
+                        raise
+                    who = early.drop_requested(pgid, act_id or "", voice or "")
+                    if who:
+                        dropped_by = who
+                        break
         except subprocess.TimeoutExpired:
             timed_out = True
-        else:
+        if not dropped_by and not timed_out:
             # Как communicate(): ждать EOF обоих pipe в остатке бюджета —
             # внук, унаследовавший stdout, держит их после выхода CLI.
-            for t in ts:
-                t.join(max(1.0, deadline - time.monotonic()))   # ≥1 с: не объявлять ложный таймаут
-            timed_out = any(t.is_alive() for t in ts)
-        if timed_out:
+            # Тоже по 2 с: флаг «снять сейчас» должен работать и здесь
+            # (codex: CLI вышел, внук держит pipe — кнопка молчала бы).
+            # ≥1 с дочитать хвост после штатного выхода — иначе CLI,
+            # вышедший за миллисекунды до дедлайна, терял ответ (субагент)
+            grace = time.monotonic() + 1.0
+            while any(t.is_alive() for t in ts):
+                left = max(deadline, grace) - time.monotonic()
+                if left <= 0:
+                    break
+                for t in ts:
+                    t.join(min(2.0, max(0.1, left)))
+                who = early.drop_requested(pgid, act_id or "", voice or "")
+                if who:
+                    dropped_by = who
+                    break
+            timed_out = (not dropped_by) and any(t.is_alive() for t in ts)
+        if dropped_by or timed_out:
             _killpg()
             for t in ts:
                 t.join(5)
+        early.clear_drop(pgid)               # вышел сам — флаг той же секунды гасим
         with _CHILD_LOCK:
             _CHILD_PGIDS.discard(pgid)
         with lock:
@@ -1269,9 +1320,16 @@ def _run_capture(cmd: list[str], cwd, timeout: float,
                 .replace("\r\n", "\n").replace("\r", "\n"))
 
     if timed_out:
-        raise subprocess.TimeoutExpired(cmd, timeout, output=_text("out"),
-                                        stderr=_text("err"))
-    return subprocess.CompletedProcess(cmd, proc.returncode, _text("out"), _text("err"))
+        te = subprocess.TimeoutExpired(cmd, timeout, output=_text("out"),
+                                       stderr=_text("err"))
+        te.early_warns = shadow.summary()         # тень и при таймауте (grok)
+        raise te
+    if proc.returncode is None:
+        proc.wait()                          # снятая группа: без зомби и None (gemini)
+    cp = subprocess.CompletedProcess(cmd, proc.returncode, _text("out"), _text("err"))
+    cp.early_warns = shadow.summary()            # тень — всегда, и при ok
+    cp.dropped_by = dropped_by
+    return cp
 
 
 def _claude_result(out: str) -> str:
@@ -1414,8 +1472,10 @@ def turn(name: str, prompt) -> dict:
             if sink is not None:
                 sink((_tr_head(name, cmd, ptext, ch, bool(use_cont))
                       + jail.mark(fact, hide) + "\n").encode("utf-8", "replace"))
-            r = _run_capture(cmd_run, cwd, vt, sink)
+            r = _run_capture(cmd_run, cwd, vt, sink, voice=name)
         rc = r.returncode
+        early_warns = getattr(r, "early_warns", None) or []
+        dropped_by = getattr(r, "dropped_by", None)
         if v.get("answer_file") and afile.exists():
             out = afile.read_text(encoding="utf-8").strip()
         elif v.get("extract"):
@@ -1454,7 +1514,15 @@ def turn(name: str, prompt) -> dict:
         elapsed = round(time.monotonic() - t0, 1)
 
         status = _status_of(rc, out, err, v.get("quota_exit"))
-        if rc == v.get("quota_exit"):
+        if dropped_by:
+            # снят человеком по кнопке «снять сейчас» до таймаута
+            last = early_warns[-1] if early_warns else {}
+            ev = {"author": name, "kind": "error", "text": "",
+                  "status": "dropped", "returncode": rc, "ended_by": dropped_by,
+                  "detail": f"снят до таймаута ({dropped_by}) на {elapsed} с"
+                            + (f"; последний признак: {last.get('cause')} — "
+                               f"{last.get('line')}" if last else "")}
+        elif rc == v.get("quota_exit"):
             # Хвост stderr обязателен: фиксированная строка выдавала
             # «исчерпаны все ключи» и тогда, когда канал перебрал ключи
             # из-за лежащего шлюза — квота ни при чём (нашли grok и
@@ -1482,7 +1550,10 @@ def turn(name: str, prompt) -> dict:
         else:
             ev = {"author": name, "kind": "say", "text": out}
         ev["elapsed_s"] = elapsed
+        if early_warns:
+            ev["early_warns"] = early_warns
     except subprocess.TimeoutExpired as e:
+        early_warns = getattr(e, "early_warns", None) or []
         # Хвост stderr — в ленту: раньше внешнее убийство съедало всё,
         # что канал успел сказать, и в ленте оставалось голое «(пусто)
         # не уложился…» — так исходный инцидент и лишился причины
@@ -1497,6 +1568,8 @@ def turn(name: str, prompt) -> dict:
               "status": "timeout", "returncode": None,
               "detail": f"не уложился в {v.get('turn_timeout', TURN_TIMEOUT)} с"
                         + (f"; последнее из канала: {tail}" if tail else "")}
+        if early_warns:
+            ev["early_warns"] = early_warns
     except Exception as e:                             # noqa: BLE001
         ev = {"author": name, "kind": "error", "text": "",
               "status": "error", "returncode": None,
@@ -1621,6 +1694,8 @@ def deliver(names: list[str], blind: bool = False) -> list[dict]:
     # субагент, grok). Один голос (быстрый вопрос, передача слова) идёт
     # в файл по мере прихода.
     hold_tr = blind or len(names) > 1
+    global BLIND_TURN
+    BLIND_TURN = bool(blind)          # не HOLD_TR: тот держит и открытый групповой ход (grok)
     with _HOLD_LOCK:
         if blind:
             HOLD_NOTES = []
@@ -1685,6 +1760,7 @@ def deliver(names: list[str], blind: bool = False) -> list[dict]:
         with _HOLD_LOCK:
             notes, HOLD_NOTES = list(HOLD_NOTES or []), None
             tr_held, HOLD_TR = (HOLD_TR or {}), None
+            BLIND_TURN = False
         if notes:
             print("слепой ход закрыт — поимённо:", flush=True)
             for msg in notes:

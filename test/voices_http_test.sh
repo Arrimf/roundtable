@@ -128,6 +128,9 @@ assert d["seed"]["text"]=="# затравка" and d["rebuts"]==0 and d["summary
 curl -s "$B/round_view?name=nope" | grep -q '"found": false' && pass "/round_view: неизвестный раунд → found=false" || fail "/round_view nope"
 [ "$(curl -s -o /dev/null -w '%{http_code}' "$B/round_view?name=..%2Fetc")" = 400 ] && pass "/round_view: кривое имя → 400" || fail "/round_view имя"
 [ "$(code /round_step '{"name":"t1","step":"merge"}')" = 400 ] && pass "/round_step: чужой шаг → 400" || fail "/round_step шаг"
+# «снять сейчас» (ранние отказы): флаг только для идущего акта и pgid из early_warn ленты
+[ "$(code /drop '{"act":"deadbeef01","pgid":4242}')" = 409 ] && pass "/drop: акт не идёт → 409" || fail "/drop 409"
+[ "$(code /drop '{"act":"x","pgid":0}')" = 400 ] && pass "/drop: кривые act/pgid → 400" || fail "/drop 400"
 [ "$(code /round_step '{"name":"t2","step":"rebut"}')" = 409 ] && pass "/round_step: без слепой фазы → 409" || fail "/round_step без ответов"
 [ "$(code /round_step '{"name":"t9","step":"summarize"}')" = 409 ] && pass "/round_step: без жребия → 409" || fail "/round_step без жребия"
 [ "$(code /round '{"question":"q","name":"pj","project":"/nonexistent/dir"}')" = 400 ] && pass "/round: проект не каталог → 400 до записи файла" || fail "/round проект"

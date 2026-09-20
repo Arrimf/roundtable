@@ -30,6 +30,7 @@ import argparse
 import hashlib
 import json
 import os
+import socket
 import sys
 import time
 import urllib.error
@@ -45,6 +46,9 @@ DEFAULT_MODEL = "deepseek-v4-pro"
 # Цены на 2026-08 (за 1M токенов), для строки диагностики.
 PRICE_IN_MISS, PRICE_IN_HIT, PRICE_OUT = 0.435, 0.0036, 0.87
 RETRIES = 3
+# Дедлайн первого байта (раунд «ранние-отказы»): см. gemini-http — одна
+# молчащая попытка не должна съедать весь бюджет вызова.
+FIRST_BYTE_S = max(10, int(os.environ.get("DEEPSEEK_FIRST_BYTE_S", "60")))
 
 
 def log(msg: str) -> None:
@@ -74,7 +78,21 @@ class StreamBroken(Exception):
 _PRINTED = False       # хоть что-то ушло в stdout/stderr — повтор запрещён
 
 
-def stream_read(r, deadline: float) -> dict:
+_FIRST_BYTE_SEEN = False
+
+
+def _set_sock_timeout(resp, timeout: float) -> None:
+    try:
+        sock = getattr(getattr(resp, "fp", None), "raw", None)
+        sock = getattr(sock, "_sock", None) or resp.fp.fp.raw._sock   # обе цепочки http.client
+        sock.settimeout(timeout)
+    except Exception as e:                                # noqa: BLE001
+        log(f"таймаут сокета не переставлен ({type(e).__name__}): порции "
+            f"ждутся по {FIRST_BYTE_S} с")
+
+
+def stream_read(r, deadline: float, t_open: float | None = None,
+                timeout: float | None = None) -> dict:
     """Собрать ответ из SSE-потока, ПЕЧАТАЯ ПО МЕРЕ ПРИХОДА (правило 17,
     наказ Автора 2026-09-14: «хочется похожесть на общение в терминале»):
     мысли — в stderr между маркерами «💭 мысли модели» / «💭 конец
@@ -88,8 +106,17 @@ def stream_read(r, deadline: float) -> dict:
     usage: dict = {}
     model = ""
     opened = closed = done = False
+    first_byte: float | None = None
     try:
         for raw in r:
+            if first_byte is None:
+                global _FIRST_BYTE_SEEN
+                _FIRST_BYTE_SEEN = True
+                first_byte = round(time.monotonic() - (t_open or time.monotonic()), 1)
+                if t_open is not None:           # живой вызов, не разбор потока в тесте
+                    log(f"первый байт через {first_byte} с")
+                if timeout:
+                    _set_sock_timeout(r, timeout)
             if time.monotonic() > deadline:
                 raise StreamBroken("дедлайн вышел посреди потока")
             line = raw.decode("utf-8", "replace").strip()
@@ -167,9 +194,14 @@ def call(prompt: str, model: str, key: str, timeout: int,
     # timeout у urlopen — на КАЖДОЕ чтение сокета; общий потолок потока
     # считает stream_read по дедлайну (ревизия: субагент, deepseek, codex).
     deadline = time.monotonic() + timeout
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    t_open = time.monotonic()
+    # Дедлайн первого байта — только потоку: без потока сервер отдаёт
+    # заголовки вместе с готовым телом, и 60 с резали бы долгие ответы
+    # (субагент, gemini, codex)
+    with urllib.request.urlopen(req, timeout=(min(timeout, FIRST_BYTE_S)
+                                              if stream else timeout)) as r:
         if stream:
-            return stream_read(r, deadline)
+            return stream_read(r, deadline, t_open, timeout)
         return json.loads(r.read().decode())
 
 
@@ -182,6 +214,7 @@ def _partial_out() -> bool:
 
 
 def main() -> int:
+    global _FIRST_BYTE_SEEN
     ap = argparse.ArgumentParser()
     ap.add_argument("--prompt-file")
     ap.add_argument("-p", "--prompt")
@@ -239,6 +272,12 @@ def main() -> int:
             log(f"попытка {attempt}/{RETRIES}: {last}")
         except Exception as e:                                   # noqa: BLE001
             last = f"{type(e).__name__}: {e}"
+            if isinstance(e, (TimeoutError, socket.timeout)):
+                # честно: до первого байта — «нет первого байта», после —
+                # «тишина после первого байта» (субагент, grok)
+                last = (f"нет первого байта за {FIRST_BYTE_S} с ({last})"
+                        if not _FIRST_BYTE_SEEN else f"тишина после первого байта ({last})")
+            _FIRST_BYTE_SEEN = False
             log(f"попытка {attempt}/{RETRIES}: {last}")
             if not a.no_stream and _partial_out():
                 # Часть ответа уже напечатана: повтор дописал бы второй

@@ -53,6 +53,7 @@ import re
 import hashlib
 import json
 import os
+import socket
 import sys
 import time
 import urllib.error
@@ -73,6 +74,12 @@ SESSIONS = HIST / "sessions"
 # Сетевые сбои (5xx, обрыв) — не повод жечь следующий ключ: ключ живой,
 # плохо шлюзу. Квота — наоборот, повод сменить ключ немедленно.
 NET_RETRIES = 3
+# ДЕДЛАЙН ПЕРВОГО БАЙТА (раунд «ранние-отказы», 2026-09-20): попытка,
+# получившая ВЕСЬ остаток общего дедлайна, молчала до него целиком —
+# 590 с тишины у шлюза без единого байта. Теперь на ожидание первого
+# байта — свой потолок; дальше сокету возвращается полный дедлайн
+# (мысли модели могут идти долго между порциями).
+FIRST_BYTE_S = max(10, int(os.environ.get("GEMINI_FIRST_BYTE_S", "60")))
 NET_BACKOFF_S = 4
 
 
@@ -140,6 +147,23 @@ class StreamBroken(Exception):
     удвоенный текст. Наружу — код 1 и причина, без повтора."""
 
 
+_FIRST_BYTE_SEEN = False
+
+
+def _set_sock_timeout(resp, timeout: float) -> None:
+    """После первого байта — полный дедлайн на чтение. Сокет достаётся
+    через внутренности http.client (обе известные цепочки); не достался —
+    остаётся потолок первого байта на каждую порцию, что честно названо
+    в логе."""
+    try:
+        sock = getattr(getattr(resp, "fp", None), "raw", None)
+        sock = getattr(sock, "_sock", None) or resp.fp.fp.raw._sock
+        sock.settimeout(timeout)
+    except Exception as e:                                # noqa: BLE001
+        log(f"таймаут сокета не переставлен ({type(e).__name__}): порции "
+            f"ждутся по {FIRST_BYTE_S} с")
+
+
 def post_stream(url: str, payload: dict, timeout: int,
                 deadline: float | None = None) -> tuple[int, dict]:
     """POST на :streamGenerateContent?alt=sse — ответ ПО МЕРЕ ПРИХОДА
@@ -160,9 +184,17 @@ def post_stream(url: str, payload: dict, timeout: int,
     version = ""
     feedback = None
     opened = closed = False
+    first_byte: float | None = None
+    t_open = time.monotonic()
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        with urllib.request.urlopen(req, timeout=min(timeout, FIRST_BYTE_S)) as r:
             for raw in r:
+                if first_byte is None:
+                    global _FIRST_BYTE_SEEN
+                    _FIRST_BYTE_SEEN = True
+                    first_byte = round(time.monotonic() - t_open, 1)
+                    log(f"первый байт через {first_byte} с")
+                    _set_sock_timeout(r, timeout)
                 if deadline is not None and time.monotonic() > deadline:
                     # timeout у urlopen — на каждое чтение сокета, не на
                     # весь ответ: капающий поток пережил бы дедлайн, и
@@ -353,6 +385,7 @@ def list_models(keys: list[str]) -> int:
 def ask(prompt: str, model: str, timeout: int, session: str | None,
         temperature: float | None, tools: bool = False,
         thinking: str = "high", more_models: bool = False) -> tuple[int, str]:
+    global _FIRST_BYTE_SEEN
     """Один вопрос ОДНОЙ моделью. Возвращает (код, причина).
 
     Причина нужна каскаду в main: «шлюз лежит» и «ключи по квоте» —
@@ -438,6 +471,10 @@ def ask(prompt: str, model: str, timeout: int, session: str | None,
                 return 1, "stream"
             except Exception as e:                     # noqa: BLE001
                 last_err = f"{type(e).__name__}: {e}"
+                if isinstance(e, (TimeoutError, socket.timeout)) and "посреди" not in str(e):
+                    last_err = (f"нет первого байта за {FIRST_BYTE_S} с ({last_err})"
+                                if not _FIRST_BYTE_SEEN else f"тишина после первого байта ({last_err})")
+                _FIRST_BYTE_SEEN = False
                 last_why = "gateway"
                 # Ранний уход обязан работать и здесь: сетевой отказ
                 # (таймаут чтения, разрыв) — та же беда канала, что и

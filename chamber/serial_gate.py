@@ -216,14 +216,19 @@ def concurrency_429(blob: str) -> bool:
     return "concurrency" in low
 
 
-def with_retry(run, *, blob_of, pauses=RETRY_PAUSES, on_retry=None):
+def with_retry(run, *, blob_of, pauses=RETRY_PAUSES, on_retry=None,
+               stop_if=None):
     """Выполнить `run()`, повторив, если сервер сказал «занято, позже».
 
     `blob_of(result)` достаёт из результата текст вывода — модуль не знает,
-    как устроен результат вызова, и знать не должен.
+    как устроен результат вызова, и знать не должен. `stop_if(result)` —
+    повторов не будет (голос снят человеком: повтор затирал бы факт
+    снятия успехом следующей попытки — codex).
     """
     last = run()
     for pause in pauses:
+        if stop_if is not None and stop_if(last):
+            return last
         if not concurrency_429(blob_of(last)):
             return last
         if on_retry:
