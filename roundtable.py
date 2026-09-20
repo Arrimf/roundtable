@@ -4924,7 +4924,8 @@ PAGE = r"""<!doctype html><html lang="ru"><head><meta charset="utf-8">
 /* Правая колонка 344px, была 240: в строку голоса встали галочка, имя,
    модель и усилие (наказ Автора 2026-08-25). Уже 344 — селекторы
    схлопываются в многоточие, и «opus» с «opus-4-mini» становятся
-   неразличимы; шире — лента теряет свои 72ch. Ниже 760px панель
+   неразличимы; шире — ленте тесно (потолок 72ch у события снят
+   2026-09-20: на широком окне текст занимал две пятых). Ниже 760px панель
    по-прежнему уходит целиком: там места нет и подавно. */
 /* Границы двигаются и запоминаются (наказ Автора 2026-08-31). Размеры
    держим переменными, а не числами в правилах: перетаскивание меняет
@@ -4951,7 +4952,7 @@ background:linear-gradient(var(--bg) 65%,transparent)}
 #quickbar{display:flex;gap:.55rem;align-items:center;
 background:var(--panel);border:1px solid var(--rule);border-radius:6px;
 padding:.2rem .5rem}
-.ev{margin:0 0 .7rem;max-width:72ch}
+.ev{margin:0 0 .7rem}   /* без потолка ширины: 72ch на широком окне — две пятых (Автор, 2026-09-20) */
 .ev .who{font:600 .78rem/1 ui-monospace,monospace;letter-spacing:.06em;
 color:var(--acc)}
 .ev.arr .who{color:var(--me)}
