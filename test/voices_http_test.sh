@@ -152,6 +152,28 @@ tail -n 3 "$W/journal/live.jsonl" | grep '"status": "done"' | grep -q '"step": "
 sleep 5
 grep -q "^summarize --round t1 --out $W/journal/rounds/tmp/SUMMARY-t1.md$" "$W/chamber/argv.log" && pass "summarize: без --by (сводчика выбирает choir.py), --out абсолютный в journal/rounds/<проект жребия>/" || fail "argv summarize: $(cat "$W/chamber/argv.log")"
 mkdir -p "$W/proj2" && git -C "$W/proj2" init -q
+# (ниже заглушки дирижёра: happy-path /round поднимает choir.py — с настоящим
+# он звал бы drand и голоса; нашёл grok в ревизии кнопки)
+# «Развить тему»: свод родителя — в вопрос дословно, parent — полем события
+cat >> "$W/journal/room.jsonl" <<'ROOM'
+{"id":"b1","ts":"2026-09-03T11:00:00+00:00","round":"t3","phase":"pick","voice":"choir","role":"lot","text":"grok","conductor":"grok","candidates":["claude","grok"]}
+{"id":"b2","ts":"2026-09-03T11:00:05+00:00","round":"t3","phase":"summary","voice":"grok","role":"summary","status":"ok","text":"# Свод t3\n\n**Нерешено.** Спор о ширине колонки.  \n\n"}
+{"id":"b3","ts":"2026-09-03T11:00:06+00:00","round":"t4","phase":"summary","voice":"grok","role":"summary","status":"error","text":""}
+ROOM
+[ "$(code /round '{"question":"а если колонку убрать?","name":"t3-2","parent":"t3","voices":["claude","grok"]}')" = 200 ] && pass "/round parent: развитие раунда со сводом → 200" || fail "/round parent 200"
+QF="$W/journal/rounds/RoundTable/QUESTION-t3-2.md"
+grep -q "^а если колонку убрать?" "$QF" && grep -q "РАЗВИТИЕ РАУНДА «t3»" "$QF" && grep -q "ведущий: grok, свод писал: grok" "$QF" && grep -q "Спор о ширине колонки" "$QF" && pass "/round parent: вопрос Автора первым, свод родителя дословно, ведущий назван" || fail "/round parent: файл вопроса: $(cat "$QF" 2>/dev/null | head -c 300)"
+python3 - "$QF" <<'PY' && pass "/round parent: свод перенесён БАЙТ В БАЙТ (хвостовые пробелы и переводы строк целы)" || fail "/round parent: свод не дословно"
+import sys; t=open(sys.argv[1],encoding="utf-8").read()
+assert "Спор о ширине колонки.  \n\n\n\n--- КОНЕЦ СВОДА" in t, repr(t[-80:])
+PY
+grep -q '"parent": "t3"' "$W/journal/live.jsonl" && grep -q 'развитие «t3»' "$W/journal/live.jsonl" && pass "/round parent: поле parent и метка в событии" || fail "/round parent: событие без parent"
+[ "$(code /round '{"question":"q","name":"t4-2","parent":"t4","voices":["claude","grok"]}')" = 409 ] && pass "/round parent: свод не удался → 409" || fail "/round parent t4"
+[ "$(code /round '{"question":"q","name":"n-2","parent":"nope","voices":["claude","grok"]}')" = 404 ] && pass "/round parent: неизвестный родитель → 404" || fail "/round parent nope"
+[ "$(code /round '{"question":"q","name":"t3","parent":"t3","voices":["claude","grok"]}')" = 400 ] && pass "/round parent: то же имя → 400" || fail "/round parent same"
+[ "$(code /round '{"question":"q","name":"bad-2","parent":"../t3","voices":["claude","grok"]}')" = 400 ] && [ ! -e "$W/journal/rounds/RoundTable/QUESTION-bad-2.md" ] && [ ! -e "$W/journal/rounds/RoundTable/QUESTION-t3.md" ] && pass "/round parent: кривое имя родителя → 400, файлов нет (и для same-name)" || fail "/round parent bad name"
+grep -q "КОНЕЦ СВОДА раунда «t3»" "$QF" && pass "/round parent: свод ограждён с конца (инъекция из свода не сливается с концом вопроса)" || fail "/round parent: нет ограды"
+[ ! -e "$W/journal/rounds/RoundTable/QUESTION-t4-2.md" ] && [ ! -e "$W/journal/rounds/RoundTable/QUESTION-n-2.md" ] && pass "/round parent: отказ до записи файла вопроса" || fail "/round parent: файл при отказе"
 R="$(post /round "{\"question\":\"q\",\"name\":\"pj2\",\"project\":\"$W/proj2\"}")"
 echo "$R" | grep -q '"act"' && pass "/round с проектом → 200" || fail "/round с проектом: $R"
 sleep 2

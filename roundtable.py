@@ -3795,6 +3795,35 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(400, {"error": "раунд — минимум два "
                                         "разных голоса (жребий ведущего и "
                                         "слепая фаза из одного бессмысленны)"})
+            # РАЗВИТИЕ ТЕМЫ (наказ Автора 2026-09-20): новый раунд по
+            # итогам прошлого. Свод прошлого раунда уходит в вопрос
+            # ДОСЛОВНО (правило 3), не пересказом; ссылка на родителя —
+            # полем события. Жребий, слепая фаза, витки — заново: это
+            # новый раунд, а не продолжение сессий голосов (правило 9:
+            # первичный ответ неизменяем, уточнение — новой записью).
+            parent = str(req.get("parent") or "").strip()
+            if parent:
+                if not re.fullmatch(ROUND_RE, parent):
+                    return self._json(400, {"error": "родитель: кривое имя раунда"})
+                if parent == name:
+                    return self._json(400, {"error": "развитие раунда не может "
+                                            "носить его же имя"})
+                pv = round_view(parent)
+                if not pv.get("found"):
+                    return self._json(404, {"error": f"раунда «{parent}» в журнале нет"})
+                if not pv.get("summary_ok"):
+                    return self._json(409, {"error": f"у раунда «{parent}» нет "
+                                            "удавшегося свода — развивать нечего"})
+                ps = pv["summary"]
+                question = (question + "\n\n---\n\n"
+                            f"РАЗВИТИЕ РАУНДА «{parent}» (ведущий: "
+                            f"{pv.get('conductor') or '?'}, свод писал: "
+                            f"{ps.get('voice') or '?'}). Ниже — свод прошлого "
+                            "раунда ДОСЛОВНО (правило 3); не пересказывайте "
+                            "его, отталкивайтесь от него — особенно от того, "
+                            "что там названо нерешённым или спорным.\n\n"
+                            + str(ps.get("text") or "")      # без rstrip: дословно
+                            + f"\n\n--- КОНЕЦ СВОДА раунда «{parent}» ---")
             rdir = JOURNAL / "rounds" / ((rp.name or "root") if rp else "RoundTable")
             qfile = rdir / fnames.round_file("QUESTION-", name)
             # Не переписываем молча: в room.jsonl уже лежит pick с
@@ -3857,6 +3886,10 @@ class Handler(BaseHTTPRequestHandler):
             # быть обеспечено механикой, и наоборот — механика без поля
             # в журнале невидима).
             fields = {"round": name, "auto": auto}
+            if parent:
+                fields["parent"] = parent
+                label += f" [развитие «{parent}»]"
+                note = f"Развитие раунда «{parent}»: его свод — в вопросе дословно. " + note
             if auto:
                 fields["rebuts"] = rebuts
             if rvoices:
@@ -4181,9 +4214,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(400, {"error": "имя раунда: буквы, "
                                         "цифры, точка, дефис; до 60"})
             with RUN_LOCK:
+                # По точному имени, не по префиксу: с «Развить тему» имена
+                # `t3` и `t3-2` — норма, и стоп t3 ловил бы бегущий t3-2
+                # в список (субагент). Метка «round: <имя>» кончается
+                # пробелом или концом строки.
                 acts = [aid for aid, t in RUNNING.items()
                         if t.get("round") == name
-                        or t["label"].startswith(f"round: {name}")]
+                        or t["label"] == f"round: {name}"
+                        or t["label"].startswith(f"round: {name} ")]
             path = stop_file(name)
             try:
                 STOP_DIR.mkdir(parents=True, exist_ok=True)
@@ -5516,6 +5554,14 @@ async function loadRound(name,box){
     row.appendChild(b);
   }
   const who=j.summarizer||j.conductor;
+  if(j.summary_ok){
+    const d=document.createElement('button');d.textContent='Развить тему';
+    d.title='Новый раунд по итогам этого: свод «'+name+'» уйдёт в вопрос ДОСЛОВНО (правило 3), '+
+      'жребий ведущего, слепая фаза и витки — заново. Нажатие только готовит форму: '+
+      'имя «'+nextRoundName(name)+'», ваш новый вопрос — в поле реплики; запуск — кнопкой «Раунд».';
+    d.onclick=function(){developRound(name,(j.summary&&j.summary.text)?j.summary.text.length:0)};
+    row.appendChild(d);
+  }
   if(j.conductor&&j.n_ok_answers&&j.rebuts<(j.rebut_cap||3)&&!j.summary_ok)
     stepBtn('Виток критики №'+(j.rebuts+1),'rebut','Виток открытой критики раунда «'+name+
       '»: каждый голос читает чужие ответы под анонимными метками. Все голоса, платно. Пускаем?');
@@ -7203,15 +7249,41 @@ document.getElementById('abort').onclick=()=>abortAll();
 // бы «переезд-v1» и «патент-v1» — то есть почти все имена этого стола,
 // которые сервер принимает без разговоров (питоновский \w — юникодный).
 const RE_ROUND=/^[\p{L}\p{N}_][\p{L}\p{N}_.\-]{0,59}$/u;
+// «Развить тему» (2026-09-20): родитель нового раунда. Живёт до запуска
+// или до ✕ — иначе следующий, никак не связанный раунд ушёл бы со
+// сводом чужого родителя в вопросе.
+let DEVELOP=null;
+// BigInt — суффикс не теряет точность; длина — в пределах ROUND_RE (60),
+// база при нужде режется (codex)
+function nextRoundName(n){const m=/^(.*)-(\d+)$/.exec(n);
+  let base=m?m[1]:n,suf=m?String(BigInt(m[2])+1n):'2';
+  base=base.slice(0,Math.max(1,60-1-suf.length));return base+'-'+suf}
+function developRound(parent,sumLen){
+  DEVELOP={parent:parent,name:nextRoundName(parent)};
+  let strip=document.getElementById('devstrip');
+  // ПОСЛЕ строки раунда, не внутрь: #roundrow — flex без переноса, и
+  // полоска внутри схлопывала кнопку «Раунд» до нуля (субагент)
+  if(!strip){strip=document.createElement('div');strip.id='devstrip';
+    strip.style.cssText='font:.74rem ui-monospace,monospace;color:var(--dim);padding:2px 0';
+    document.getElementById('roundrow').insertAdjacentElement('afterend',strip)}
+  strip.innerHTML='';
+  strip.appendChild(document.createTextNode('развитие раунда «'+parent+'»: свод'+(sumLen?' ('+sumLen+' симв.)':'')+' уйдёт в вопрос дословно; имя «'+DEVELOP.name+'» '));
+  const x=document.createElement('button');x.textContent='✕';x.title='отменить развитие — обычный раунд';
+  x.onclick=function(){DEVELOP=null;strip.remove();msg.placeholder=MSG_PH};
+  strip.appendChild(x);
+  msg.placeholder='Новый вопрос по итогам раунда «'+parent+'» — что развить, что оспорить (Alt+Enter — перенос)';
+  msg.focus();
+}
+const MSG_PH=msg.placeholder;
 document.getElementById('round').onclick=async()=>{
   const question=msg.value.trim();
-  if(!question){alert('вопрос раунда — в поле реплики');return}
+  if(!question){alert(DEVELOP?'новый вопрос по итогам раунда «'+DEVELOP.parent+'» — в поле реплики':'вопрос раунда — в поле реплики');return}
   // Проверяем ЗДЕСЬ, а не по 400 с сервера: имя спрашивают уже после
   // набранного вопроса, и отказ после prompt() стоил бы Автору второго
   // ввода — а вопрос к тому моменту ещё висит в поле и легко теряется.
   let name='';
   for(;;){
-    name=(prompt('Имя раунда (буквы/цифры/точка/дефис, до 60):')||'').trim();
+    name=(prompt('Имя раунда (буквы/цифры/точка/дефис, до 60):',DEVELOP?DEVELOP.name:'')||'').trim();
     if(!name)return;
     if(RE_ROUND.test(name))break;
     alert('так нельзя: первый символ — буква или цифра, дальше буквы, '+
@@ -7231,12 +7303,18 @@ document.getElementById('round').onclick=async()=>{
   if(auto&&!confirm('Автопрогон «'+name+'»: pick → expand → ask → rebut ×'+
       rebuts+' → summarize, без остановки. Голоса: '+rvoices.join(', ')+
       ' — платно. Пускаем?'))return;
+  const sent=DEVELOP;            // что ушло: ответ чистит только ЭТО (codex)
   const r=await fetch('/round',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({question,name,auto,rebuts,brief:briefOn(),thoughts:thoughtsOn(),
                          voices:rvoices,canary:(document.getElementById('canary')||{}).value||'',
-                         project:document.getElementById('project').value.trim()})});
-  if(r.ok)msg.value='';
-  else alert((await r.json()).error||'ошибка');
+                         project:document.getElementById('project').value.trim(),
+                         parent:sent?sent.parent:''})});
+  if(r.ok){
+    // пока ждали ответ, Автор мог выбрать другую карточку и набрать
+    // новый вопрос — его не стираем
+    if(msg.value.trim()===question)msg.value='';
+    if(DEVELOP===sent){DEVELOP=null;const st=document.getElementById('devstrip');if(st)st.remove();msg.placeholder=MSG_PH}
+  } else alert((await r.json()).error||'ошибка');
 };
 document.getElementById('stop').onclick=async()=>{
   const name=document.getElementById('stop').dataset.round;
