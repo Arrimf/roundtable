@@ -1586,6 +1586,7 @@ def turn(name: str, prompt, acc=None) -> dict:
             sink = _tr_sink(name)
             if sink is not None:
                 sink((_tr_head(name, cmd, ptext, ch, bool(use_cont))
+                      + (f"промпт {len(ptext)} симв. — через {prompt_via}\n" if prompt_via else "")
                       + jail.mark(fact, hide) + access.mark(acc) + "\n")
                      .encode("utf-8", "replace"))
             r = _run_capture(cmd_run, cwd, vt, sink, voice=name,

@@ -1763,6 +1763,7 @@ def ask_one(name: str, prompt: str, round_id: str, phase: str,
             if tee is not None:
                 tee((transcript.head(name, argv, prompt,
                                      channel=(ch or {}).get("name", ""))
+                     + (f"промпт {len(prompt)} симв. — через {via}\n" if via else "")
                      + jail.mark(fact, hide) + access.mark(acc) + "\n")
                     .encode("utf-8", "replace"))
             res = run_watched(argv_run, cwd=cwd, hard_limit=limit,

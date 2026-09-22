@@ -46,7 +46,15 @@ codex — подписка истекла; deepseek/gemini не звались (
 
 **Субагент (построчно), первая попытка** — снят фильтром безопасности
 моего канала («safeguards flagged this message», reasoning_extraction)
-на тексте ревизии; вторая — см. ниже.
+на тексте ревизии. **Вторая — ОДОБРЯЮ.** «Разбор argv по равенству
+безопасен: других аргументов такой длины нет; basename — claude/codex
+голым именем или ~/.local/bin; deliver до jail.wrap; with_retry —
+согласованно; UnboundLocalError нет; stdin при kill — BrokenPipe →
+finally close; seen_sha только когда seen ≠ prompt. Оговорки: `codex
+exec resume` без [PROMPT] читает stdin — не проверено живьём (в бинаре
+есть «Failed to read prompt from stdin»); recover для kimi с
+prompt_via=file не найдёт сессию — сверка по prompt_sha, в логе обёртка.
+Мелочь: в шапке стенограммы факт stdin не назван.»
 
 ## Что сделано
 
@@ -61,3 +69,7 @@ codex — подписка истекла; deepseek/gemini не звались (
   (kimi).
 - Тесты: codex без «-», полный путь claude, 100 КБ ещё аргументом, EOF
   при ошибке записи.
+- Шапка стенограммы: «промпт N симв. — через stdin/file» (субагент).
+
+Долги (названы): `codex exec resume` со stdin — проверить живьём при
+живой подписке; `recover` Кими при via=file — сверять и по seen_sha.
