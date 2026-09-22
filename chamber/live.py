@@ -59,6 +59,7 @@ import transcript                               # noqa: E402  стенограм
 import jail                                     # noqa: E402  клетка bwrap голоса
 import access                                   # noqa: E402  ACCESS.txt проекта: доступ вне проекта
 import early                                    # noqa: E402  ранние отказы: тень и снятие
+import promptio                                 # noqa: E402  длинный промпт — не аргументом
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -1263,7 +1264,8 @@ BLIND_TURN = False        # deliver(blind=True) идёт: улика early_warn 
 
 
 def _run_capture(cmd: list[str], cwd, timeout: float,
-                 sink, voice: str = "") -> subprocess.CompletedProcess:
+                 sink, voice: str = "",
+                 stdin_text: str | None = None) -> subprocess.CompletedProcess:
     """subprocess.run(capture_output=True, text=True) с тройником.
 
     Без sink — прежний вызов, бит-в-бит. С sink (callable(bytes)) — Popen
@@ -1274,7 +1276,8 @@ def _run_capture(cmd: list[str], cwd, timeout: float,
     меняется."""
     if sink is None:
         return subprocess.run(cmd, capture_output=True, text=True,
-                              timeout=timeout, cwd=str(cwd))
+                              timeout=timeout, cwd=str(cwd),
+                              input=stdin_text)
     bufs: dict[str, list[bytes]] = {"out": [], "err": []}
     lock = threading.Lock()
     closed = False           # ход завершён — читатель больше не пишет
@@ -1286,10 +1289,14 @@ def _run_capture(cmd: list[str], cwd, timeout: float,
         # process_group=0: своя группа (та же сессия), setpgid делает libc
         # до exec — preexec_fn из рабочей нити ThreadPoolExecutor мог бы
         # заклинить ребёнка до exec (документированный дедлок; ревьюер).
-        proc = subprocess.Popen(cmd, cwd=str(cwd), stdin=subprocess.DEVNULL,
+        proc = subprocess.Popen(cmd, cwd=str(cwd),
+                                stdin=subprocess.PIPE if stdin_text is not None
+                                else subprocess.DEVNULL,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 process_group=0)
         pgid = proc.pid                      # == pid при process_group=0
+        if stdin_text is not None:           # длинный промпт — в stdin (promptio)
+            promptio.feed_stdin(proc, stdin_text, binary=True)
         with _CHILD_LOCK:
             _CHILD_PGIDS.add(pgid)
         early.clear_drop(pgid)               # хвост чужой жизни pgid — не команда
@@ -1503,6 +1510,8 @@ def turn(name: str, prompt, acc=None) -> dict:
                         # в полном: хвост тоже может не вместить.
     ptext = prompt if isinstance(prompt, str) else ""
     fact: dict = {}          # факт клетки — в событие при любом исходе
+    prompt_via = ""
+    seen_text = None
     try:
         # Ворота держим вокруг самого вызова — и вокруг выбора линии:
         # от неё зависят нить, каталог и промпт, а разбор ответа уже
@@ -1547,6 +1556,10 @@ def turn(name: str, prompt, acc=None) -> dict:
                 use_cont = False
             cmd = _voice_cmd(v, "cont" if use_cont else "start", ptext,
                              pfile, afile, session, ch)
+            # Длинный промпт аргументом — за MAX_ARG_STRLEN (128 КБ на
+            # аргумент): stdin у claude, «прочитай файл» у kimi
+            # (см. choir.long_prompt; свод prodolzhit-lyuboe-v1 упал так)
+            cmd, stdin_text, prompt_via, seen_text = promptio.deliver(cmd, ptext, pfile)
             # КЛЕТКА (обязательства 2 и 3 правила 8.5 механикой): корень
             # ro, rw — только свой каталог голоса (answer.txt Кодекса) и
             # состояние своего CLI; журнал, проект и cwd видны ro (под
@@ -1575,7 +1588,8 @@ def turn(name: str, prompt, acc=None) -> dict:
                 sink((_tr_head(name, cmd, ptext, ch, bool(use_cont))
                       + jail.mark(fact, hide) + access.mark(acc) + "\n")
                      .encode("utf-8", "replace"))
-            r = _run_capture(cmd_run, cwd, vt, sink, voice=name)
+            r = _run_capture(cmd_run, cwd, vt, sink, voice=name,
+                             stdin_text=stdin_text)
         rc = r.returncode
         early_warns = getattr(r, "early_warns", None) or []
         dropped_by = getattr(r, "dropped_by", None)
@@ -1655,6 +1669,8 @@ def turn(name: str, prompt, acc=None) -> dict:
         ev["elapsed_s"] = elapsed
         if early_warns:
             ev["early_warns"] = early_warns
+        if prompt_via:
+            ev["prompt_via"] = prompt_via
     except subprocess.TimeoutExpired as e:
         early_warns = getattr(e, "early_warns", None) or []
         # Хвост stderr — в ленту: раньше внешнее убийство съедало всё,
@@ -1731,6 +1747,10 @@ def turn(name: str, prompt, acc=None) -> dict:
     # данные. Правило 8.5: свойство, объявленное полем, должно быть
     # обеспечено механикой, иначе поле врёт.
     ev["context_sha"] = hashlib.sha256(ptext.encode("utf-8")).hexdigest()[:16]
+    if seen_text is not None and seen_text != ptext:
+        # голос получил обёртку «задание в файле», не пакет: sha пакета —
+        # context_sha, что реально ушло — seen_sha (grok)
+        ev["seen_sha"] = hashlib.sha256(seen_text.encode("utf-8")).hexdigest()[:16]
     if DOSSIER:
         # Метка обязательна, а не декоративна: без неё «стол согласился»
         # неотличимо от «стол трижды прочитал один пересказ».

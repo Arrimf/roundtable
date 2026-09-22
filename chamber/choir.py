@@ -51,6 +51,7 @@ import jail                                     # noqa: E402  клетка bwrap
 import access                                   # noqa: E402  ACCESS.txt проекта: доступ вне проекта
 import coverage as cover                        # noqa: E402  карта покрытия: одна арифметика с окном
 import early                                    # noqa: E402  ранние отказы: тень и снятие
+import promptio                                 # noqa: E402  длинный промпт — не аргументом
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -822,7 +823,7 @@ def run_watched(argv: list[str], *, cwd: str, hard_limit: int,
                 idle_limit: int = IDLE_LIMIT, sink=None,
                 voice: str = "", round_id: str = "",
                 phase: str = "", warn_sink: list | None = None,
-                blind: bool = False) -> dict:
+                blind: bool = False, stdin_text: str | None = None) -> dict:
     """Запуск с двумя лимитами: на тишину и на общее время.
 
     Возвращает stdout/stderr целиком (собранные по ходу), код возврата,
@@ -836,9 +837,12 @@ def run_watched(argv: list[str], *, cwd: str, hard_limit: int,
     # целиком: SIGTERM, потом SIGKILL.
     proc = subprocess.Popen(argv, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, text=True,
-                            stdin=subprocess.DEVNULL, cwd=cwd, bufsize=1,
+                            stdin=subprocess.PIPE if stdin_text is not None
+                            else subprocess.DEVNULL, cwd=cwd, bufsize=1,
                             process_group=0)
     pgid = proc.pid
+    if stdin_text is not None:
+        promptio.feed_stdin(proc, stdin_text, binary=False)
     with _CHILD_LOCK:
         _CHILD_PGIDS.add(pgid)
     early.clear_drop(pgid)            # хвост чужой жизни этого pgid — не команда
@@ -1713,6 +1717,7 @@ def ask_one(name: str, prompt: str, round_id: str, phase: str,
         chans = v.get("channels") or ()
 
         warns_acc: list[dict] = []          # тень всех попыток этого хода
+        seen_box: dict = {}                 # что голос получил, если не сам промпт
 
         def _call(ch: dict | None = None) -> dict:
             # argv зависит от линии: у голоса с каналами модель приходит
@@ -1742,6 +1747,9 @@ def ask_one(name: str, prompt: str, round_id: str, phase: str,
             # обычных файлов, не каналов (проверено пробником).
             hide = _hide_dirs()
             cwd = voice_cwd(name)
+            argv, stdin_text, via, seen_text = promptio.deliver(argv, prompt, pfile)
+            if via:
+                seen_box["text"] = seen_text      # sha — от того, что голос получил
             # ACCESS.txt проекта: r — ro всем; rw в раунде — тоже ro
             # (запись только креслу). Снимок один на процесс.
             acc = project_access()
@@ -1761,7 +1769,10 @@ def ask_one(name: str, prompt: str, round_id: str, phase: str,
                               idle_limit=idle if idle is not None else limit,
                               sink=tee, voice=name, round_id=round_id,
                               phase=phase, warn_sink=warns_acc,
-                              blind=(visibility == "blind"))   # по видимости, не по имени фазы (expand — слепой)
+                              blind=(visibility == "blind"),   # по видимости, не по имени фазы (expand — слепой)
+                              stdin_text=stdin_text)
+            if via:
+                res["prompt_via"] = via       # факт: промпт ушёл не аргументом
             res.update(fact)
             return res
 
@@ -1830,6 +1841,12 @@ def ask_one(name: str, prompt: str, round_id: str, phase: str,
             # ненаблюдаемы, а порог не откалибровать (раунд ранние-отказы);
             # с повторами with_retry — предупреждения всех попыток (субагент)
             rec["early_warns"] = list(warns_acc)
+        if run.get("prompt_via"):
+            rec["prompt_via"] = run["prompt_via"]
+            if seen_box.get("text") is not None and seen_box["text"] != prompt:
+                # kimi видел обёртку, не пакет: sha пакета остаётся в
+                # prompt_sha, а что реально ушло — seen_sha (grok)
+                rec["seen_sha"] = _sha(seen_box["text"])
         if run.get("jail"):
             rec["jail"] = run["jail"]           # факт клетки, не обещание
             if run.get("jail_sha"):
