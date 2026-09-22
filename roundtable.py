@@ -30,6 +30,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
 import fcntl
 import hashlib
@@ -239,6 +240,7 @@ import names as fnames                         # noqa: E402  имена файл
 import canary                                  # noqa: E402  канарейки прав (обещания 1 и 2)
 import access                                  # noqa: E402  ACCESS.txt проекта: доступ голосов вне проекта
 import coverage as cover                       # noqa: E402  карта покрытия свода: та же арифметика, что у дирижёра
+import jail                                    # noqa: E402  jail.disabled(): сторож доступа выключен вместе с клеткой
 import early                                   # noqa: E402  ранние отказы: снятие голоса по кнопке
 
 VOICES = list(live.VOICES)
@@ -447,6 +449,15 @@ def _last_goal() -> str:
     return goal
 
 
+def _coverage_now(recs: list, name: str):
+    """Карта по записям раунда сейчас; без единой фазы ответов — словами,
+    а не обрывком «: ; долгов нет» (субагент, ревизия 22.09)."""
+    cov = cover.compute(recs, _debts_open_safe(), round_id=name)
+    if not cov.get("phases"):
+        return None
+    return cover.head(cov, None)
+
+
 def _debts_open_safe() -> list:
     """Открытые долги ответов по choir.py; дирижёр не импортировался —
     пустой список, карта честно покажет «долгов нет» по тому, что видит."""
@@ -478,21 +489,45 @@ def _cut(s: str, n: int) -> str:
     return s if len(s) <= n else s[:n - 1] + "…"
 
 
+# Сигнатура НАШЕЙ клетки в командной строке bwrap (jail.prefix): чужие
+# bwrap — собственная песочница Грока (`--cap-drop ALL --bind / /`), флатпаки
+# — не голоса стола, и блокировать ими запись доступа значит врать о
+# причине (ревизия 22.09: субагент, «пока открыт терминал Грока, права из
+# окна не меняются»).
+JAIL_SIGNATURE = ("--ro-bind / /", "--unshare-pid")
+
+
+def _is_our_jail(pgrep_line: str) -> bool:
+    """Строка `pgrep -a`: «<pid> bwrap <аргументы клетки> -- <команда голоса>».
+    Сигнатура ищется ТОЛЬКО в аргументах до разделителя ` -- `: промпт
+    Грока/Кими идёт в argv, и текст, цитирующий jail.py, делал чужой bwrap
+    «нашим» (второй круг ревизии: 409 по собственной песочнице Грока с
+    дифом в промпте). Наша клетка начинается ровно так, как её собирает
+    jail.prefix: `bwrap --ro-bind / / --dev /dev --proc /proc …`."""
+    head = pgrep_line.split(" -- ", 1)[0]
+    body = head.split(" ", 1)[1] if " " in head else head          # без pid
+    return body.startswith("bwrap --ro-bind / / --dev /dev --proc /proc") \
+        and all(sig in body for sig in JAIL_SIGNATURE)
+
+
 def _bwrap_alive() -> bool:
-    """Жив ли хоть один bwrap этого пользователя — значит чей-то голос
-    сейчас в клетке (любое окно, раунд, ревизия). pgrep -x по имени
-    процесса, не -f: -f ловил бы собственную оболочку. Окно без клетки
-    (CHOIR_RT_NO_BWRAP=1: стенды тестов, машины без bwrap) сторожить не
-    может и не должно: его голоса и так вне клетки, а чужой bwrap на той
-    же машине ронял бы тесты (voices_http 22.09)."""
-    if os.environ.get("CHOIR_RT_NO_BWRAP") == "1":
+    """Жив ли bwrap НАШЕЙ клетки у этого пользователя — значит чей-то голос
+    стола сейчас в клетке (любое окно, раунд, ревизия). pgrep -a по имени
+    процесса, не -f: -f ловил бы собственную оболочку; сигнатура — по
+    аргументам. Окно без клетки (jail.disabled(): CHOIR_RT_NO_BWRAP=1 —
+    стенды тестов, машины без bwrap) сторожить не может и не должно: его
+    голоса и так вне клетки; о том, что сторож выключен, окно говорит при
+    старте."""
+    if jail.disabled():
         return False
     try:
-        r = subprocess.run(["pgrep", "-u", str(os.getuid()), "-x", "bwrap"],
+        r = subprocess.run(["pgrep", "-u", str(os.getuid()), "-a", "-x", "bwrap"],
                            capture_output=True, text=True, timeout=5)
     except (OSError, subprocess.TimeoutExpired):
         return False                    # pgrep нет — проверка честно молчит
-    return r.returncode == 0
+    if r.returncode != 0:
+        return False
+    return any(_is_our_jail(line) for line in r.stdout.splitlines())
 
 
 def _access_view(rp: Path) -> dict:
@@ -586,7 +621,7 @@ def round_view(name: str) -> dict:
             # Карта СЕЙЧАС — по всем записям раунда, до всякого свода (Автор
             # 22.09: «карту покрытия я увижу только после раунда?»). Та же
             # арифметика, что у сводчика; долги — из журнала долгов.
-            "coverage_now": cover.head(cover.compute(recs, _debts_open_safe(), round_id=name), None),
+            "coverage_now": _coverage_now(recs, name),
             "summary": (slim(last_sum) if last_sum else None),
             "summary_ok": bool(last_sum and last_sum.get("status") == "ok"),
             "n_records": len(recs)}
@@ -3284,6 +3319,194 @@ def _has_numbers(res: dict) -> bool:
                for r in rows)
 
 
+# ── подписки CLI: дата окончания и статус (наказ Автора 2026-09-23) ──
+# Повод: у Codex 15.09 кончилась подписка, стол это проморгал — панель
+# показывала расход, а не срок. Здесь ТОЛЬКО то, что провайдер отдаёт
+# бесплатно и что уже лежит на диске: JWT Codex (план и
+# chatgpt_subscription_active_until), профиль Claude (has_claude_max /
+# subscription_status — даты продления Anthropic не отдаёт),
+# /rest/subscriptions Грока (status, billingPeriodEnd). Kimi и DeepSeek
+# живут на балансе — подписки у них нет, и это названо, а не молчит.
+CLAUDE_PROFILE = "https://api.anthropic.com/api/oauth/profile"
+_SUB_STATE: dict[str, str] = {}      # прошлое состояние на процесс — для заметки о переходе
+SUB_NONE_BALANCE = "оплата по балансу — подписки нет, срок не применим"
+
+
+def _jwt_payload(token: str) -> dict:
+    """Тело JWT без проверки подписи: нам нужна только дата, которую
+    провайдер сам вписал в токен CLI."""
+    try:
+        part = token.split(".")[1]
+        part += "=" * (-len(part) % 4)
+        d = json.loads(base64.urlsafe_b64decode(part))
+        return d if isinstance(d, dict) else {}
+    except Exception:                                   # noqa: BLE001
+        return {}
+
+
+def _sub_state(until_iso: str | None, active: bool | None) -> str:
+    """active / ending (меньше 7 дней) / expired / unknown.
+
+    Флаг провайдера СИЛЬНЕЕ даты: план free с датой в будущем или
+    неактивная подписка Грока с недавним billingPeriodEnd иначе
+    показывались бы «активна» (grok, kimi). Дата лишь уточняет живую:
+    меньше недели — ending."""
+    if active is False:
+        return "expired"
+    if until_iso:
+        try:
+            dt = datetime.fromisoformat(str(until_iso).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)   # naive — UTC, не локаль (kimi)
+            left = dt.timestamp() - time.time()
+            if left < 0:
+                # флаг «жива» при прошедшей дате — не «истекла», а снимок
+                # устарел (граница биллинга у Грока, старый JWT Codex):
+                # stale с датой в подсказке (субагент)
+                return "stale" if active is True else "expired"
+            if left < 7 * 86400:
+                return "ending"
+            return "active"
+        except ValueError:
+            pass
+    if active is True:
+        return "active"
+    return "unknown"
+
+
+def _sub_codex() -> dict:
+    try:
+        tk = json.loads(CODEX_AUTH.read_text(encoding="utf-8"))["tokens"]
+    except Exception as e:                              # noqa: BLE001
+        return {"state": "unknown", "note": f"нет {CODEX_AUTH}: {type(e).__name__}"}
+    j = _jwt_payload(tk.get("id_token") or tk.get("access_token") or "")
+    auth = j.get("https://api.openai.com/auth") or {}
+    plan = auth.get("chatgpt_plan_type") or ""
+    until = auth.get("chatgpt_subscription_active_until")
+    checked = auth.get("chatgpt_subscription_last_checked")
+    if plan == "free":
+        # free: была подписка (дата в прошлом) — истекла; не было — нет
+        # подписки. Первая редакция гасила это флагом до разбора даты, и
+        # ветка «none» была мёртвой (kimi, субагент).
+        st = "expired" if _sub_state(until, None) == "expired" else "none"
+    else:
+        st = _sub_state(until, True if plan else None)
+    return {"state": st, "plan": plan, "until": until,
+            "checked_at": checked,
+            "source": "JWT из ~/.codex/auth.json (chatgpt_subscription_active_until)",
+            "note": ("план free: подписки нет, платные модели CLI отвергает"
+                     if plan == "free" else "")}
+
+
+def _sub_claude() -> dict:
+    try:
+        oauth = json.loads(CLAUDE_CREDS.read_text(encoding="utf-8")).get("claudeAiOauth") or {}
+        token = oauth["accessToken"]
+    except Exception as e:                              # noqa: BLE001
+        return {"state": "unknown", "note": f"нет {CLAUDE_CREDS}: {type(e).__name__}"}
+    plan = oauth.get("subscriptionType") or ""
+    code, d, err = _get_json(CLAUDE_PROFILE, {
+        "Authorization": f"Bearer {token}", "anthropic-beta": "oauth-2025-04-20",
+        "User-Agent": "claude-cli/roundtable"})
+    if not isinstance(d, dict):
+        return {"state": "unknown", "plan": plan, "source": CLAUDE_PROFILE,
+                "note": f"профиль не ответил — {err}"}
+    org = d.get("organization") or {}
+    acc = d.get("account") or {}
+    status = org.get("subscription_status")
+    # trialing / past_due — жива с оговоркой, не «истекла» (kimi);
+    # незнакомый статус — unknown, а не догадка
+    if status in ("active", "trialing", "past_due"):
+        active: bool | None = True
+    elif status in ("canceled", "cancelled", "incomplete_expired", "unpaid", "expired"):
+        active = False
+    elif status:
+        active = None
+    else:
+        hm = acc.get("has_claude_max") or acc.get("has_claude_pro")
+        active = bool(hm) if hm is not None else None
+    return {"state": _sub_state(None, active),
+            "plan": (plan or org.get("organization_type") or "")
+                    + (f" ({status})" if status in ("trialing", "past_due") else ""),
+            "status": status, "since": org.get("subscription_created_at"),
+            "source": CLAUDE_PROFILE,
+            "note": "дату продления Anthropic не отдаёт: известен только статус"}
+
+
+def _sub_grok() -> dict:
+    try:
+        auth = json.loads(GROK_AUTH.read_text(encoding="utf-8"))
+        token = next(v.get("key") for v in auth.values()
+                     if isinstance(v, dict) and v.get("key"))
+    except Exception as e:                              # noqa: BLE001
+        return {"state": "unknown", "note": f"нет токена в {GROK_AUTH}: {type(e).__name__}"}
+    code, d, err = _get_json(GROK_SUBS, {
+        "Authorization": f"Bearer {token}", "Accept": "application/json",
+        "User-Agent": "grok-cli/1.0.3"})
+    if not isinstance(d, dict):
+        return {"state": "unknown", "source": GROK_SUBS, "note": f"не ответил — {err}"}
+    subs = [x for x in (d.get("subscriptions") or []) if isinstance(x, dict)]
+    if not subs:
+        return {"state": "none", "source": GROK_SUBS, "note": "подписок у аккаунта нет"}
+    act = [x for x in subs if x.get("status") == "SUBSCRIPTION_STATUS_ACTIVE"]
+    x = act[0] if act else max(subs, key=lambda y: str(y.get("modTime") or ""))
+    pe = x.get("billingPeriodEnd") or (x.get("stripe") or {}).get("currentPeriodEnd")
+    if isinstance(pe, str) and pe.isdigit():
+        pe = float(pe)                                   # epoch строкой (субагент)
+    if isinstance(pe, (int, float)):
+        pe = _iso(pe / (1000 if pe > 2e10 else 1))
+    tier = str(x.get("tier") or "").replace("SUBSCRIPTION_TIER_", "").lower()
+    return {"state": _sub_state(pe, bool(act)), "plan": tier, "until": pe,
+            "status": str(x.get("status") or "").replace("SUBSCRIPTION_STATUS_", "").lower(),
+            "source": GROK_SUBS}
+
+
+_SUB_CACHE: dict = {"ts": 0.0, "data": {}}
+SUB_TTL = 3600           # профиль и подписки — раз в час, не каждый проход лимитов (kimi)
+
+
+def collect_subscriptions(force: bool = False) -> dict[str, dict]:
+    if not force and _SUB_CACHE["data"] and time.time() - _SUB_CACHE["ts"] < SUB_TTL:
+        return dict(_SUB_CACHE["data"])
+    jobs = {"claude": _sub_claude, "codex": _sub_codex, "grok": _sub_grok}
+    out: dict[str, dict] = {}
+    with ThreadPoolExecutor(max_workers=len(jobs)) as ex:
+        futs = {ex.submit(fn): n for n, fn in jobs.items()}
+        for f in as_completed(futs):
+            n = futs[f]
+            try:
+                out[n] = f.result()
+            except Exception as e:                      # noqa: BLE001
+                out[n] = {"state": "unknown", "note": f"сборщик упал: {type(e).__name__}: {e}"}
+    for n in ("kimi", "deepseek", "gemini"):
+        out[n] = {"state": "none", "note": SUB_NONE_BALANCE if n != "gemini"
+                  else "ключи API без подписки — срок не применим"}
+    for v in out.values():
+        v["checked_by_window_at"] = _iso(time.time())
+    _SUB_CACHE.update(ts=time.time(), data=dict(out))
+    return out
+
+
+def _sub_transitions(subs: dict[str, dict]) -> list[dict]:
+    """Заметки о переходе в expired — один раз на переход; в память
+    состояний только определённые (unknown после сбоя сети — не
+    переход: иначе «истекла» повторялось бы после каждого сбоя — kimi)."""
+    notes = []
+    for name, sub in subs.items():
+        cur = sub.get("state")
+        if cur not in ("active", "ending", "expired", "none", "stale"):
+            continue
+        prev = _SUB_STATE.get(name)
+        if prev is not None and prev != cur and cur == "expired":
+            until = str(sub.get("until") or "")[:10]
+            notes.append({"voice": name, "text": f"⛔ подписка CLI {name} истекла"
+                          + (f" ({until})" if until else "")
+                          + (f" · план {sub.get('plan')}" if sub.get("plan") else ""),
+                          "subscription": sub})
+        _SUB_STATE[name] = cur
+    return notes
+
+
 def collect_limits() -> dict[str, dict]:
     """Один проход по всем источникам.
 
@@ -3339,6 +3562,21 @@ def collect_limits() -> dict[str, dict]:
                                     or res.get("error")
                                     or f"свежий замер: {res.get('kind')}")
             out[name] = good
+    # Подписки — рядом с лимитами, тем же фоновым проходом (без платных
+    # вызовов); поле subscription у каждого голоса, даже «нет подписки»
+    subs = collect_subscriptions()
+    for name in out:
+        out[name] = {**out[name], "subscription": subs.get(name) or {"state": "unknown"}}
+    # Переход в expired — одной строкой в ленту, один раз на переход
+    # (grok, kimi: «проморгали» лечится записью, не звонком)
+    for n in _sub_transitions(subs):
+        try:
+            feed_append("note", n["text"], voice=n["voice"], subscription=n["subscription"])
+        except Exception as e:                          # noqa: BLE001
+            # не записалось — переход не «состоялся»: следующий проход
+            # повторит заметку (grok)
+            _SUB_STATE.pop(n["voice"], None)
+            print(f"заметка о подписке не записана: {e}", file=sys.stderr)
     return out
 
 
@@ -5218,6 +5456,8 @@ overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .vrow .cap{display:flex;gap:.4rem;align-items:baseline;
 font-size:.7rem;color:var(--dim);line-height:1.25}
 .vrow .capt{flex:1;min-width:0}
+.vrow .sub{font:.72rem ui-monospace,monospace;color:var(--dim);margin-top:.1rem}
+.vrow .sub.ok{color:var(--dim)}.vrow .sub.warn{color:var(--acc)}.vrow .sub.bad{color:var(--err);font-weight:600}
 .vrow .capt[title]:not([title=""]){cursor:help}
 .vrow .st{margin-left:auto;font-size:.7rem;color:var(--dim);
 white-space:nowrap}
@@ -6284,7 +6524,30 @@ function renderMulti(row,m,L){
     '\nСреднего между разными окнами не бывает: усреднить 5-часовое с '+
     'недельным значит показать число, которого не сообщал никто.';
 }
+// Подписка CLI под шкалой (наказ Автора 2026-09-23: «проморгали»
+// Codex): дата и состояние — active / ending (<7 сут) / expired /
+// none (баланс) / unknown. Цвет — по состоянию, дата — как есть.
+function renderSub(row,m){
+  let el=row.querySelector('.sub');
+  if(!el){el=document.createElement('div');el.className='sub';
+    const cap=row.querySelector('.cap');cap.parentNode.insertBefore(el,cap.nextSibling)}
+  const s=(m&&m.limit&&m.limit.subscription)||{state:'unknown',note:'подписка ещё не запрошена (первый замер лимитов)'};
+  el.className='sub';el.textContent='';el.title='';el.hidden=false;
+  const d=s.until?String(s.until).slice(0,10):'';
+  let txt,cls='';
+  if(s.state==='none'){txt='подписка: нет'+(s.plan?' · '+s.plan:'')+(s.note&&/баланс/.test(s.note)?' (баланс)':'');cls='dim'}
+  else if(s.state==='expired'){txt='⛔ подписка ИСТЕКЛА'+(d?' '+d:'')+(s.plan?' · '+s.plan:'');cls='bad'}
+  else if(s.state==='ending'){txt='⚠ подписка до '+d+(s.plan?' · '+s.plan:'');cls='warn'}
+  else if(s.state==='active'){txt='подписка: '+(d?'до '+d:'активна')+(s.plan?' · '+s.plan:'');cls='ok'}
+  else if(s.state==='stale'){txt='подписка: жива по провайдеру, дата '+d+' прошла — снимок устарел';cls='warn'}
+  else{txt='подписка: неизвестно'+(s.plan?' · '+s.plan:'');cls='dim'}
+  el.classList.add(cls);el.textContent=txt;
+  el.title=[s.note||'',s.status?'статус: '+s.status:'',s.since?'с: '+s.since:'',
+    s.checked_at?'провайдер проверял: '+s.checked_at:'',s.source?'источник: '+s.source:'']
+    .filter(Boolean).join('\n')||txt;
+}
 function renderLim(row,m){
+  renderSub(row,m);
   const L=limsOf(m);
   // ЕДИНЫЙ вид для всех, у кого есть хоть одна шкала: Кими и DeepSeek
   // с одинаковыми балансами рисовались по-разному (у одного строка-
@@ -8061,6 +8324,10 @@ def main(argv: list[str] | None = None) -> int:
     print(f"RoundTable: http://127.0.0.1:{PORT}  (лента: {FEED.name}, "
           f"голосов: {len(VOICES)})\n"
           f"  проект: {PROJECT or '— (без проекта)'}")
+    if jail.disabled():
+        # Вслух, а не молча: с этим флагом POST /access не сторожится
+        # живыми bwrap (голоса и так вне клетки) — ревизия 22.09.
+        print("  клетки нет (CHOIR_RT_NO_BWRAP=1): сторож записи доступа выключен")
     # Первый замер лимитов — сразу и в фоне: он читает десятки мегабайт
     # логов и ходит за балансом в сеть, и делать это на первом же
     # открытии страницы значит показать Автору сплошное «unknown».
