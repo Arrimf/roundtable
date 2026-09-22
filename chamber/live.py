@@ -57,6 +57,7 @@ import threading
 
 import transcript                               # noqa: E402  стенограмма акта
 import jail                                     # noqa: E402  клетка bwrap голоса
+import access                                   # noqa: E402  ACCESS.txt проекта: доступ вне проекта
 import early                                    # noqa: E402  ранние отказы: тень и снятие
 import time
 import uuid
@@ -589,6 +590,10 @@ VOICES: dict[str, dict] = {
                                        str(VOICES["deepseek"]["turn_timeout"] - 30)],
         # Прямой вызов API, а не агент: файлы не читает (как Джемини).
         "no_files": True,
+        # СЕССИЙ НЕТ: каждый ход — с нуля. Память нити собирает комната
+        # сама из ленты (MEMORY_VOICES, наказ Автора 2026-09-22), как
+        # CLI остальных голосов делают внутри себя.
+        "no_session": True,
         # exit 3 — кончился предоплаченный баланс: штатный отказ, как
         # исчерпанная квота у остальных.
         "quota_exit": 3,
@@ -919,6 +924,37 @@ def available(name: str) -> bool:
 # прежние рамки 120–250 слов; правило 16 канона остаётся рычагом
 # Автора, просто рычаг теперь у него в руках, а не зашит в устав.
 BRIEF = os.environ.get("CHOIR_BRIEF") == "1"
+
+# ПАМЯТЬ НИТИ ИЗ ЛЕНТЫ (наказ Автора 2026-09-22). У голоса без сессии
+# (no_session — deepseek-http) каждый ход стартует с нуля, и он один из
+# шести не помнил разговор. Остальные CLI при каждом ходе шлют в API всю
+# историю сессии сами; здесь комната делает то же для голоса без сессии:
+# устав и цель — каждый ход (нить их не помнит), история нити с её
+# начала (origin) вместо дельты, свои реплики — как «Вы». Потолок в
+# символах: старейшие реплики режутся, и обрезка называется в промпте
+# (правило 3). Выключатель — галочка «память» в строке голоса (окно →
+# CHOIR_DEEPSEEK_MEMORY); умолчание — включено.
+MEMORY_CAP = max(4000, int(os.environ.get("CHOIR_MEMORY_CAP", "60000") or 60000))
+
+
+def _origin_of(st: dict) -> int:
+    """Рождение нити для памяти: origin из состояния, иначе курсор; ноль
+    (нить без проекта, cold start) — хвост COLD_TAIL, не архив с начала
+    времён (субагент, deepseek). Одна функция для промпта и для
+    сохранения состояния — иначе промпт брал хвост, а на диск ложился 0."""
+    if "origin" in st:
+        return int(st["origin"] or 0)     # записанный ноль — «с начала»: лента была короче хвоста (grok)
+    cursor = int(st.get("cursor", 0) or 0)
+    if cursor:
+        return cursor
+    allev = read_events()
+    return max(0, (allev[-1]["id"] - COLD_TAIL) if allev else 0)
+
+
+def memory_on(name: str) -> bool:
+    if not VOICES.get(name, {}).get("no_session"):
+        return False
+    return os.environ.get(f"CHOIR_{name.upper()}_MEMORY", "1") != "0"
 BRIEF_RULE = ("• Отвечайте коротко: 120–250 слов. Внимание человека — "
               "самый дефицитный ресурс стола; непрочитанная реплика "
               "не состоялась.\n" if BRIEF else "")
@@ -971,8 +1007,11 @@ def project_doc() -> str:
 
 
 def build_prompt(name: str, st: dict, events: list[dict], first: bool,
-                 blind: bool = False) -> str:
+                 blind: bool = False, acc=None, memory: bool = False,
+                 origin: int = 0) -> str:
     parts = []
+    if memory:
+        first = True          # нить ничего не помнит: устав и цель — каждый ход
     if first:
         parts.append(CHARTER)
         parts.append(f"Ваше имя за столом: {name}.\n")
@@ -994,6 +1033,23 @@ def build_prompt(name: str, st: dict, events: list[dict], first: bool,
             doc = project_doc()          # PROJECT.md — всем одинаково, один раз на нить
             if doc:
                 parts.append(doc)
+            # ACCESS.txt — тоже всем одинаково: голосу без диска строка
+            # говорит, чего ему не видно, голосу с диском — куда смотреть
+            # (правило 8.5: bind без слова в пакете голос не найдёт).
+            # Снимок — ОДИН на раздачу (deliver), тот же, что уйдёт в
+            # клетку; отдельное чтение здесь давало «слово без bind'а»
+            # при правке файла в щели между пакетом и ходом (ревизия).
+            if acc is not None:
+                acc_note = access.notice(acc)
+                if acc_note:
+                    parts.append(acc_note)
+    elif acc is not None and st.get("access_sha", "") != (acc.sha or ""):
+        # Доступ сменился с прошлого хода нити: голос обязан узнать об
+        # этом словом, а не догадкой (правило 8.5 в обе стороны).
+        n = access.notice(acc)
+        parts.append("ДОСТУП ИЗМЕНИЛСЯ. " + n if n else
+                     "ДОСТУП ИЗМЕНИЛСЯ: сверх каталога проекта теперь ничего не открыто.\n\n")
+    if first:
         if blind:
             parts.append(
                 "СЛЕПОЙ ХОД. Вы отвечаете первым по новой теме и НЕ видите "
@@ -1029,13 +1085,40 @@ def build_prompt(name: str, st: dict, events: list[dict], first: bool,
     # «Голос choir» — ложная атрибуция, платные токены и соблазн отвечать
     # диспетчеру (нашли codex, grok, kimi и субагент; у субагента замер:
     # 19 заметок на 6 реплик в одном прогоне).
+    cur_goal = current_goal() if memory else None
     events = [e for e in events
               if e.get("kind") in ("say", "pass", "error", "verdict")
-              or (e.get("kind") == "goal" and not first)]
-    if events:
-        parts.append("Что сказали с вашего прошлого хода:\n")
+              or (e.get("kind") == "goal" and (not first or (
+                  # с памятью — смены цели, кроме действующей: она уже в
+                  # шапке ЦЕЛЬ (deepseek, субагент); снятие цели (пустая)
+                  # остаётся — иначе прошлая выглядела бы действующей (grok)
+                  memory and ((e.get("goal") or "").strip() != (cur_goal or "")
+                              or not (e.get("goal") or "").strip()))))]
+    cut_note = ""
+    if memory:
+        # Потолок: режем СТАРЕЙШИЕ целыми репликами, обрезка названа —
+        # и когда срезано всё (deepseek). Размер — текст ИЛИ причина.
+        # размер — как в промпте: у error печатается detail[:80], не stdout (grok)
+        size = lambda e: (80 if e.get("kind") == "error" else len(e.get("text") or e.get("goal") or "")) + 40
+        total = sum(size(e) for e in events)
+        dropped = 0
+        while events and total > MEMORY_CAP:
+            total -= size(events.pop(0))
+            dropped += 1
+        if dropped:
+            cut_note = (f"(история обрезана по потолку {MEMORY_CAP} симв.: "
+                        f"{dropped} ранних реплик не показаны)\n")
+        if origin:
+            cut_note = (f"(нить ведётся с события №{origin + 1} ленты; что было "
+                        f"раньше, вам не показано)\n") + cut_note
+    if events or (memory and cut_note):
+        parts.append(("ИСТОРИЯ ЭТОЙ НИТИ (у вашего канала нет сессии — комната "
+                      "собрала её из журнала; ваши реплики помечены «Вы»):\n"
+                      + cut_note) if memory else "Что сказали с вашего прошлого хода:\n")
         for e in events:
-            who = "Автор (человек)" if e["author"] == HUMAN else f"Голос {e['author']}"
+            who = ("Автор (человек)" if e["author"] == HUMAN
+                   else "Вы" if (memory and e["author"] == name)
+                   else f"Голос {e['author']}")
             if e["kind"] == "goal":
                 # Смена цели доезжает до начатых нитей дельтой, иначе
                 # старожил живёт со старой целью (нашли codex, claude).
@@ -1372,7 +1455,10 @@ def _claude_result(out: str) -> str:
     return result
 
 
-def turn(name: str, prompt) -> dict:
+_DELIVER_ACC = None            # снимок ACCESS.txt текущей раздачи (deliver)
+
+
+def turn(name: str, prompt, acc=None) -> dict:
     """Один ход голоса в его нити. Возвращает событие для ленты.
 
     Ошибку не поглощаем и пустым ответом не подменяем: «промолчал» и
@@ -1467,17 +1553,28 @@ def turn(name: str, prompt) -> dict:
             # /tmp — тесты — их прячет tmpfs, потому явно); чужие
             # каталоги скрыты. Кодекс — своя песочница ВНУТРИ клетки.
             hide = _hide_dirs()
+            # ACCESS.txt проекта (наказ Автора 2026-09-20): r — ro всем,
+            # rw вне кресла — тоже ro, запись выдаётся только исполнителю.
+            # Отвергнутые строки — в стенограмму, не в клетку и не в пакет.
+            # Снимок приходит из deliver (один на раздачу, тот же, что в
+            # пакете); прямой вызов turn без него читает файл сам.
+            if acc is None:
+                acc = (_DELIVER_ACC if _DELIVER_ACC is not None
+                       else access.load(PROJECT, hide=hide))
             cmd_run, fact = jail.wrap(
                 cmd, name, rw=[str(home)],
-                ro=[str(JOURNAL), *([str(PROJECT)] if PROJECT else [])],
+                ro=[str(JOURNAL), *([str(PROJECT)] if PROJECT else []),
+                    *access.ro_paths(acc)],
                 hide=hide, cwd=str(cwd), nest_own=True)
+            fact = {**fact, **access.fact(acc)}
             t0 = time.monotonic()  # отсчёт РАБОТЫ, очередь сюда не входит
             wall_t0 = time.time()  # для пробы логов Кими (mtime файлов)
             vt = v.get("turn_timeout", TURN_TIMEOUT)
             sink = _tr_sink(name)
             if sink is not None:
                 sink((_tr_head(name, cmd, ptext, ch, bool(use_cont))
-                      + jail.mark(fact, hide) + "\n").encode("utf-8", "replace"))
+                      + jail.mark(fact, hide) + access.mark(acc) + "\n")
+                     .encode("utf-8", "replace"))
             r = _run_capture(cmd_run, cwd, vt, sink, voice=name)
         rc = r.returncode
         early_warns = getattr(r, "early_warns", None) or []
@@ -1655,6 +1752,8 @@ def turn(name: str, prompt) -> dict:
         st["session"] = session
         st["turns"] = st.get("turns", 0) + 1
         st["cwd"] = _session_dir(v, cwd)     # каталог, где живёт сессия (для -c)
+        if acc is not None:
+            st["access_sha"] = acc.sha or ""   # что голос видел о доступе (для «ДОСТУП ИЗМЕНИЛСЯ»)
         save_state(name, st, ch)
     if HAND_RE.search(ev.get("text", "")):
         ev["hand"] = True                              # поднял руку
@@ -1662,6 +1761,8 @@ def turn(name: str, prompt) -> dict:
         ev.setdefault("jail", fact.get("jail"))
         if fact.get("jail_sha"):
             ev.setdefault("jail_sha", fact["jail_sha"])
+        if fact.get("access_sha"):
+            ev.setdefault("access_sha", fact["access_sha"])   # отпечаток ACCESS.txt хода
     return ev
 
 
@@ -1675,12 +1776,30 @@ def deliver(names: list[str], blind: bool = False) -> list[dict]:
     отсутствием данных, а не запретом смотреть.
     """
     prompts = {}
+    # ACCESS.txt — один снимок на раздачу: пакет и клетка каждого голоса
+    # видят одно и то же, и все голоса хода — одно и то же (правило 1;
+    # ревизия 20.09: codex, grok, kimi, субагент). Ходу снимок уходит
+    # модульной переменной, не аргументом: сигнатура turn(name, prompt)
+    # — контракт, который подменяют тесты и стенды.
+    global _DELIVER_ACC
+    acc = access.load(PROJECT, hide=_hide_dirs())
+    _DELIVER_ACC = acc
     for n in names:
         def _make(st, n=n):
+            if memory_on(n):
+                # Память из ленты: вся нить с её начала, включая свои
+                # реплики (см. MEMORY_CAP); origin — курсор при рождении
+                # нити, у старых нитей — курсор первого хода с памятью.
+                # cursor=0 (нить без проекта) — не «с начала времён»:
+                # хвост COLD_TAIL, как у дельты (субагент, deepseek)
+                origin = _origin_of(st)
+                hist = read_events(since=origin)
+                return build_prompt(n, st, hist, True, blind, acc=acc, memory=True,
+                                    origin=origin)
             delta = read_events(since=st.get("cursor", 0))
             # Свои же реплики голосу не пересказываем: он их помнит нитью.
             delta = [e for e in delta if e["author"] != n]
-            return build_prompt(n, st, delta, not st.get("turns"), blind)
+            return build_prompt(n, st, delta, not st.get("turns"), blind, acc=acc)
         # У голоса с линиями промпт считается для КАЖДОЙ: какая
         # достанется, решат ворота уже внутри хода (см. per_channel).
         prompts[n] = per_channel(n, _make)
@@ -1734,9 +1853,13 @@ def deliver(names: list[str], blind: bool = False) -> list[dict]:
             ch = next((c for c in channels_of(n)
                        if c["name"] == ev.get("channel")), None)
             st = load_state(n, ch)
+            if "origin" not in st:
+                st["origin"] = _origin_of(st)   # рождение нити — до сдвига курсора
             st["cursor"] = top
             st["peer"] = PEER           # с какой опцией шёл ход (для уведомления о смене)
             save_state(n, st, ch)
+            if memory_on(n):
+                ev["memory"] = "feed"   # память собрана комнатой из ленты (правило 8.5: поле = механика)
             mark = {"say": "●", "pass": "○", "error": "✗"}.get(ev["kind"], "?")
             done_n += 1
             _note(f"{mark} {n:<8} {ev.get('elapsed_s', 0):>6.1f} с  "

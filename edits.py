@@ -394,6 +394,46 @@ class EditRefused(RuntimeError):
     """Правка не открыта — причина в тексте, следов не осталось."""
 
 
+def _chair_access(project):
+    """ACCESS.txt проекта для кресла (наказ Автора 2026-09-20) — ОДИН
+    снимок на акт: из него rw идут в writable_roots Кодекса (клетки у
+    него нет, песочница — единственная ограда) и в --add-dir Клода и
+    Кими (bwrap разрешит запись, а CLI без флага откажет сам —
+    субагент), сам снимок уходит окну и дальше креслу (executor_run
+    --access-json): перечитывание файла там давало бы права, не
+    совпадающие с записью close (codex). Читается из главного checkout,
+    не из worktree."""
+    if str(CHOIR) not in sys.path:
+        sys.path.insert(0, str(CHOIR))
+    import access                                        # noqa: PLC0415
+    return access.load(project)
+
+
+def _chair_note(acc) -> str:
+    """Строка задания: что креслу открыто сверх worktree — и чтение, и
+    запись (правило 8.5: bind без слова голос не найдёт)."""
+    import access                                        # noqa: PLC0415
+    n = access.notice(acc, chair=True).strip()
+    return ("\n\n" + n) if n else ""
+
+
+def _with_add_dir(voice: str, cmd: list[str], rw: list[str]) -> list[str]:
+    """rw-каталоги — рабочими каталогами CLI: у claude `--add-dir`
+    сразу за `-p` (variadic, следующий токен — флаг), у kimi — перед
+    `-p` (как в комнате). Без этого клетка запись разрешает, а CLI в
+    -p режиме отказывает сам, и обещание в задании — ложь (субагент)."""
+    if not rw or voice not in ("claude", "kimi"):
+        return cmd
+    i = cmd.index("-p")
+    at = i + 1 if voice == "claude" else i
+    return [*cmd[:at], "--add-dir", *rw, *cmd[at:]]
+
+
+def _access_snapshot(acc) -> dict:
+    import access                                        # noqa: PLC0415
+    return access.snapshot(acc)
+
+
 def codex_roots(common: str, act: str, gitdir: str = "") -> list[str]:
     """Куда Кодексу в кресле можно писать помимо worktree: свой gitdir
     (HEAD, index, logs), объекты и ТОЛЬКО ветки act/ с их reflog. Не весь
@@ -491,9 +531,13 @@ def open_edit(project: Path, task: str, voice: str,
 
     try:
         gitdir, _e = _git(wt, "rev-parse", "--absolute-git-dir")
-        cmd = EDIT_VOICES[voice](
-            (CODEX_CHAIR_NOTE + task) if voice == "codex" else task,
-            codex_roots(base_git.strip(), act, (gitdir or "").strip()))
+        acc = _chair_access(project)
+        rw_extra = list(acc.rw)
+        cmd = _with_add_dir(voice, EDIT_VOICES[voice](
+            ((CODEX_CHAIR_NOTE + task) if voice == "codex" else task)
+            + _chair_note(acc),
+            [*codex_roots(base_git.strip(), act, (gitdir or "").strip()),
+             *rw_extra]), rw_extra)
     except (ValueError, OSError) as e:
         # argv не собрался (кривое имя модели, диск под патч dsh) — до
         # интента; worktree уже есть, и без отката он остался бы сиротой.
@@ -516,14 +560,17 @@ def open_edit(project: Path, task: str, voice: str,
              files=sorted(files) if files else None,
              # Команда — в ленту: через месяц «что именно запускали» не
              # восстановить из памяти окна (правило 8.5).
-             cmd=" ".join(shlex.quote(c) for c in cmd))
+             cmd=" ".join(shlex.quote(c) for c in cmd),
+             # Снимок ACCESS.txt на открытии: ревизия сверит с файлом
+             # главного checkout и назовёт подмену между ними.
+             access_sha=acc.sha or "", access_rw=list(acc.rw) or None)
     except Exception as e:               # noqa: BLE001
         _undo()
         raise EditRefused(f"интент не записался в ленту ({e}) — "
                           f"акт не открыт, дерево убрано") from e
     return {"act": act, "epoch": epoch, "worktree": wt,
             "base_sha": base_sha, "voice": voice, "cmd": cmd,
-            "project": project}
+            "project": project, "access": _access_snapshot(acc)}
 
 
 # ── Вердикт и читатель маркеров ──────────────────────────────────────
@@ -658,9 +705,13 @@ def continue_edit(project: Path, act: str, text: str,
                           f"{opn.get('epoch')} — продолжение не различимо")
     try:
         gitdir, _e = _git(wt, "rev-parse", "--absolute-git-dir")
-        cmd = EDIT_VOICES[voice](
-            (CODEX_CHAIR_NOTE + prompt) if voice == "codex" else prompt,
-            codex_roots(base_git.strip(), act, (gitdir or "").strip()))
+        acc = _chair_access(project)
+        rw_extra = list(acc.rw)
+        cmd = _with_add_dir(voice, EDIT_VOICES[voice](
+            ((CODEX_CHAIR_NOTE + prompt) if voice == "codex" else prompt)
+            + _chair_note(acc),
+            [*codex_roots(base_git.strip(), act, (gitdir or "").strip()),
+             *rw_extra]), rw_extra)
     except (ValueError, OSError) as e:
         raise EditRefused(f"argv исполнителя не собрался: {e}")
     # В ленту — ИСХОДНОЕ задание и слова Автора, не собранный промпт:
@@ -674,9 +725,11 @@ def continue_edit(project: Path, act: str, text: str,
               worktree=str(wt), task=(opn.get("task") or ""),
               files=opn.get("files") or None,
               continues=opn.get("id"), head_before=head, author_text=text,
-              reviews_in_prompt=len(notes), prompt_chars=len(prompt))
+              reviews_in_prompt=len(notes), prompt_chars=len(prompt),
+              access_sha=acc.sha or "", access_rw=list(acc.rw) or None)
     return {"act": act, "epoch": epoch, "worktree": wt, "cmd": cmd,
             "project": project, "base_sha": base_sha, "event": ev,
+            "access": _access_snapshot(acc),
             "voice": voice}
 
 

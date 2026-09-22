@@ -43,7 +43,7 @@ if ss -ltn 2>/dev/null | grep -q ":$PORT "; then
   echo "порт $PORT занят: $(ss -ltnp | grep ":$PORT ") — задайте RT_HTTP_TEST_PORT"; exit 2
 fi
 ( cd "$RT_DIR" && ROUNDTABLE_CHAMBER="$W/chamber" ROUNDTABLE_JOURNAL="$W/journal" CHOIR_RT_VOICES="$W/rt-voices.json" CHOIR_RT_ACTS="$W/acts" CHOIR_LEASE_DIR="$W/leases" CHOIR_RT_NO_AUTOREVIEW=1 CHOIR_RT_WINDOWS="$W/windows" CHOIR_RT_LAST_RUN="$W/rt-last.json" \
-  CHOIR_RT_MODELS="$W/rt-models.json" CHOIR_RT_NO_DISCOVERY=1 CHOIR_DSH_PATCH_DIR="$W/dshp" \
+  CHOIR_RT_MODELS="$W/rt-models.json" CHOIR_RT_NO_DISCOVERY=1 CHOIR_DSH_PATCH_DIR="$W/dshp" CHOIR_RT_NO_BWRAP=1 \
   CHOIR_WT_DIR="$W/wt" ROUNDTABLE_PORT="$PORT" nohup python3 roundtable.py --no-project \
   > "$W/srv.log" 2>&1 ) &
 for _ in $(seq 1 40); do sleep 0.25; curl -s -o /dev/null "$B/state" && break; done
@@ -78,6 +78,20 @@ assert "codex/rounds/effort" in log and "kimi/exec/effort" in log and "gemini/ex
 EOF
 
 [ "$(code /voices '{"voice":"kimi","scope":"exec","effort":"high"}')" = 400 ] && pass "exec kimi effort → 400 (рычага нет)" || fail "exec kimi effort"
+# память нити из ленты: только deepseek (без сессии), только комната, отдельным запросом
+[ "$(code /voices '{"voice":"deepseek","scope":"room","memory":false}')" = 200 ] && pass "memory deepseek room → 200" || fail "memory deepseek"
+[ "$(code /voices '{"voice":"claude","scope":"room","memory":false}')" = 400 ] && pass "memory claude → 400 (сессия есть)" || fail "memory claude"
+[ "$(code /voices '{"voice":"deepseek","scope":"rounds","memory":true}')" = 400 ] && pass "memory rounds → 400 (только комната)" || fail "memory rounds"
+[ "$(code /voices '{"voice":"deepseek","scope":"room","memory":true,"model":"deepseek-v4-pro"}')" = 400 ] && pass "memory вместе с model → 400" || fail "memory+model"
+curl -s "$B/voices" | python3 -c '
+import json,sys; d=json.load(sys.stdin)
+v={x["name"]:x for x in d["voices"]}
+assert v["deepseek"]["tabs"]["room"]["memory"] is False and v["deepseek"]["tabs"]["room"]["can_memory"], v["deepseek"]["tabs"]["room"]
+assert "can_memory" not in v["claude"]["tabs"]["room"]
+' && pass "GET /voices: memory=false после выключения, can_memory только у deepseek" || fail "GET /voices memory"
+grep -q '"memory": false' "$W/rt-voices.json" && pass "memory сохранена в rt-voices.json (room)" || fail "memory не в файле"
+grep -q 'память нити ВЫКЛЮЧЕНА' "$W/journal/live.jsonl" && pass "voice_config в ленте о памяти" || fail "voice_config memory"
+post /voices '{"voice":"deepseek","scope":"room","memory":true}' >/dev/null
 [ "$(code /voices '{"voice":"deepseek","scope":"exec","effort":"max"}')" = 400 ] && pass "exec dsh effort → 400" || fail "exec dsh effort"
 [ "$(code /voices '{"voice":"claude","scope":"exec","effort":"max"}')" = 200 ] && pass "exec claude effort → 200 (новый рычаг)" || fail "exec claude effort"
 [ "$(code /voices '{"voice":"grok","scope":"exec","model":"grok-4.5"}')" = 200 ] && pass "exec grok model → 200 (новый рычаг)" || fail "exec grok model"
@@ -160,7 +174,7 @@ mkdir -p "$W/proj2" && git -C "$W/proj2" init -q
 # «Развить тему»: свод родителя — в вопрос дословно, parent — полем события
 cat >> "$W/journal/room.jsonl" <<'ROOM'
 {"id":"b1","ts":"2026-09-03T11:00:00+00:00","round":"t3","phase":"pick","voice":"choir","role":"lot","text":"grok","conductor":"grok","candidates":["claude","grok"]}
-{"id":"b2","ts":"2026-09-03T11:00:05+00:00","round":"t3","phase":"summary","voice":"grok","role":"summary","status":"ok","text":"# Свод t3\n\n**Нерешено.** Спор о ширине колонки.  \n\n"}
+{"id":"b2","ts":"2026-09-03T11:00:05+00:00","round":"t3","phase":"summary","voice":"grok","role":"summary","status":"ok","text":"# Свод t3\n\n**Нерешено.** Спор о ширине колонки.  \n\n","coverage":{"phases":[{"phase":"blind","called":["claude","grok"],"ok":["grok"],"pass":[],"fell":{"claude":{"status":"error","detail":"упал"}},"stubs":{},"flags":{}}],"debts":["claude (blind, error)"]}}
 {"id":"b3","ts":"2026-09-03T11:00:06+00:00","round":"t4","phase":"summary","voice":"grok","role":"summary","status":"error","text":""}
 ROOM
 [ "$(code /round '{"question":"а если колонку убрать?","name":"t3-2","parent":"t3","voices":["claude","grok"]}')" = 200 ] && pass "/round parent: развитие раунда со сводом → 200" || fail "/round parent 200"
@@ -176,6 +190,16 @@ grep -q '"parent": "t3"' "$W/journal/live.jsonl" && grep -q 'развитие «
 [ "$(code /round '{"question":"q","name":"t3","parent":"t3","voices":["claude","grok"]}')" = 400 ] && pass "/round parent: то же имя → 400" || fail "/round parent same"
 [ "$(code /round '{"question":"q","name":"bad-2","parent":"../t3","voices":["claude","grok"]}')" = 400 ] && [ ! -e "$W/journal/rounds/RoundTable/QUESTION-bad-2.md" ] && [ ! -e "$W/journal/rounds/RoundTable/QUESTION-t3.md" ] && pass "/round parent: кривое имя родителя → 400, файлов нет (и для same-name)" || fail "/round parent bad name"
 grep -q "КОНЕЦ СВОДА раунда «t3»" "$QF" && pass "/round parent: свод ограждён с конца (инъекция из свода не сливается с концом вопроса)" || fail "/round parent: нет ограды"
+grep -q "^> Карта покрытия (по журналу): слепая фаза — звали 2, ответили 1, упали: claude (error); долги: claude (blind, error). Свод писал grok.$" "$QF" && pass "/round parent: шапка покрытия родителя из журнала — перед сводом" || fail "/round parent: шапки покрытия нет: $(grep -n Карта "$QF")"
+curl -s "$B/round_view?name=t3" | python3 -c '
+import json,sys; d=json.load(sys.stdin)
+assert d["summary_head"].startswith("> Карта покрытия (по журналу): слепая фаза — звали 2, ответили 1"), d["summary_head"]
+assert d["summary"]["coverage"]["debts"]==["claude (blind, error)"], d["summary"]
+' && pass "/round_view: summary_head из coverage свода, поле coverage не срезано slim" || fail "/round_view summary_head"
+curl -s "$B/round_view?name=t1" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["summary_head"] is None' && pass "/round_view: без свода summary_head=null" || fail "/round_view t1 summary_head"
+curl -s "$B/round_view?name=t1" | python3 -c '
+import json,sys; d=json.load(sys.stdin)
+assert d["coverage_now"].startswith("> Карта покрытия (по журналу): слепая фаза — звали 2, ответили 2") and "Свод писал" not in d["coverage_now"], d["coverage_now"]' && pass "/round_view: coverage_now считается до свода по записям раунда" || fail "/round_view coverage_now"
 [ ! -e "$W/journal/rounds/RoundTable/QUESTION-t4-2.md" ] && [ ! -e "$W/journal/rounds/RoundTable/QUESTION-n-2.md" ] && pass "/round parent: отказ до записи файла вопроса" || fail "/round parent: файл при отказе"
 R="$(post /round "{\"question\":\"q\",\"name\":\"pj2\",\"project\":\"$W/proj2\"}")"
 echo "$R" | grep -q '"act"' && pass "/round с проектом → 200" || fail "/round с проектом: $R"
@@ -371,6 +395,73 @@ assert me and me[0]["pid"]==d["self"] and me[0].get("port"), d' && pass "/window
 [ "$(code /windows/stop "{\"pid\": $(curl -s "$B/windows" | python3 -c 'import json,sys; print(json.load(sys.stdin)["self"])')}")" = 400 ] && pass "/windows/stop: своё окно — отказ" || fail "/windows/stop self"
 [ "$(code /windows/stop '{"pid": 1}')" = 400 ] && pass "/windows/stop: чужой pid — отказ" || fail "/windows/stop pid 1"
 [ "$(code /windows/stop '{"pid": "x"}')" = 400 ] && pass "/windows/stop: кривой pid → 400" || fail "/windows/stop bad"
+
+
+# ── /access: ACCESS.txt проекта из окна (наказ Автора 2026-09-20) ──
+# Окно без проекта: каталог берётся из поля; отказы поимённо; файл
+# пишется целиком; событие access в ленте; клетка и пакет читают тот же
+# разбор (access_test.py) — здесь контракт HTTP.
+mkdir -p "$W/aproj" "$W/adata" "$W/adata2"
+[ "$(curl -s -o /dev/null -w '%{http_code}' "$B/access")" = 400 ] && pass "/access без проекта и без поля → 400" || fail "/access без проекта"
+curl -s "$B/access?project=$W/aproj" | python3 -c '
+import json,sys; d=json.load(sys.stdin)
+assert d["exists"] is False and d["ro"]==[] and d["rw"]==[] and d["text"]=="" and d["sha"] is None, d' && pass "GET /access: проект без файла — пусто, exists=false" || fail "GET /access пустой"
+[ "$(code /access "{\"project\":\"$W/aproj\",\"text\":5}")" = 400 ] && pass "POST /access: text не строка → 400" || fail "/access text int"
+[ "$(code /access "{\"project\":\"$W/nope-dir\",\"text\":\"\"}")" = 400 ] && pass "POST /access: нет такого каталога → 400" || fail "/access nope dir"
+python3 -c "print('{\"project\":\"$W/aproj\",\"text\":\"' + 'r /tmp\\\\n'*700 + '\"}')" > "$W/big.json"
+[ "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$B/access" -H 'Content-Type: application/json' --data-binary @"$W/big.json")" = 400 ] && pass "POST /access: больше 4000 символов → 400" || fail "/access big"
+post /access "{\"project\":\"$W/aproj\",\"text\":\"# k\\nr $W/adata\\nrw $W/adata2\\nr /nope-$$\\nrw $HOME\\nr $W/aproj\"}" > "$W/acc.json"
+python3 - "$W/acc.json" "$W/aproj/ACCESS.txt" "$W/adata" "$W/adata2" <<'PY' && pass "POST /access: файл записан целиком, ro/rw разобраны, три отказа поимённо, событие есть" || fail "POST /access: $(cat "$W/acc.json")"
+import json,sys
+d=json.load(open(sys.argv[1])); txt=open(sys.argv[2],encoding="utf-8").read()
+assert d["exists"] and d["ro"]==[sys.argv[3]] and d["rw"]==[sys.argv[4]], d
+assert len(d["rejects"])==3 and all(r.startswith("строка ") for r in d["rejects"]), d["rejects"]
+assert any("не существует" in r for r in d["rejects"]) and any("дом" in r for r in d["rejects"]) and any("открыт и так" in r for r in d["rejects"]), d["rejects"]
+assert txt.startswith("# k\n") and "r /nope-" in txt and txt.endswith("\n"), repr(txt)   # отвергнутое остаётся в файле, как написал Автор
+assert d["text"]==txt and isinstance(d["event"], int) and d["sha"] and len(d["sha"])==16, d
+PY
+python3 - "$W/journal/live.jsonl" "$W/aproj" <<'PY' && pass "событие access в ленте: проект, ro/rw, отвергнутые, access_sha, by=arr" || fail "событие access в ленте"
+import json,sys
+evs=[json.loads(l) for l in open(sys.argv[1],encoding="utf-8") if l.strip()]
+a=[e for e in evs if e.get("kind")=="access"]
+assert a, "нет события access"
+e=a[-1]; assert e["project"]==sys.argv[2] and len(e["ro"])==1 and len(e["rw"])==1 and len(e["rejects"])==3 and e["access_sha"] and e.get("by")=="arr", e
+assert "отвергнуто строк: 3 — строка " in e["text"] and "не существует" in e["text"] and "rw " in e["text"], e["text"]
+PY
+curl -s "$B/access?project=$W/aproj" | python3 -c '
+import json,sys; d=json.load(sys.stdin); t=open(sys.argv[1],encoding="utf-8").read()
+assert d["exists"] and d["text"]==t and len(d["rejects"])==3, d' "$W/aproj/ACCESS.txt" && pass "GET /access после записи: тот же текст и тот же разбор" || fail "GET /access после POST"
+post /access "{\"project\":\"$W/aproj\",\"text\":\"\"}" | python3 -c '
+import json,sys; d=json.load(sys.stdin); assert d["exists"] and d["ro"]==[] and d["text"]=="", d' && pass "POST /access пустым текстом: файл пуст, доступа нет, файл остаётся" || fail "/access пустой текст"
+printf 'control' > "$W/adata/ctrl.txt"; rm -f "$W/aproj/ACCESS.txt"; ln "$W/adata/ctrl.txt" "$W/aproj/ACCESS.txt"
+post /access "{\"project\":\"$W/aproj\",\"text\":\"r $W/adata\"}" > /dev/null
+[ "$(cat "$W/adata/ctrl.txt")" = control ] && pass "POST /access на жёсткую ссылку: чужой inode не тронут (replace, не write)" || fail "запись ушла в жёсткую ссылку: $(cat "$W/adata/ctrl.txt")"
+[ -z "$(ls -A "$W/aproj" | grep -v '^ACCESS.txt$')" ] && pass "после записи в каталоге проекта нет временных файлов" || fail "остатки в проекте: $(ls -A "$W/aproj")"
+# Много отказов: текст события режется с многоточием, поле rejects полное (grok, субагент 22.09)
+python3 - "$W/aproj" > "$W/many.json" <<'PY'
+import json,sys
+print(json.dumps({"project": sys.argv[1], "text": "\n".join("r /nope-%d-%s" % (i, "x"*40) for i in range(20))}))
+PY
+curl -s -X POST "$B/access" -H 'Content-Type: application/json' --data-binary @"$W/many.json" > "$W/many.out"
+python3 - "$W/many.out" "$W/journal/live.jsonl" <<'PY' && pass "POST /access: 20 отказов — ответ несёт все 20, текст события обрезан с «…»" || fail "обрезка отказов: $(head -c 300 "$W/many.out")"
+import json,sys
+d=json.load(open(sys.argv[1])); assert len(d["rejects"])==20, len(d["rejects"])
+evs=[json.loads(l) for l in open(sys.argv[2],encoding="utf-8") if l.strip()]
+e=[x for x in evs if x.get("kind")=="access"][-1]
+assert len(e["rejects"])==20 and e["text"].endswith("…") and len(e["text"]) < 800, (len(e["rejects"]), e["text"][-40:], len(e["text"]))
+PY
+# Синтаксис JS страницы: PAGE — raw-строка, ошибка в скрипте иначе всплыла бы только в браузере (субагент)
+if command -v node >/dev/null 2>&1; then
+python3 - "$RT_DIR/roundtable.py" "$W/page.js" <<'PY' && node --check "$W/page.js" 2>/dev/null && pass "JS страницы окна синтаксически цел (node --check)" || fail "JS страницы: $(node --check "$W/page.js" 2>&1 | tail -3)"
+import re,sys
+src=open(sys.argv[1],encoding="utf-8").read(); i=src.index('PAGE = r"""')+len('PAGE = r"""'); j=src.index('"""',i)
+open(sys.argv[2],"w",encoding="utf-8").write("\n".join(re.findall(r"<script>(.*?)</script>", src[i:j], re.S)))
+PY
+fi
+rm -f "$W/aproj/ACCESS.txt"; ln -s "$W/adata/x.txt" "$W/aproj/ACCESS.txt"
+[ "$(code /access "{\"project\":\"$W/aproj\",\"text\":\"r $W/adata\"}")" = 409 ] && pass "POST /access: ACCESS.txt-ссылка → 409, по ссылке не пишем" || fail "/access symlink"
+[ ! -e "$W/adata/x.txt" ] && pass "по ссылке ничего не записано" || fail "запись ушла по ссылке"
+rm -f "$W/aproj/ACCESS.txt"
 
 cat "$W/srv2.log" 2>/dev/null >> "$W/srv.log"   # трейсбеки второго окна — в ту же проверку (ревьюер)
 grep -q "Traceback" "$W/srv.log" && fail "в логе сервера трейсбек: $(grep -A3 Traceback "$W/srv.log" | head -5)" || pass "трейсбеков в логе сервера нет"

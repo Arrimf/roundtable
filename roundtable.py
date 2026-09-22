@@ -30,6 +30,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import fcntl
 import hashlib
 import html
@@ -42,6 +43,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -153,11 +155,11 @@ def scaffold_project(project: Path, *, force: bool = False) -> None:
     # .git — не содержимое: «git init» в новом каталоге — обычный первый
     # шаг, каркас после него всё ещё нужен (ревизия: gemini, deepseek, grok)
     entries = [q for q in project.iterdir()
-               if q.name not in (".roundtable", "PROJECT.md", ".git")]
+               if q.name not in (".roundtable", "PROJECT.md", access.FILE, ".git")]
     if entries and not force:
         if not (project / "PROJECT.md").exists():
             print(f"каталог {project} не пуст — каркас проекта не создан; "
-                  f"roundtable --init-project создаст .roundtable и PROJECT.md",
+                  f"roundtable --init-project создаст .roundtable, PROJECT.md и {access.FILE}",
                   file=sys.stderr)
         return
     link = project / ".roundtable"
@@ -196,6 +198,19 @@ def scaffold_project(project: Path, *, force: bool = False) -> None:
                   f"он уйдёт в пакет всем голосам")
         except FileExistsError:
             pass
+    # ACCESS.txt — тоже каркас (наказ Автора 2026-09-20): пустой шаблон с
+    # правилами записи; без него голоса видят только сам проект.
+    acc_f = project / access.FILE
+    if acc_f.is_symlink():
+        print(f"⚠ {acc_f} — ссылка, а не файл: не трогаю", file=sys.stderr)
+    elif not acc_f.exists():
+        try:
+            with open(acc_f, "x", encoding="utf-8") as fh:
+                fh.write(access.TEMPLATE)
+            print(f"проект {project.name}: создан {access.FILE} — что открыть "
+                  f"голосам сверх проекта (r/rw)")
+        except FileExistsError:
+            pass
 
 
 def project_risk(path: str) -> str | None:
@@ -222,6 +237,8 @@ sys.path.insert(0, str(CHOIR))
 import live  # noqa: E402
 import names as fnames                         # noqa: E402  имена файлов раундов латиницей (alias: в do_POST есть локальная names)
 import canary                                  # noqa: E402  канарейки прав (обещания 1 и 2)
+import access                                  # noqa: E402  ACCESS.txt проекта: доступ голосов вне проекта
+import coverage as cover                       # noqa: E402  карта покрытия свода: та же арифметика, что у дирижёра
 import early                                   # noqa: E402  ранние отказы: снятие голоса по кнопке
 
 VOICES = list(live.VOICES)
@@ -430,6 +447,63 @@ def _last_goal() -> str:
     return goal
 
 
+def _debts_open_safe() -> list:
+    """Открытые долги ответов по choir.py; дирижёр не импортировался —
+    пустой список, карта честно покажет «долгов нет» по тому, что видит."""
+    try:
+        return choir._debts_open() if CHOIR_OK else []
+    except Exception as e:                       # noqa: BLE001
+        print(f"долги не прочитаны: {e}", file=sys.stderr)
+        return []
+
+
+def _access_project(raw) -> tuple:
+    """Каталог проекта для /access: поле окна, иначе проект окна.
+    Относительный — от корня песочницы, как у /round."""
+    s = str(raw or "").strip() or str(PROJECT or "")
+    if not s:
+        return None, "нужен проект: поле «Проект» пусто"
+    p = Path(s).expanduser()
+    if not p.is_absolute():
+        p = SANDBOX / p
+    p = p.resolve()
+    if not p.is_dir():
+        return None, f"нет такого каталога: {p}"
+    return p, None
+
+
+def _cut(s: str, n: int) -> str:
+    """Обрезка с многоточием: молчаливый срез хвоста причин в ленте
+    прочитался бы как полный список (grok, ревизия 22.09)."""
+    return s if len(s) <= n else s[:n - 1] + "…"
+
+
+def _bwrap_alive() -> bool:
+    """Жив ли хоть один bwrap этого пользователя — значит чей-то голос
+    сейчас в клетке (любое окно, раунд, ревизия). pgrep -x по имени
+    процесса, не -f: -f ловил бы собственную оболочку. Окно без клетки
+    (CHOIR_RT_NO_BWRAP=1: стенды тестов, машины без bwrap) сторожить не
+    может и не должно: его голоса и так вне клетки, а чужой bwrap на той
+    же машине ронял бы тесты (voices_http 22.09)."""
+    if os.environ.get("CHOIR_RT_NO_BWRAP") == "1":
+        return False
+    try:
+        r = subprocess.run(["pgrep", "-u", str(os.getuid()), "-x", "bwrap"],
+                           capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return False                    # pgrep нет — проверка честно молчит
+    return r.returncode == 0
+
+
+def _access_view(rp: Path) -> dict:
+    """Разбор ACCESS.txt теми же проверками, что у комнаты (сокрытия
+    live._hide_dirs): окно показывает ровно то, что получит голос."""
+    acc = access.load(rp, hide=live._hide_dirs())
+    return {"project": str(rp), "file": acc.file, "exists": acc.file is not None,
+            "text": acc.text, "ro": acc.ro, "rw": acc.rw,
+            "rejects": acc.rejects, "sha": acc.sha}
+
+
 def round_view(name: str) -> dict:
     """Карточка раунда из room.jsonl: жребий, затравка, слепые ответы,
     витки, свод — дословно, как записано (правило 3), плюс счётчики
@@ -478,7 +552,8 @@ def round_view(name: str) -> dict:
                                       "recovered", "error", "detail", "eyes",
                                       "visibility", "late", "nonblind",
                                       "channel", "role_declared",
-                                      "ended_by", "early_warns")
+                                      "ended_by", "early_warns",
+                                      "coverage")            # карта покрытия свода — полем
                 if r.get(k) is not None}
     ok = ("ok", "pass")
     # Витки считаются, как у cmd_rebut: только ok/pass — виток, где все
@@ -502,6 +577,16 @@ def round_view(name: str) -> dict:
             "rebuts": len(rebut_rounds),
             "rebut_cap": cap,
             "rebut_records": [slim(r) for r in rebuts],
+            # Шапка из журнала: окно и «Развить тему» обязаны показывать
+            # состав, иначе «все ответили» сводчика — первое, что видит
+            # человек (ревизия 22.09: codex, grok, kimi).
+            "summary_head": (cover.head(last_sum["coverage"], last_sum.get("voice"))
+                             if last_sum and isinstance(last_sum.get("coverage"), dict)
+                             else None),
+            # Карта СЕЙЧАС — по всем записям раунда, до всякого свода (Автор
+            # 22.09: «карту покрытия я увижу только после раунда?»). Та же
+            # арифметика, что у сводчика; долги — из журнала долгов.
+            "coverage_now": cover.head(cover.compute(recs, _debts_open_safe(), round_id=name), None),
             "summary": (slim(last_sum) if last_sum else None),
             "summary_ok": bool(last_sum and last_sum.get("status") == "ok"),
             "n_records": len(recs)}
@@ -1554,6 +1639,9 @@ CFG_FILE = Path(os.environ.get("CHOIR_RT_VOICES")
 # галочка пула random (наказ Автора 2026-09-01: «те же агенты со своими
 # моделями и усилиями — чтобы можно было выбирать»).
 SCOPES = ("room", "rounds", "exec")
+# Голоса без сессии CLI: память нити им собирает комната из ленты
+# (live.memory_on); галочка «память» в строке голоса, область room.
+MEMORY_VOICES = frozenset(n for n, v in live.VOICES.items() if v.get("no_session"))
 
 
 def _load_voice_cfg() -> None:
@@ -1596,12 +1684,17 @@ def _load_voice_cfg() -> None:
         ctl = VOICE_CTL.get(name) or {}
         for sc in list(ent):
             keys = ("model", "effort", "pool") if sc == "exec" \
+                else ("model", "effort", "memory") if sc == "room" \
                 else ("model", "effort")
             pair = {k: ent[sc][k] for k in keys
                     if k in ent[sc]}          # белый список ключей
             if "pool" in pair and not isinstance(pair["pool"], bool):
                 drop(name, sc, "pool", "не bool")
                 pair.pop("pool", None)
+            if "memory" in pair and (not isinstance(pair["memory"], bool)
+                                     or name not in MEMORY_VOICES):
+                drop(name, sc, "memory", "не bool или у голоса есть сессия")
+                pair.pop("memory", None)
             for what, why in _pair_problems(name, sc, pair):
                 drop(name, sc, what, why)
                 pair.pop(what, None)
@@ -1755,6 +1848,8 @@ def _spawn_env(voices: list[str]) -> dict:
             cfg = VOICE_CFG.get(name) or {}
             ctl = VOICE_CTL.get(name) or {}
             room = cfg.get("room") or {}
+            if name in MEMORY_VOICES:
+                env[f"CHOIR_{name.upper()}_MEMORY"] = "0" if room.get("memory") is False else "1"
             if room.get("model") and ctl.get("model_env"):
                 env[ctl["model_env"]] = room["model"]
             if room.get("effort") and ctl.get("effort_env"):
@@ -2077,6 +2172,9 @@ def voice_report(name: str, limit: dict) -> dict:
                             else "ступени не объявлены — рычаг есть, "
                                  "списка нет"),
              "efforts": ladder}
+        if sc == "room" and name in MEMORY_VOICES:
+            t.update(memory=set_.get("memory", True) is not False, can_memory=True,
+                     memory_cap=live.MEMORY_CAP)
         if sc == "exec":
             t.update(pool=set_.get("pool", name not in edits.EDIT_COSTLY),
                      costly=name in edits.EDIT_COSTLY,
@@ -3471,6 +3569,14 @@ class Handler(BaseHTTPRequestHandler):
                              "lot": ({"commit": lot["commit"][:16],
                                       "target": lot["target"],
                                       "conductor": winner} if lot else None)})
+        elif self.path.partition("?")[0] == "/access":
+            # ACCESS.txt проекта — окну на показ: текст как есть, разбор
+            # и отвергнутые строки (те же проверки, что у комнаты).
+            qs = parse_qs(self.path.partition("?")[2])
+            rp, err = _access_project((qs.get("project") or [""])[0])
+            if err:
+                return self._json(400, {"error": err})
+            return self._json(200, _access_view(rp))
         elif self.path.partition("?")[0] == "/round_view":
             # Ответы раунда — В ОКНО (наказ Автора 2026-09-03: «ожидаю
             # увидеть полный ответ и расшифровку каждого голоса, а не
@@ -3824,6 +3930,9 @@ class Handler(BaseHTTPRequestHandler):
                             "раунда ДОСЛОВНО (правило 3); не пересказывайте "
                             "его, отталкивайтесь от него — особенно от того, "
                             "что там названо нерешённым или спорным.\n\n"
+                            # Шапка покрытия родителя — из журнала, перед сводом:
+                            # следующий раунд обязан знать, кого в своде нет.
+                            + ((pv.get("summary_head") + "\n\n") if pv.get("summary_head") else "")
                             + str(ps.get("text") or "")      # без rstrip: дословно
                             + f"\n\n--- КОНЕЦ СВОДА раунда «{parent}» ---")
             rdir = JOURNAL / "rounds" / ((rp.name or "root") if rp else "RoundTable")
@@ -4040,6 +4149,8 @@ class Handler(BaseHTTPRequestHandler):
                            / "executor_run.py"),
                        "--act", act, "--epoch", str(epoch),
                        "--worktree", str(wt), "--voice", voice,
+                       "--access-json", json.dumps(ed.get("access") or {},
+                                                   ensure_ascii=False),   # снимок ACCESS.txt акта
                        *(["--serial-gate", voice]
                          if voice in edits.EDIT_GATES else []),
                        "--cmd-json",
@@ -4467,6 +4578,30 @@ class Handler(BaseHTTPRequestHandler):
                 # VOICE_CFG (нашёл gemini).
                 return self._json(400, {"error": "нет такого голоса: "
                                         + (name or "(пусто)")})
+            if "memory" in req:
+                # Память нити из ленты — только область room и только
+                # голосу без сессии; отдельным запросом, как pool
+                if vscope != "room" or name not in MEMORY_VOICES:
+                    return self._json(400, {"error": "память из ленты: только "
+                                            "комната и голос без сессии CLI "
+                                            f"({', '.join(sorted(MEMORY_VOICES))})"})
+                if not isinstance(req["memory"], bool):
+                    return self._json(400, {"error": "memory — bool"})
+                if req.get("model") or req.get("effort") or "model" in req or "effort" in req:
+                    return self._json(400, {"error": "memory — отдельным запросом"})
+                with CFG_LOCK:
+                    ent = VOICE_CFG.setdefault(name, {})
+                    pair = dict(ent.get("room") or {})
+                    pair["memory"] = req["memory"]
+                    ent["room"] = pair
+                    _save_voice_cfg(name, "room")
+                ev = feed_append(
+                    "voice_config",
+                    f"голос {name} [комната]: память нити "
+                    + ("собирается из ленты (вся нить каждый ход)" if req["memory"]
+                       else "ВЫКЛЮЧЕНА — только дельта с курсора"),
+                    voice=name, cfg_scope="room", memory=req["memory"], by="arr")
+                return self._json(200, {"ok": True, "event": ev["id"]})
             if vscope == "exec":
                 # Вкладка coder: pool-галочка и пара кресла. gemini
                 # кресла не имеет — отказ по существу, не по форме.
@@ -4822,6 +4957,75 @@ class Handler(BaseHTTPRequestHandler):
             feed_append("note", f"окно pid {pid} остановлено из монитора окон")
             return self._json(200, {"stopped": pid, "note": msg})
 
+        if self.path == "/access":
+            # Поле доступа окна (наказ Автора 2026-09-20): пишет
+            # <проект>/ACCESS.txt целиком — это настройка проекта, не
+            # журнал; след — событием access в ленте (что открыто, что
+            # отвергнуто, sha), чтобы через месяц было видно, с каким
+            # доступом шли раунды. Отвергнутые строки остаются в файле
+            # как есть — Автор видит их в ответе и в стенограммах, а в
+            # клетку и в пакет они не попадают (access.py).
+            if not isinstance(req.get("text"), str):
+                return self._json(400, {"error": "text — строка"})
+            text = req["text"]
+            if len(text) > 4000:
+                return self._json(400, {"error": "ACCESS.txt — до 4000 символов"})
+            rp, err = _access_project(req.get("project"))
+            if err or not rp:
+                return self._json(400, {"error": err or "нужен проект"})
+            # ЗАЩИТА ОТ ГОЛОСА В КЛЕТКЕ. У POST окна нет токена (долг), а
+            # сеть клетка не режет: голос мог бы выписать себе rw на
+            # следующий акт (ревизия 20.09: codex, субагент). Голос живёт
+            # ТОЛЬКО внутри акта — поэтому права меняются только в
+            # тишине: ни одного акта этого окна и ни одного живого bwrap
+            # пользователя (голос другого окна). Остаток: кресло Кодекса
+            # чужого окна идёт без bwrap — закрывается токеном POST.
+            with RUN_LOCK:
+                busy = [t["label"] for t in RUNNING.values()]
+            if busy:
+                return self._json(409, {"error": "идёт акт (" + "; ".join(busy)[:200]
+                                        + ") — доступ меняется только в тишине: голос в "
+                                        "клетке не должен менять права себе"})
+            if _bwrap_alive():
+                return self._json(409, {"error": "жив процесс bwrap — чей-то голос ещё в "
+                                        "клетке; повторите, когда акты закончатся"})
+            f = rp / access.FILE
+            if f.is_symlink():
+                return self._json(409, {"error": f"{f} — ссылка, не файл: не пишу"})
+            body = text if (not text or text.endswith("\n")) else text + "\n"
+            # Атомарно: tmp + replace. Параллельный load из хода/раунда не
+            # увидит половины файла (усечённый префикс — другой допустимый
+            # путь; kimi), а replace меняет запись каталога, не inode —
+            # запись не уйдёт ни по ссылке, ни в жёсткую ссылку на чужой
+            # файл (TOCTOU между is_symlink и write — codex, субагент).
+            try:
+                fd, tmp = tempfile.mkstemp(prefix=".ACCESS.", suffix=".tmp", dir=str(rp))
+                try:
+                    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                        fh.write(body)
+                    os.chmod(tmp, 0o644)
+                    os.replace(tmp, f)
+                except BaseException:
+                    with contextlib.suppress(OSError):
+                        os.unlink(tmp)
+                    raise
+            except OSError as e:
+                return self._json(500, {"error": f"{f}: {e}"})
+            view = _access_view(rp)
+            items = [f"r {p}" for p in view["ro"]] + [f"rw {p}" for p in view["rw"]]
+            ev = feed_append(
+                "access",
+                f"доступ голосов ({rp.name}): " + (", ".join(items) or "записей нет")
+                + (f"; отвергнуто строк: {len(view['rejects'])} — "
+                   + _cut("; ".join(view["rejects"]), 600) if view["rejects"] else ""),
+                project=str(rp), ro=view["ro"], rw=view["rw"],
+                rejects=view["rejects"], access_sha=view["sha"], by="arr",
+                # Автор не аутентифицирован (долг токена): адрес и агент
+                # запроса — хотя бы след, по которому подмену видно.
+                client=str(self.client_address[0]),
+                ua=str(self.headers.get("User-Agent") or "")[:80])
+            return self._json(200, {**view, "event": ev["id"]})
+
         if self.path == "/goal":
             # Цель целеполагателя — событием в ленту (append-only): её
             # читают live.py (первый ход) и choir.py (пакет раунда).
@@ -4997,6 +5201,7 @@ white-space:nowrap}
    2026-08-31: «при смене комнаты съезжает вёрстка»). Теперь значение
    любой длины живёт внутри своей колонки и обрезается многоточием. */
 .vrow .cell{flex:none;width:6.6rem;display:flex;min-width:0}
+.vrow .mem{flex:none;font-size:.74rem;color:var(--dim)}.vrow .memlab{display:inline-flex;align-items:center;gap:.2rem;cursor:pointer}
 .vrow .cell>*{width:100%;min-width:0;max-width:100%;box-sizing:border-box}
 .vrow select,.vrow input.free{background:var(--bg);color:var(--ink);
 border:1px solid var(--rule);border-radius:4px;
@@ -5184,6 +5389,8 @@ margin-top:.3rem;padding-top:.3rem;max-height:9rem;overflow-y:auto}
    двух голосов читался как ветка, а не как общий поток. */
 .ev.thr{margin-left:1.4rem;border-left:2px dashed var(--rule);padding-left:.5rem}
 #goal{width:100%;box-sizing:border-box;min-height:3.2rem;font:.85rem/1.3 ui-sans-serif,system-ui,sans-serif}
+#access{width:100%;box-sizing:border-box;min-height:3.2rem;font:.8rem/1.3 ui-monospace,monospace}
+#accessnote{font-size:.8rem;opacity:.85;white-space:pre-wrap;margin:.2rem 0 .4rem}
 /* Карточка раунда под act_status: ответы голосов дословно из room.jsonl
    (наказ Автора 2026-09-03: «ожидаю увидеть полный ответ и расшифровку
    каждого голоса»). Свёрнута по умолчанию — лента не тонет в 40К символов. */
@@ -5235,6 +5442,10 @@ margin:.2rem 0 .3rem;white-space:pre-wrap;word-break:break-word}
 
   <h3>Проект (--project)</h3>
   <input id="project" value="__PROJECT_DEFAULT__" placeholder="путь к каталогу; пусто — без него" title="Каталог, который голоса получат на чтение. Подставлен тот, из которого запущено окно; очистить поле — значит спрашивать без проекта.">
+  <h3 title="ACCESS.txt в каталоге проекта: что голосам открыто сверх самого проекта. Клетка bwrap держит дом голоса пустым — без этой записи Cursor_W, код стола и любой другой каталог голосам не видны. Одна строка — одна запись: «r /путь» — чтение всем; «rw /путь» — запись креслу исполнителя, остальным чтение. Дом, состояние CLI голосов и стол на запись не выдаются — такие строки отвергаются поимённо.">Доступ голосов (ACCESS.txt)</h3>
+  <textarea id="access" placeholder="r /абсолютный/путь — чтение всем голосам&#10;rw /абсолютный/путь — запись креслу исполнителя" title="Содержимое <проект>/ACCESS.txt. Кнопка пишет файл и событие access в ленту; отвергнутые строки останутся в файле, но в клетку не попадут — их список покажется под кнопкой."></textarea>
+  <button id="accessbtn" title="Записать ACCESS.txt проекта и событие access в ленту. Действует со следующего хода, раунда, ревизии или кресла.">Записать доступ</button>
+  <div id="accessnote" hidden></div>
   <h3 title="Целеполагатель — прослойка между человеком и столом (RoundTable/CLAUDE.md): формулирует цель и критерии «готово», режет скоуп, держит цель между раундами. Сейчас это Автор. Цель уходит первым ходом каждому голосу комнаты и в пакет каждого раунда — всем одинаково; каждая смена — событие goal в ленте.">Цель (целеполагатель)</h3>
   <textarea id="goal" placeholder="цель и критерии «готово»; пусто — цель не задана" title="Текст цели, который получат все голоса: в комнате — первым ходом, в раундах — строкой пакета. Кнопка ниже пишет его событием goal в ленту; последняя запись и есть действующая цель."></textarea>
   <button id="goalbtn" title="Записать цель событием goal в ленту (append-only). Пустой текст снимает цель отдельным событием.">Задать цель</button>
@@ -5577,6 +5788,8 @@ async function loadRound(name,box){
   if(j.seed)body.appendChild(rline('затравка ('+(j.seed.voice||'')+')',j.seed));
   j.answers.forEach(function(a){body.appendChild(rline('слепой ответ',a))});
   (j.rebut_records||[]).forEach(function(a){body.appendChild(rline('виток '+(a.phase||''),a))});
+  if(j.summary_head){const h=document.createElement('div');h.className='dim';h.textContent=j.summary_head;body.appendChild(h)}
+  if(j.coverage_now){const c=document.createElement('div');c.className='dim';c.title='Состав по журналу на этот момент, без свода: звали, ответили, ПАС, упали, долги. В своде та же карта повторится шапкой.';c.textContent='сейчас: '+j.coverage_now.replace(/^> /,'');body.insertBefore(c,body.firstChild)}
   if(j.summary)body.appendChild(rline('свод ('+(j.summary.voice||'')+')',j.summary));
   // шаги по человеку — кнопка есть только там, где шаг легален
   const row=document.createElement('div');
@@ -6190,7 +6403,7 @@ function vrow(name){
   d.innerHTML='<div class="vhead">'+
     '<label class="vpick"><input type="checkbox" checked value="'+esc(name)+'">'+
     '<span class="nm">'+esc(name)+'</span></label>'+
-    '<span class="cell mdl"></span><span class="cell eff"></span></div>'+
+    '<span class="cell mdl"></span><span class="cell eff"></span><span class="mem"></span></div>'+
     '<div class="limbox"></div>'+
     '<div class="cap"><span class="capt"></span>'+
     '<span class="st" id="st-'+esc(name)+'"></span></div>'+
@@ -6449,6 +6662,49 @@ function vnote(text,isNote){
 // ⟳ модели: разведка у самих каналов, без модельных вызовов; отчёт —
 // строкой под списком, списки — перерисовкой карточек с сервера.
 document.getElementById('goal').addEventListener('input',function(){this.dataset.dirty='1'});
+// Доступ голосов (ACCESS.txt проекта, наказ Автора 2026-09-20): поле
+// читает файл проекта из поля «Проект» и пишет его кнопкой; отвергнутые
+// строки сервер называет поимённо — они видны здесь, а не в клетке.
+const accessTa=document.getElementById('access'), accessNote=document.getElementById('accessnote');
+accessTa.dataset.title0=accessTa.title;   // исходная подсказка — вернуть, когда отказов нет
+function accessShow(j){
+  const items=[].concat((j.ro||[]).map(function(p){return 'r '+p}),(j.rw||[]).map(function(p){return 'rw '+p}));
+  let s=(j.exists?('действует: '+(items.length?items.join('; '):'записей нет')):'ACCESS.txt в проекте нет — голосам открыт только сам проект');
+  if(j.rejects&&j.rejects.length)s+='\nОТВЕРГНУТО: '+j.rejects.join('\n');
+  accessNote.textContent=s; accessNote.hidden=false;
+  // Подсказка поля повторяет отказы: строка под кнопкой уезжает из вида,
+  // а наведение на поле — всегда под рукой (Автор 22.09).
+  const tip=(j.rejects&&j.rejects.length)?('ОТВЕРГНУТО (в клетку и в пакет не попадёт):\n'+j.rejects.join('\n')+'\n\nДействует: '+(items.length?items.join('; '):'записей нет')):accessTa.dataset.title0;
+  accessTa.title=tip.length>1500?tip.slice(0,1499)+'…':tip;   // подсказка не резиновая (kimi)
+}
+async function loadAccess(){
+  const project=document.getElementById('project').value.trim();
+  // Любой ранний выход возвращает исходную подсказку: иначе поле показывало
+  // бы отказы ПРЕЖНЕГО проекта (grok, ревизия 22.09).
+  accessTa.title=accessTa.dataset.title0;
+  if(!project){accessNote.textContent='проект не задан — доступ читать неоткуда';accessNote.hidden=false;return}
+  let r,j={};
+  try{r=await fetch('/access?project='+encodeURIComponent(project));j=await r.json();}
+  catch(e){accessNote.textContent='сервер не ответил: '+e;accessNote.hidden=false;return}
+  if(!r.ok){accessNote.textContent=(j&&j.error)||('ошибка '+r.status);accessNote.hidden=false;return}
+  if(!accessTa.dataset.dirty&&document.activeElement!==accessTa)accessTa.value=j.text||'';
+  accessShow(j);
+}
+accessTa.addEventListener('input',function(){this.dataset.dirty='1'});
+document.getElementById('project').addEventListener('change',function(){delete accessTa.dataset.dirty;loadAccess()});
+document.getElementById('accessbtn').onclick=async function(){
+  const project=document.getElementById('project').value.trim();
+  if(!project)return acterr('доступу нужен проект: укажите путь в поле «Проект»');
+  let r,j={};
+  try{r=await fetch('/access',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({project:project,text:accessTa.value})});j=await r.json();}
+  catch(e){return acterr('сервер не ответил: '+e)}
+  if(!r.ok)return acterr((j&&j.error)||('ошибка '+r.status));
+  delete accessTa.dataset.dirty; accessShow(j);
+  const why=(j.rejects&&j.rejects.length)?' — ОТВЕРГНУТО: '+j.rejects.join('; '):'';
+  acterr('ACCESS.txt записан (событие '+j.event+')'+(why.length>600?why.slice(0,599)+'…':why),true);
+};
+loadAccess();
 document.getElementById('goalbtn').onclick=async function(){
   const g=document.getElementById('goal');
   const text=g.value.trim();
@@ -6629,6 +6885,34 @@ function applyVoices(list,fresh){
     fillCell(row,name,'effort',eshow,efl,!!t.can_effort,
       clip((t.why_effort||'рычага усилия у этого канала нет')+(src?'\n'+src:''),300),
       etitle,sc==='exec'?false:diffE,!!t.set_effort,t.default_effort,!t.set_effort);
+    // «память» — только у голоса без сессии CLI (deepseek-http) на 💬:
+    // комната собирает ему нить из ленты каждый ход (POST /voices memory)
+    const memc=row.querySelector('.mem');
+    if(memc&&!memc.contains(document.activeElement)&&!memc.dataset.busy){
+      memc.innerHTML='';
+      if(sc==='room'&&t.can_memory){
+        const lb=document.createElement('label');lb.className='memlab';
+        lb.title='Память нити из ленты: у '+name+' нет сессии CLI, каждый ход стартует с нуля. Галочка — комната шлёт ему всю нить проекта с её начала (свои реплики помечены «Вы», потолок '+(t.memory_cap||60000)+' симв., обрезка называется). Без галочки — только устав и дельта с курсора. Платится входом; DeepSeek кэширует повторяющийся префикс — «вход N+M кэш» в строке хода.';
+        const cb=document.createElement('input');cb.type='checkbox';cb.checked=!!t.memory;cb.className='memck';
+        cb.onchange=async function(ev){
+          ev.stopPropagation();          // не в делегат #voices: тот пишет набор вкладки (grok)
+          const want=cb.checked;
+          // без disabled: он снимает фокус, и опрос /voices пересобрал бы
+          // галочку из старого t.memory до ответа сервера (grok)
+          memc.dataset.busy='1';
+          let r,j={};
+          try{r=await fetch('/voices',{method:'POST',headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({voice:name,scope:'room',memory:want})});j=await r.json();}
+          catch(e){cb.checked=!want;delete memc.dataset.busy;return acterr('сервер не ответил: '+e)}
+          delete memc.dataset.busy;
+          if(!r.ok){cb.checked=!want;return acterr((j&&j.error)||('ошибка '+r.status))}
+          if(t)t.memory=want;
+        };
+        const tx=document.createElement('span');tx.textContent='память';
+        lb.appendChild(cb);lb.appendChild(tx);
+        memc.appendChild(lb);
+      }
+    }
     renderLim(row,m);
   });
 }

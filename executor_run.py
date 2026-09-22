@@ -76,6 +76,7 @@ JOURNAL = _abs(os.environ.get("ROUNDTABLE_JOURNAL") or os.environ.get("CHOIR_JOU
 CHOIR = CHAMBER
 sys.path.insert(0, str(CHAMBER))
 import jail                                              # noqa: E402
+import access                                            # noqa: E402  ACCESS.txt проекта
 # live.py/choir.py в дочерних процессах обязаны видеть ТОТ ЖЕ журнал, что
 # окно: присваивание, не setdefault — унаследованный CHOIR_JOURNAL иначе
 # перекрыл бы явный ROUNDTABLE_JOURNAL тестового окна, и дирижёр писал бы в
@@ -281,6 +282,11 @@ def main() -> int:
     ap.add_argument("--serial-gate", default="",
                     help="имя голоса, чей канал сериен (kimi): обёртка "
                          "займёт ворота организации НА ВЕСЬ акт")
+    ap.add_argument("--access-json", default="",
+                    help="снимок ACCESS.txt проекта от окна (JSON: ro, rw, "
+                         "sha) — доступ кресла вне worktree; файл здесь НЕ "
+                         "перечитывается (права Кодекса сняты при сборке "
+                         "argv); без флага сверх worktree ничего не открывается")
     a = ap.parse_args()
 
     # --act проверяем ПЕРВЫМ: кривое имя роняло lease_path трейсбеком
@@ -441,12 +447,31 @@ def _run(a, wt: Path, cmd: list, lease) -> int:
     # коммитом, в пустом доме файла не было бы, и коммит кресла падал
     # «остановлен» (субагент). Не секрет.
     rev_log = Path.home() / ".cache" / "choir" / "reviews.jsonl"
+    # ACCESS.txt проекта — СНИМОК от окна (edits.open_edit читал главный
+    # checkout, не worktree): тот же список, что ушёл в writable_roots
+    # Кодекса и в --add-dir; перечитывание здесь разводило бы права и
+    # запись close (codex). r — ro, rw — запись вне worktree; rw уходит в
+    # close полем access_rw — этих правок в дифе не будет, гейт назовёт
+    # мягкую причину.
+    try:
+        acc = access.from_snapshot(json.loads(a.access_json) if a.access_json else None)
+    except (ValueError, TypeError) as e:
+        _close_act(a, status="error", rc=-4,
+                   text=f"правка {a.act}: --access-json не разобран ({e}) — "
+                        f"кресло не выдано")
+        return 1
+    if acc.file or acc.rejects or not acc.empty:
+        print(access.mark(acc).strip(), file=sys.stderr)
     cmd, jail_fact = jail.wrap(
         cmd, a.voice,
-        rw=[str(wt), *codex_roots(common, a.act, gitdir)],
-        ro=[common, *([str(rev_log)] if rev_log.is_file() else [])],
+        rw=[str(wt), *codex_roots(common, a.act, gitdir),
+            *access.rw_paths(acc, chair=True)],
+        ro=[common, *([str(rev_log)] if rev_log.is_file() else []),
+            *access.ro_paths(acc, chair=True)],
         ro_after=[str(wt / ".git")] if (wt / ".git").is_file() else [],
         cwd=str(wt))
+    jail_fact = {**jail_fact, **access.fact(acc),
+                 **({"access_rw": list(acc.rw)} if acc.rw else {})}
     a.jail_fact = jail_fact                  # для close при прерывании
     if jail_fact.get("jail") == "none":
         print(f"кресло БЕЗ клетки: {jail_fact.get('jail_why')}",

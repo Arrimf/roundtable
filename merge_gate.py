@@ -59,6 +59,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import edits                                             # noqa: E402
 sys.path.insert(0, str(edits.CHOIR))
 import jail                                              # noqa: E402
+import access                                            # noqa: E402  ACCESS.txt проекта
 import leases                                            # noqa: E402
 
 QUORUM = 2          # минимум одобрений (спека п.6)
@@ -360,6 +361,23 @@ def _review_prompt(act: str, st: dict, diff: str, head: str,
     # пакет шести провайдерам: чистка по форме ключей (ревьюер). Не по
     # длине: 40-hex sha в дифе документации — не секрет, и ревьюеру он
     # нужен целым.
+    # ACCESS.txt — права голосов: его правка в ветке меняет, что увидят
+    # и куда смогут писать следующие кресла и ревизии. Ревьюер обязан
+    # её заметить, даже если это одна строка.
+    if ACCESS_RE.search(diff):
+        warn += ACCESS_WARN
+    if op.get("project"):
+        acc = access.load(Path(op["project"]), hide=_review_hide())
+        if not acc.empty:
+            warn += "\n\n" + access.notice(acc).strip()
+        # Файл главного checkout сменился ПОСЛЕ открытия акта: следующие
+        # кресла пойдут с другими правами, чем это; POST /access без
+        # аутентификации — известный долг окна, и ревьюер обязан видеть
+        # след (codex, субагент).
+        if op.get("access_sha") is not None and (acc.sha or "") != (op.get("access_sha") or ""):
+            warn += (f"\n\nВНИМАНИЕ: ACCESS.txt главного checkout изменился после "
+                     f"открытия акта (было {op.get('access_sha') or 'пусто'}, "
+                     f"стало {acc.sha or 'пусто'}) — права следующих кресел уже другие.")
     diff = _DIFF_SECRET_RE.sub("‹вырезано›", diff)
     if delta_block:
         delta_block = _DIFF_SECRET_RE.sub("‹вырезано›", delta_block)
@@ -389,6 +407,39 @@ git». Сверяйте содержимое ветки: git -C {op.get('project
 
 ── diff ({head[:12]}) ──────────────────────────────────────────────
 {diff}"""
+
+
+def _batch_access_note(projects) -> str:
+    """Строка доступа для пачки: рецензентам открыто то же, что
+    поштучной ревизии (bind в _run_reviewers), и слово обязано это
+    назвать (субагент: батч шёл мимо _review_prompt)."""
+    if len(projects) != 1:
+        return ""
+    acc = access.load(Path(next(iter(projects))), hide=_review_hide())
+    return ("\n" + access.notice(acc).strip() + "\n") if not acc.empty else ""
+
+
+def _review_hide() -> list[str]:
+    """Чужое под открытым ro проекта: каталоги голосов комнаты и карантин
+    раундов, идущих параллельно ревизии (grok). Родители создаются ДО
+    клетки: точку монтирования под ro bwrap сделать не может."""
+    hide = [edits.JOURNAL / "voices", Path.home() / ".cache" / "choir",
+            Path.home() / ".cache" / "choir-voices"]   # нейтральные cwd — как у комнаты
+    for h in hide:
+        with contextlib.suppress(OSError):
+            h.mkdir(parents=True, exist_ok=True)
+    return [str(h) for h in hide]
+
+
+# Диф трогает ACCESS.txt — права голосов. Обе стороны заголовка и
+# rename/copy: `git mv notes.txt ACCESS.txt` даёт `a/notes.txt b/ACCESS.txt`
+# (kimi, субагент).
+ACCESS_RE = re.compile(r"^(?:diff --git .*[ /]ACCESS\.txt(?:\s|$)"
+                       r"|\+\+\+ b/(?:.*/)?ACCESS\.txt\s*$"
+                       r"|(?:rename|copy) to (?:.*/)?ACCESS\.txt\s*$)", re.M)
+ACCESS_WARN = ("\n\nВНИМАНИЕ: диф МЕНЯЕТ ACCESS.txt — права доступа голосов "
+               "вне проекта (r/rw). Проверьте каждую строку: чему открывается "
+               "чтение, кому — запись, и зачем это правке.")
 
 
 def _git_common(cwd: str) -> str:
@@ -442,15 +493,17 @@ def _run_reviewers(picked: dict, pf: Path, timeout: int, *, cwd: str):
             # в клетке пустой (tmpfs), проект может быть и вне песочницы
             # чужое под открытым ro проекта — каталоги голосов комнаты и
             # карантин раундов, идущих параллельно ревизии (grok)
-            hide = [edits.JOURNAL / "voices", Path.home() / ".cache" / "choir"]
-            for h in hide:
-                with contextlib.suppress(OSError):
-                    h.mkdir(parents=True, exist_ok=True)
+            hide = _review_hide()
+            # ACCESS.txt проекта: рецензенту то же чтение, что и
+            # голосам комнаты (rw — тоже только чтение).
+            acc = access.load(Path(cwd), hide=hide)
             try:
                 argv, fact = jail.wrap(argv, REVIEWER_SEATS.get(name, name),
                                        ro=[str(pf), cwd, *([common] if common else []),
-                                           str(Path(__file__).resolve().parent)],
-                                       hide=[str(h) for h in hide], cwd=cwd)
+                                           str(Path(__file__).resolve().parent),
+                                           *access.ro_paths(acc)],
+                                       hide=hide, cwd=cwd)
+                fact = {**fact, **access.fact(acc)}   # отпечаток ACCESS.txt — в событие ревизии
             except RuntimeError as e:
                 # строгий режим без bwrap или путь, накрывающий дом —
                 # отказ ОДНОГО рецензента, не всего гейта (kimi)
@@ -560,7 +613,8 @@ def review(act: str, *, reviewers=None, timeout: int = REVIEW_TIMEOUT,
                       elapsed_s=res.get("elapsed_s"),
                       eyes=REVIEWER_EYES.get(name, "files"),
                       seat=REVIEWER_SEATS.get(name, name),
-                      jail=res.get("jail"), full_text=full)
+                      jail=res.get("jail"), access_sha=res.get("access_sha"),
+                      full_text=full)
             events.append(ev)
         # ИТОГ ВЕЕРА одной строкой (Автор 2026-09-14: «отказ от Грока
         # вылез сильно после» — ответы ложатся по мере прихода, и без
@@ -628,6 +682,15 @@ def checks(act: str) -> dict:
                 + str(cl.get("jail_why") or "причина не названа")
                 + ") — запись была возможна во весь диск, канарейки — "
                   "единственная проверка"]
+    if cl.get("access_rw"):
+        # Запись вне worktree по ACCESS.txt (rw): этих правок в дифе нет
+        # и канарейки прав их не стерегут — не блок (право выдал Автор
+        # сам), но вслух, чтобы ревьюер знал, куда ещё смотреть.
+        out["access_rw"] = list(cl.get("access_rw") or [])
+        out["reasons_soft"] = out.get("reasons_soft", []) + [
+            "кресло имело ЗАПИСЬ вне worktree по ACCESS.txt: "
+            + ", ".join(out["access_rw"])
+            + " — этих правок в дифе нет, канарейки их не стерегут"]
     rj = sorted({r.get("voice") or "?" for r in st.get("reviews") or []
                  if r.get("jail") == "none"})
     if rj:
@@ -1435,7 +1498,9 @@ def review_batch(acts: list[str] | None = None, *, reviewers=None,
             f"═══ АКТ {act} (исполнитель {st['open'].get('voice')}, "
             f"голова {head[:12]}) ═══\n"
             f"ЗАДАНИЕ: {st['open'].get('task') or st['open'].get('text')}\n"
-            f"── diff ──\n{diff}")
+            + ("ВНИМАНИЕ: этот акт МЕНЯЕТ ACCESS.txt — права голосов.\n"
+               if ACCESS_RE.search(diff) else "")
+            + f"── diff ──\n{diff}")
     if len(projects) > 1:
         # cwd веера один; ревьюеры чужого проекта работали бы в чужом
         # каталоге, и относительные пути ломались молча (нашёл deepseek).
@@ -1459,7 +1524,7 @@ def review_batch(acts: list[str] | None = None, *, reviewers=None,
 УСТРОЙСТВО: правки живут в ветках act/<id>; рабочая копия проекта до
 приёмки стоит на базе — сверяйте содержимое ветки (git show <sha>:путь),
 а не файл на диске. Голоса с диском могут открыть живые файлы.
-
+{_batch_access_note(projects)}
 {chr(10).join(bundle)}"""
 
     # Исполнители НЕ выбрасываются из веера: они судят ЧУЖИЕ акты
@@ -1500,7 +1565,8 @@ def review_batch(acts: list[str] | None = None, *, reviewers=None,
                     elapsed_s=res.get("elapsed_s"), batch=True,
                     eyes=REVIEWER_EYES.get(name, "files"),
                     seat=REVIEWER_SEATS.get(name, name),
-                    jail=res.get("jail"), batch_acts=acts, full_text=full))
+                    jail=res.get("jail"), access_sha=res.get("access_sha"),
+                    batch_acts=acts, full_text=full))
         # итог веера — по каждому акту пачки (см. _post_tally)
         for act in acts:
             head, _ps, _st = heads[act]
