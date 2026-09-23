@@ -385,6 +385,11 @@ ps2.wait()
 cS2 = mg.checks(edS2["act"])
 t("диф в заявленном скоупе — отметка «соблюдён»",
   str(cS2.get("scope", "")).startswith("соблюдён"))
+t("scope_ok: точное имя и маска", mg.scope_ok("a.py", ["a.py"]) and mg.scope_ok("src/x.py", ["src/*.py"]))
+t("scope_ok: каталог со слэшем — файл и подкаталог под ним",
+  mg.scope_ok("KanBan/mockups/codex/README.md", ["KanBan/mockups/codex/"]) and mg.scope_ok("KanBan/mockups/codex/sub/x.svg", ["KanBan/mockups/codex/"]))
+t("scope_ok: чужой каталог — мимо; каталог без слэша — не маска (прежний отказ кресел 23.09)",
+  not mg.scope_ok("KanBan/mockups/grok/x", ["KanBan/mockups/codex/"]) and not mg.scope_ok("KanBan/mockups/codex/README.md", ["KanBan/mockups/codex"]))
 
 # 9г. ПЛОМБА: сдвиг ветки мимо гейта — событие seal_note
 mg.seal_probe(proj, "main")                     # поставить/выровнять

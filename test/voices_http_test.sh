@@ -206,6 +206,55 @@ echo "$R" | grep -q '"act"' && pass "/round с проектом → 200" || fail
 sleep 2
 grep -q "^pick --round pj2 --seed .* --project $W/proj2$" "$W/chamber/argv.log" && pass "/round: --project уходит в pick (цепочка по шагам)" || fail "argv pick без --project: $(grep pick "$W/chamber/argv.log")"
 grep -q "^ask --round pj2 --seed" "$W/chamber/argv.log" && ! grep "^ask --round pj2" "$W/chamber/argv.log" | grep -q -- "--project" && pass "/round: ask без --project (берёт из жребия)" || fail "argv ask: $(grep '^ask' "$W/chamber/argv.log")"
+# ── «продолжить отсюда» (раунд prodolzhit-lyuboe-v1; решения Автора 2026-09-23) ──
+# адрес → текст из журнала на сервере; отказы словами; в раунд — без имени автора,
+# автор вне жребия (--exclude у pick), поле anchor в событии запуска
+cat >> "$W/journal/room.jsonl" <<'ROOM'
+{"id":"c1","ts":"2026-09-03T12:00:00+00:00","round":"t5","phase":"blind","voice":"kimi","role":"answer","status":"ok","text":"тезис кими про якорь"}
+{"id":"c2","ts":"2026-09-03T12:00:01+00:00","round":"t5","phase":"blind","voice":"grok","role":"answer","status":"pass","text":"ПАС"}
+ROOM
+[ "$(code /round '{"question":"а если якорь?","name":"t5-a","anchor":"room:c1","voices":["claude","grok","kimi"]}')" = 200 ] && pass "/round anchor: ответ раунда как якорь → 200" || fail "/round anchor 200"
+QA="$W/journal/rounds/RoundTable/QUESTION-t5-a.md"
+grep -q "^а если якорь?" "$QA" && grep -q "тезис кими про якорь" "$QA" && grep -q "один из голосов стола" "$QA" && ! grep -q "kimi" "$QA" && pass "/round anchor: текст дословно, БЕЗ имени автора (решение Автора)" || fail "/round anchor: вопрос: $(cat "$QA")"
+grep -q "без мыслей модели" "$QA" && pass "/round anchor: названо, что мыслей модели в якоре нет" || fail "/round anchor: мысли не названы"
+sleep 2
+grep -q "^pick --round t5-a --seed .* --anchor room:c1 --exclude kimi$" "$W/chamber/argv.log" && pass "/round anchor: pick получает --anchor и --exclude автора" || fail "argv pick anchor: $(grep t5-a "$W/chamber/argv.log")"
+grep "^ask --round t5-a" "$W/chamber/argv.log" | grep -q -- "--voices claude,grok,kimi" && ! grep "^ask --round t5-a" "$W/chamber/argv.log" | grep -q -- "--exclude" && pass "/round anchor: ask — полный состав, автор якоря участвует" || fail "argv ask anchor"
+grep -q '"anchor": {"addr": "room:c1", "author": "kimi", "sha": "[0-9a-f]*", "kind": "answer", "round": "t5", "phase": "blind"}' "$W/journal/live.jsonl" && pass "/round anchor: поле anchor (скаляр, с автором) в событии запуска" || fail "/round anchor: поля нет"
+[ "$(code /round '{"question":"q","name":"t5-b","anchor":"room:c2","voices":["claude","grok"]}')" = 400 ] && [ ! -e "$W/journal/rounds/RoundTable/QUESTION-t5-b.md" ] && pass "/round anchor: ПАС → 400, файла нет" || fail "/round anchor pass"
+[ "$(code /round '{"question":"q","name":"t5-c","anchor":"room:c1","parent":"t3","voices":["claude","grok"]}')" = 400 ] && pass "/round anchor + parent → 400" || fail "/round anchor+parent"
+[ "$(code /round '{"question":"q","name":"t5-d","anchor":"room:c1","voices":["kimi","claude"]}')" = 200 ] && pass "/round anchor: автор в составе из двух — жребий из одного, 200" || fail "/round anchor two"
+[ "$(code /round '{"question":"q","name":"t5-e","anchor":"live:999999","voices":["claude","grok"]}')" = 400 ] && pass "/round anchor: нет события → 400" || fail "/round anchor 404"
+# /act: якорь на реплику ленты; сверх потолка — отказ. Комната — СТАБ:
+# happy-path /act поднимает live.py, а с настоящим он звал бы claude платно
+cp "$W/chamber/live.py" "$W/chamber/live_real.py"
+cat > "$W/chamber/live.py" <<'EOF2'
+import sys, os
+open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "argv.log"), "a").write("live " + " ".join(sys.argv[1:]) + "\n")
+EOF2
+python3 - "$W/journal/live.jsonl" <<'PY'
+import json,sys,time
+p=sys.argv[1]; ids=[json.loads(l)["id"] for l in open(p,encoding="utf-8") if l.strip()]
+n=max(ids)+1
+with open(p,"a",encoding="utf-8") as f:
+    f.write(json.dumps({"id":n,"ts":time.strftime("%Y-%m-%dT%H:%M:%S+00:00"),"author":"grok","kind":"say","text":"реплика грока"},ensure_ascii=False)+"\n")
+    f.write(json.dumps({"id":n+1,"ts":time.strftime("%Y-%m-%dT%H:%M:%S+00:00"),"author":"grok","kind":"say","text":"x"*6001},ensure_ascii=False)+"\n")
+    f.write(json.dumps({"id":n+2,"ts":time.strftime("%Y-%m-%dT%H:%M:%S+00:00"),"author":"kimi","kind":"pass","text":"ПАС"},ensure_ascii=False)+"\n")
+open("/dev/stdout","w").write(str(n))
+PY
+AN="$(python3 -c "import json;print(max(json.loads(l)['id'] for l in open('$W/journal/live.jsonl',encoding='utf-8') if l.strip())-2)")"
+R="$(post /act "{\"text\":\"@claude продолжим\",\"voices\":[\"claude\"],\"anchor\":\"live:$AN\"}")"
+echo "$R" | grep -q '"act"' && pass "/act anchor: реплика ленты как якорь → 200" || fail "/act anchor: $R"
+sleep 2
+grep -q '"anchor_addr": "live:'"$AN"'"' "$W/journal/live.jsonl" && pass "/act anchor: адрес в событии accepted" || fail "/act anchor accepted"
+grep -q "^live say @claude продолжим --anchor live:$AN --voices claude$" "$W/chamber/argv.log" && pass "/act anchor: live.py получает --anchor адресом (текст вставит комната)" || fail "argv live anchor: $(grep '^live' "$W/chamber/argv.log")"
+R="$(post /act "{\"text\":\"q\",\"voices\":[\"claude\"],\"anchor\":\"live:$((AN+1))\"}")"
+echo "$R" | grep -q "обрезки нет" && pass "/act anchor: сверх потолка 6000 → отказ словами, не обрезка" || fail "/act anchor cap: $R"
+[ "$(code /act "{\"text\":\"q\",\"voices\":[\"claude\"],\"anchor\":\"live:$((AN+2))\"}")" = 400 ] && pass "/act anchor: ПАС → 400" || fail "/act anchor pass"
+[ "$(code /act '{"text":"q","voices":["claude"],"anchor":"live:1; rm -rf /"}')" = 400 ] && pass "/act anchor: кривой адрес → 400" || fail "/act anchor bad"
+curl -s "$B/state" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["anchor_cap"]==6000, d.get("anchor_cap")' && pass "/state: anchor_cap=6000 (потолок из сервера)" || fail "/state anchor_cap"
+mv "$W/chamber/live_real.py" "$W/chamber/live.py"    # дальше секции читают настоящий live.py
+
 # ── цель целеполагателя и адресная опция комнаты ──────────────────
 R="$(post /goal '{"text":"Довести окно до релиза 0.2"}')"
 echo "$R" | grep -q '"goal": "Довести окно до релиза 0.2"' && pass "/goal → событие goal" || fail "/goal: $R"

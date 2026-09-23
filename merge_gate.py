@@ -29,7 +29,7 @@ SPEC-ispolnitel-v1 (v2), пп. 6–8:
 — rebase_act(): сдвиг main гейт чинит сам — в worktree акта, под
   замком, identity гейта (авторы сохраняются); прежние одобрения
   гаснут, событие edit_rebase главнее интента (_effective_base);
-— scope: заявка files в интенте, сверка дифа fnmatch'ем (fail-closed
+— scope: заявка files в интенте, сверка дифа fnmatch'ем, «каталог/» — всё под ним (fail-closed
   при неудавшейся сверке); не заявлен — так и пишется;
 — пломба ветки: seal_probe/seal_update под замком гейта, сдвиг ВНЕ
   гейта — одно нейтральное seal_note на сдвиг (ручные коммиты легальны);
@@ -726,14 +726,15 @@ def checks(act: str) -> dict:
         return out
     out["head"], out["patch_sha"] = head, patch_sha
     # СКОУП (спека п.7): заявлены файлы — диф обязан в них уложиться.
-    # fnmatch: заявка может быть маской (dir/*.py). Не заявлен — гейт
-    # честно пишет «не заявлен», сверки нет (правило 8.5 наоборот).
+    # fnmatch: заявка может быть маской (dir/*.py); заявка со слэшем на
+    # конце (dir/) — весь каталог, включая подкаталоги: кресла макетов
+    # 23.09 были заявлены каталогом и отвергнуты гейтом за «выход из
+    # скоупа» по собственным трём файлам. Не заявлен — гейт честно
+    # пишет «не заявлен», сверки нет (правило 8.5 наоборот).
     declared = st["open"].get("files")
     if declared:
-        import fnmatch
         touched = sorted(_diff_paths(project, base_sha, head))
-        stray = [p2 for p2 in touched
-                 if not any(fnmatch.fnmatch(p2, pat) for pat in declared)]
+        stray = [p2 for p2 in touched if not scope_ok(p2, declared)]
         out["scope"] = (f"соблюдён ({len(touched)} файл(ов) в "
                         f"{len(declared)} заявленных)")
         if stray:
@@ -855,6 +856,14 @@ def _sync_checkout(project: Path, result: str, moved: set[str],
             + (f", удалено {len(files) - len(to_checkout)}" if len(files) > len(to_checkout) else "")
             + (f", журналы не тронуты: {skipped}" if skipped else "")
             + ")")
+
+
+def scope_ok(path: str, declared) -> bool:
+    """Путь дифа укладывается в заявленный скоуп: маска fnmatch (dir/*.py,
+    a.py) или каталог со слэшем на конце (dir/ — всё под ним)."""
+    import fnmatch
+    return any(fnmatch.fnmatch(path, pat) or (pat.endswith("/") and path.startswith(pat))
+               for pat in declared)
 
 
 def _diff_paths(project: Path, a: str, b: str) -> set:

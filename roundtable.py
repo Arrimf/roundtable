@@ -241,6 +241,7 @@ import canary                                  # noqa: E402  канарейки 
 import access                                  # noqa: E402  ACCESS.txt проекта: доступ голосов вне проекта
 import coverage as cover                       # noqa: E402  карта покрытия свода: та же арифметика, что у дирижёра
 import jail                                    # noqa: E402  jail.disabled(): сторож доступа выключен вместе с клеткой
+import anchor as anchor_mod                    # noqa: E402  «продолжить отсюда»: адрес → текст из журнала
 import early                                   # noqa: E402  ранние отказы: снятие голоса по кнопке
 
 VOICES = list(live.VOICES)
@@ -3797,6 +3798,7 @@ class Handler(BaseHTTPRequestHandler):
                              "review_queue": queued,
                              "goal": _last_goal(),
                              "edit_voices": sorted(edits.EDIT_VOICES),
+                             "anchor_cap": anchor_mod.ANCHOR_CAP,   # потолок якоря — из сервера, не из JS
                              "exec_pool": edits.random_pool(),
                              "acts": acts,
                              # Режим объявлен только теперь, когда он
@@ -3963,6 +3965,20 @@ class Handler(BaseHTTPRequestHandler):
                     "error": "быстрый вопрос — ровно к одному голосу",
                     "got": voices})
             mode = "ask" if req.get("blind") else "say"
+            # «ПРОДОЛЖИТЬ ОТСЮДА» (раунд prodolzhit-lyuboe-v1; решения
+            # Автора 2026-09-23): клиент шлёт АДРЕС сообщения журнала,
+            # текст вставляет комната сама (правило 8.5: иначе кнопка
+            # приносила бы что угодно под видом цитаты). Здесь — ранний
+            # отказ словами (нет записи, ПАС, отказ канала, сверх потолка
+            # без обрезки), чтобы не платить актом за 400.
+            anchor_addr = str(req.get("anchor") or "").strip()
+            if anchor_addr:
+                try:
+                    anchor_mod.resolve(anchor_addr, live_path=live.LIVE,
+                                       room_path=ROOM,
+                                       project=str(live.event_project()) if live.event_project() else None)
+                except anchor_mod.AnchorError as e:
+                    return self._json(400, {"error": f"якорь: {e}"})
             if mode == "ask":
                 # Барьер слепоты ДВУсторонний: /edit не выдаёт кресло
                 # при слепой фазе, но и слепая фаза не начинается при
@@ -3979,6 +3995,8 @@ class Handler(BaseHTTPRequestHandler):
                                             "пока кресло исполнителя "
                                             "занято"})
             args = [mode, text]
+            if anchor_addr:
+                args += ["--anchor", anchor_addr]
             if quick:
                 args.append("--once")
             if quick and picked_by_server:
@@ -4042,6 +4060,8 @@ class Handler(BaseHTTPRequestHandler):
             if picked_by_server:
                 acc_fields.update(picked_by="server-random",
                                   voice=picked_by_server)
+            if anchor_addr:
+                acc_fields["anchor_addr"] = anchor_addr   # само поле anchor пишет комната
             act = spawn([sys.executable, str(CHOIR / "live.py"), *args],
                         f"{'быстрый' if quick else mode}: {text[:60]}",
                         (list(pool) if (quick and picked_by_server) else (voices or VOICES)),
@@ -4173,6 +4193,33 @@ class Handler(BaseHTTPRequestHandler):
                             + ((pv.get("summary_head") + "\n\n") if pv.get("summary_head") else "")
                             + str(ps.get("text") or "")      # без rstrip: дословно
                             + f"\n\n--- КОНЕЦ СВОДА раунда «{parent}» ---")
+            # «ПРОДОЛЖИТЬ ОТСЮДА» в раунде: одно сообщение журнала дословно
+            # в вопросе (без имени автора — решение Автора; правило 9:
+            # спорят с доводом, не с именем), автор якоря вне жребия
+            # ведущего и свода, поле anchor — в записи жребия и здесь.
+            # Якорь и «развитие» вместе не бывают: у вопроса один контекст.
+            anchor_addr = str(req.get("anchor") or "").strip()
+            anchor_rec = None
+            if anchor_addr:
+                if parent:
+                    return self._json(400, {"error": "якорь и развитие раунда "
+                                            "вместе не бывают: один контекст "
+                                            "на вопрос"})
+                try:
+                    anchor_rec = anchor_mod.resolve(anchor_addr, live_path=live.LIVE,
+                                                    room_path=ROOM,
+                                                    project=str(live.event_project()) if live.event_project() else None)
+                except anchor_mod.AnchorError as e:
+                    return self._json(400, {"error": f"якорь: {e}"})
+                lot_pool = [v for v in (rvoices or VOICES) if v != anchor_rec["author"]]
+                if len(lot_pool) < 1:
+                    return self._json(400, {"error": "жребий не из кого: автор "
+                                            "якоря вне жребия, других голосов нет"})
+                question = (question + "\n\n---\n\n"
+                            + anchor_mod.block(anchor_rec, with_author=False)
+                            + "Вопрос Автора выше задан ОТ этого сообщения: "
+                              "отвечайте на вопрос, опираясь на него как на "
+                              "контекст, а не пересказывая его.")
             rdir = JOURNAL / "rounds" / ((rp.name or "root") if rp else "RoundTable")
             qfile = rdir / fnames.round_file("QUESTION-", name)
             # Не переписываем молча: в room.jsonl уже лежит pick с
@@ -4199,10 +4246,13 @@ class Handler(BaseHTTPRequestHandler):
             if auto:
                 # Аргументы списком, без bash -c: имя уже проверено, но
                 # лишний слой кавычек — лишний способ ошибиться.
+                aflag = (["--exclude", anchor_rec["author"], "--anchor", anchor_addr]
+                         if anchor_rec and anchor_rec["author"] in VOICES else
+                         (["--anchor", anchor_addr] if anchor_rec else []))
                 cmd = [sys.executable, str(CHAMBER / "choir.py"), "run", "--round", name,
                        "--seed", str(qfile), "--rebuts", str(rebuts),
                        *(["--voices", ",".join(rvoices)] if rvoices else []),
-                       *cflag, *pflag]
+                       *cflag, *pflag, *aflag]
                 label = f"round: {name} [авто, витков: {rebuts}]" + (f" 🐤 {cnr}" if cnr else "")
                 note = (f"АВТОПРОГОН: такт идёт сам — pick → expand → ask → "
                         f"rebut ×{rebuts} → summarize, без остановки на "
@@ -4221,8 +4271,15 @@ class Handler(BaseHTTPRequestHandler):
                 # --project только у pick: он пишет проект в запись
                 # жребия, остальные фазы читают его оттуда (choir.py).
                 pj = (" --project " + shlex.quote(str(rp))) if rp else ""
+                # якорь — только у pick: он пишет его в запись жребия и
+                # выводит автора из жребия; ask получает полный состав
+                af = ""
+                if anchor_rec:
+                    af = " --anchor " + shlex.quote(anchor_addr)
+                    if anchor_rec["author"] in VOICES:
+                        af += " --exclude " + shlex.quote(anchor_rec["author"])
                 cmd = ["bash", "-c",
-                       f"{py} choir.py pick --round {rn} --seed {seed}{vs}{pj} && "
+                       f"{py} choir.py pick --round {rn} --seed {seed}{vs}{pj}{af} && "
                        f"{py} choir.py expand --round {rn} --seed {seed} && "
                        f"{py} choir.py ask --round {rn} --seed {zt}{vs}{cs}"]
                 label = f"round: {name}"
@@ -4239,6 +4296,12 @@ class Handler(BaseHTTPRequestHandler):
                 fields["parent"] = parent
                 label += f" [развитие «{parent}»]"
                 note = f"Развитие раунда «{parent}»: его свод — в вопросе дословно. " + note
+            if anchor_rec:
+                fields["anchor"] = anchor_mod.field(anchor_rec)
+                label += f" [от {anchor_addr}]"
+                note = (f"Продолжение от сообщения {anchor_addr} ({anchor_rec['author']}, "
+                        f"{len(anchor_rec['text'])} симв.): оно в вопросе дословно, "
+                        f"без имени автора; автор вне жребия и свода. " + note)
             if auto:
                 fields["rebuts"] = rebuts
             if rvoices:
@@ -5404,6 +5467,8 @@ color:var(--acc)}
 .ev.sys .t{color:var(--dim);font-size:.86rem}
 .ev.warn .who,.ev.warn .t{color:var(--acc)}
 .ev.warn .dropnow{margin-left:.5rem;font-size:.78rem;border-color:var(--acc);color:var(--acc)}
+.ev .anc,.rbody .anc{font:inherit;font-size:.74rem;background:none;border:1px solid var(--rule);color:var(--dim);border-radius:.3rem;padding:0 .4rem;margin-left:.5rem;cursor:pointer}
+.ev .anc:hover,.rbody .anc:hover{color:var(--fg);border-color:var(--dim)}
 .ev.err .who{color:var(--err)}
 .ev.err .t{color:var(--err)}
 .ev .kind{font:600 .66rem/1 ui-monospace,monospace;letter-spacing:.08em;
@@ -5706,7 +5771,7 @@ margin:.2rem 0 .3rem;white-space:pre-wrap;word-break:break-word}
       </select>
     </div>
     <div class="qrow">
-      <input id="scopefiles" placeholder="скоуп: файлы через запятую (пусто — не заявлен)" title="Заявка исполнительского намерения (спека п.1): какие файлы правка ИМЕЕТ ПРАВО трогать (можно маски: src/*.py). Гейт при приёмке сверит диф с заявкой — вышедший за скоуп акт не пройдёт. Пусто — скоуп не заявлен, сверки не будет, и событие merge честно это скажет." style="flex:1;min-width:12rem">
+      <input id="scopefiles" placeholder="скоуп: файлы через запятую (пусто — не заявлен)" title="Заявка исполнительского намерения (спека п.1): какие файлы правка ИМЕЕТ ПРАВО трогать (можно маски: src/*.py; каталог целиком — со слэшем: KanBan/mockups/codex/). Гейт при приёмке сверит диф с заявкой — вышедший за скоуп акт не пройдёт. Пусто — скоуп не заявлен, сверки не будет, и событие merge честно это скажет." style="flex:1;min-width:12rem">
     </div>
     <div class="qrow">
       <input id="actid" placeholder="акт" title="Идентификатор акта правки (hex из события edit_open; после кнопки «Правка» подставляется сам). Кнопки ниже действуют на него." style="width:7.5rem">
@@ -6001,6 +6066,13 @@ function rline(label,rec){
     // раскрытия и слепым не является (правила 4 и 8.5; субагент).
     rec.nonblind?'НЕСЛЕПОЙ (добран после раскрытия)':'',rec.late&&!rec.nonblind?'поздний':''].filter(Boolean);
   sm.textContent=label+': '+meta.join(' · ');
+  // якорем бывает ответ ok закрытой фазы и удавшийся свод; затравка,
+  // жребий, ПАС и отказы — нет
+  if(rec.id&&rec.status==='ok'&&(rec.role==='answer'||rec.role==='summary')&&(rec.text||'').trim()){
+    const b=anchorButton('room:'+rec.id,rec.voice||'?',(rec.text||'').length);
+    b.addEventListener('click',function(e){e.preventDefault();e.stopPropagation()},true);
+    sm.appendChild(b);
+  }
   d.appendChild(sm);
   const pre=document.createElement('pre');
   // Отказ канала choir.py пишет в detail (правило 4): quota/stalled
@@ -6088,7 +6160,12 @@ function add(ev){
   const det=ev.detail?'<div class="det">'+esc(ev.detail)+'</div>':'';
   const badge=(k&&k!=='say'?'<span class="kind">'+esc(k)+'</span>':'')+
     (ev.thread?'<span class="kind" title="ответ в адресной ветке между голосами">↳ ветка '+esc(String(Number(ev.thread)||''))+'</span>':'')+
-    (k==='error'&&ev.status?'<span class="kind">'+esc(String(ev.status))+'</span>':'');
+    (k==='error'&&ev.status?'<span class="kind">'+esc(String(ev.status))+'</span>':'')+
+    // «Продолжить отсюда»: у реплики Автора — адрес якоря; у ответа голоса —
+    // нить начата заново (поле session_fresh пишет комната, не окно)
+    (ev.anchor?'<span class="kind" title="продолжение от одного сообщения журнала, дословно">⚓ от '+
+      esc(typeof ev.anchor==='string'?ev.anchor:String(ev.anchor.addr||''))+
+      (ev.session_fresh?' · нить заново':'')+'</span>':'');
   const tv=tsView(ev.ts);
   el.innerHTML='<span class="who">'+esc(a)+'</span>'+badge+
     '<span class="ts">'+esc(tv.short)+'</span>'+
@@ -6100,6 +6177,12 @@ function add(ev){
   // приходит из ленты, то есть снаружи; строка вида `x" onmouseover=…`
   // вырвалась бы из атрибута. Свойству разметка не страшна вовсе.
   const tsEl=el.querySelector('.ts'); if(tsEl)tsEl.title=tv.full;
+  // «Продолжить отсюда» — под любой репликой (голоса или Автора) и
+  // вердиктом контролёра; не под ПАС, отказом и служебным: якорем они
+  // не бывают (раунд prodolzhit-lyuboe-v1). Уходит АДРЕС, текст берёт сервер.
+  if((k==='say'||k==='verdict')&&ev.id&&(ev.text||'').trim()&&!sys){
+    el.appendChild(anchorButton('live:'+ev.id,a,(ev.text||'').length));
+  }
   // Тень ранних отказов: жёлтая строка + «снять сейчас» — снимает ОДИН
   // голос через флаг дирижёру (POST /drop), не весь акт.
   if(k==='early_warn'&&ev.pgid&&ev.act){
@@ -7341,13 +7424,14 @@ async function send(blind){
   // Отказ показываем строкой под кнопками, а не alert'ом — по тому же
   // доводу, что и у строки голоса: alert перекрывает ленту и стоит
   // Автору набранной реплики, если снять его вслепую.
+  const sentA=ANCHOR;
   try{
     r=await fetch('/act',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({text,blind,voices:picked('room'),project,brief:briefOn(),thoughts:thoughtsOn(),
-        peer:peerOn()})});
+        peer:peerOn(),anchor:sentA?sentA.addr:''})});
   }catch(e){return acterr('сервер не ответил: '+e)}
   let j={};try{j=await r.json()}catch(_){}
-  if(r.ok)msg.value='';
+  if(r.ok){msg.value='';anchorSent(sentA)}
   else acterr((j&&j.error)||('ошибка '+r.status));
 }
 // ── БЫСТРЫЙ ВОПРОС: один голос, без протокола ───────────────────────
@@ -7428,8 +7512,9 @@ async function sendQuick(){
     if(!pool.length)return acterr('некого спросить: ни одного голоса в списке');
     voice=pool[Math.floor(Math.random()*pool.length)];here=true;
   }
+  const sentA=ANCHOR;
   const body={text:text,mode:'quick',voice:voice,project:project,
-              brief:briefOn(),thoughts:thoughtsOn()};
+              brief:briefOn(),thoughts:thoughtsOn(),anchor:sentA?sentA.addr:''};
   if(voice)body.voices=[voice]; else body.pool=picked('room');   // «случайно» — из отмеченных
   acterr('');
   let r;
@@ -7440,7 +7525,7 @@ async function sendQuick(){
   let j={};try{j=await r.json()}catch(_){}
   if(!r.ok)return acterr('быстрый вопрос не ушёл: '+
     ((j&&j.error)||('ошибка '+r.status)));
-  msg.value='';
+  msg.value='';anchorSent(sentA);
   acterr(here?'голос выбрало окно: '+voice+
     ' — сервер режим quick пока не объявил':'',true);
 }
@@ -7860,6 +7945,42 @@ const RE_ROUND=/^[\p{L}\p{N}_][\p{L}\p{N}_.\-]{0,59}$/u;
 // или до ✕ — иначе следующий, никак не связанный раунд ушёл бы со
 // сводом чужого родителя в вопросе.
 let DEVELOP=null;
+// «ПРОДОЛЖИТЬ ОТСЮДА» (раунд prodolzhit-lyuboe-v1, 2026-09-22; решения
+// Автора 2026-09-23): одно сообщение журнала — дословно, как контекст
+// следующего вопроса; уходит с «Сказать», «Слепой», быстрым вопросом и
+// раундом. Окно шлёт только АДРЕС (live:<id> | room:<id>), текст
+// вставляет сервер из журнала (правило 8.5). Полоска с ✕ по образцу
+// «Развить тему»; галочки нет — «открытого сообщения» в окне не бывает.
+// Живёт до отправки или до ✕. Потолок ANCHOR_CAP — отказ, не обрезка.
+let ANCHOR=null;
+function anchorCap(){return (window.STATE&&window.STATE.anchor_cap)||6000}   // от сервера; 6000 — запас на старый сервер
+function anchorButton(addr,author,n){
+  const b=document.createElement('button');b.type='button';b.className='anc';
+  b.textContent='продолжить отсюда';
+  b.title='Следующий вопрос — от этого сообщения: оно уйдёт голосам дословно ('+n+' симв.), '+
+    'нить голоса начнётся заново; мысли модели в якорь не входят — только итог';
+  if(n>anchorCap()){b.disabled=true;b.title='якорь '+n+' симв. — больше потолка '+anchorCap()+': обрезки нет, выделите фрагмент и вставьте его в вопрос сами'}
+  b.onclick=function(){anchorFrom(addr,author,n)};
+  return b;
+}
+function anchorFrom(addr,author,n){
+  ANCHOR={addr:addr,author:author,n:n};
+  let strip=document.getElementById('ancstrip');
+  if(!strip){strip=document.createElement('div');strip.id='ancstrip';
+    strip.style.cssText='font:.74rem ui-monospace,monospace;color:var(--dim);padding:2px 0';
+    document.getElementById('roundrow').insertAdjacentElement('afterend',strip)}
+  strip.innerHTML='';
+  strip.appendChild(document.createTextNode('⚓ продолжить от '+addr+' ('+author+', '+n+' симв.): уйдёт дословно, без мыслей модели; нить голоса — заново '));
+  const x=document.createElement('button');x.type='button';x.textContent='✕';x.title='снять якорь — обычная реплика';
+  x.onclick=function(){ANCHOR=null;strip.remove();if(!DEVELOP)msg.placeholder=MSG_PH};
+  strip.appendChild(x);
+  msg.placeholder='Вопрос от сообщения '+addr+' ('+author+') — «Сказать», быстрый вопрос или «Раунд»';
+  msg.focus();
+}
+function anchorSent(sent){
+  // чистим только ТО, что ушло: пока ждали ответ, Автор мог выбрать другой якорь
+  if(sent&&ANCHOR===sent){ANCHOR=null;const st=document.getElementById('ancstrip');if(st)st.remove();if(!DEVELOP)msg.placeholder=MSG_PH}
+}
 // BigInt — суффикс не теряет точность; длина — в пределах ROUND_RE (60),
 // база при нужде режется (codex)
 function nextRoundName(n){const m=/^(.*)-(\d+)$/.exec(n);
@@ -7911,16 +8032,19 @@ document.getElementById('round').onclick=async()=>{
       rebuts+' → summarize, без остановки. Голоса: '+rvoices.join(', ')+
       ' — платно. Пускаем?'))return;
   const sent=DEVELOP;            // что ушло: ответ чистит только ЭТО (codex)
+  const sentA=ANCHOR;
+  if(sent&&sentA){alert('якорь и развитие раунда вместе не бывают: снимите одно из двух (✕ на полоске)');return}
   const r=await fetch('/round',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({question,name,auto,rebuts,brief:briefOn(),thoughts:thoughtsOn(),
                          voices:rvoices,canary:(document.getElementById('canary')||{}).value||'',
                          project:document.getElementById('project').value.trim(),
-                         parent:sent?sent.parent:''})});
+                         parent:sent?sent.parent:'',anchor:sentA?sentA.addr:''})});
   if(r.ok){
     // пока ждали ответ, Автор мог выбрать другую карточку и набрать
     // новый вопрос — его не стираем
     if(msg.value.trim()===question)msg.value='';
     if(DEVELOP===sent){DEVELOP=null;const st=document.getElementById('devstrip');if(st)st.remove();msg.placeholder=MSG_PH}
+    anchorSent(sentA);
   } else alert((await r.json()).error||'ошибка');
 };
 document.getElementById('stop').onclick=async()=>{

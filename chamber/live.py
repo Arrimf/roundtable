@@ -60,6 +60,7 @@ import jail                                     # noqa: E402  клетка bwrap
 import access                                   # noqa: E402  ACCESS.txt проекта: доступ вне проекта
 import early                                    # noqa: E402  ранние отказы: тень и снятие
 import promptio                                 # noqa: E402  длинный промпт — не аргументом
+import anchor as anchor_mod                     # noqa: E402  «продолжить отсюда»: одно сообщение дословно
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -206,6 +207,47 @@ PEER_ADDRESS_RE = re.compile(r"(?m)^\s*@([a-zA-Zа-яА-Я]+)\b")
 # всем голосам этого акта одинаково (правило 1); смена цели посреди
 # акта доедет до нитей дельтой (событие goal в «что сказали»).
 GOAL_SNAPSHOT: str | None = None
+# «ПРОДОЛЖИТЬ ОТСЮДА» (раунд prodolzhit-lyuboe-v1, 2026-09-22; решения
+# Автора 2026-09-23). Одно сообщение из журнала — дословно, как контекст
+# нового вопроса. Живёт один акт: cmd_say/cmd_ask ставят, deliver
+# читает. Что это меняет в ходе: (1) блок якоря идёт в промпт ПЕРЕД
+# репликой Автора, (2) голос отвечает в СВЕЖЕЙ сессии — прежняя нить
+# помнит события ПОСЛЕ якоря, и «отсюда» с ней врало бы (4 из 5, довод
+# codex по коду: resume + context_sha от текущего промпта), (3) дельта
+# и память из ленты не подаются — контекст хода равен якорю плюс
+# вопросу, иначе свежая сессия ничем не отличалась бы от старой.
+ANCHOR: dict | None = None
+ANCHOR_EV: dict | None = None      # реплика Автора с полем anchor (этот акт)
+_ANCHORED: set[str] = set()        # кто в этом акте уже сделал ход «отсюда»
+
+
+def anchor_fresh(st: dict, v: dict, addr: str | None, since: int) -> str | None:
+    """Нить заново для хода «отсюда»: прежняя сессия — в session_prev
+    (идея grok: session == session_prev значило бы, что якорь врёт),
+    session/turns/cwd — как у новой нити; курсор и рождение нити
+    (origin — память из ленты у голоса без сессии) — на реплику Автора
+    с якорем: что было до неё, нить не видит ни дельтой, ни памятью, и
+    следующий акт без якоря этого не вернёт (субагент). Возвращает
+    прежний id. Делается ОДИН раз на голос за акт, по ВСЕМ его линиям,
+    на диске, до хода (deliver): сброс одной линии под воротами оставлял
+    вторую линию kimi со старой нитью (субагент)."""
+    prev = st.get("session") or (
+        "по каталогу" if (st.get("turns") and v.get("cwd_session")) else None)
+    st["session_prev"] = prev
+    st["session"] = None
+    st["turns"] = 0
+    st["cwd"] = None
+    st["anchor"] = addr
+    st["cursor"] = since
+    st["origin"] = since
+    return prev
+
+
+def anchored_state(st: dict) -> bool:
+    """Состояние нити — свежее «отсюда», ход ещё не сделан: якорь в
+    промпт и факты в событие. После первого хода (turns > 0) — обычная
+    дельта: иначе каждый ход сбрасывал бы только что начатую нить."""
+    return bool(ANCHOR) and st.get("anchor") == ANCHOR.get("addr") and not st.get("turns")
 
 
 def _read_goal() -> str:
@@ -1009,7 +1051,7 @@ def project_doc() -> str:
 
 def build_prompt(name: str, st: dict, events: list[dict], first: bool,
                  blind: bool = False, acc=None, memory: bool = False,
-                 origin: int = 0) -> str:
+                 origin: int = 0, anchor: dict | None = None) -> str:
     parts = []
     if memory:
         first = True          # нить ничего не помнит: устав и цель — каждый ход
@@ -1112,6 +1154,15 @@ def build_prompt(name: str, st: dict, events: list[dict], first: bool,
         if origin:
             cut_note = (f"(нить ведётся с события №{origin + 1} ленты; что было "
                         f"раньше, вам не показано)\n") + cut_note
+    if anchor:
+        # Блок якоря — ДО реплики Автора: он контекст вопроса, а не ответ
+        # на него. Имя автора в комнате остаётся (это разговор, не слепой
+        # раунд); в пакет раунда имя не идёт — решение Автора (choir.py).
+        parts.append("ПРОДОЛЖЕНИЕ ОТСЮДА. Автор возвращается к одному сообщению "
+                     "стола и задаёт вопрос от него. Ваша нить начата заново: "
+                     "того, что говорилось между этим сообщением и вопросом "
+                     "Автора, вы не видите намеренно.\n")
+        parts.append(anchor_mod.block(anchor, with_author=True))
     if events or (memory and cut_note):
         parts.append(("ИСТОРИЯ ЭТОЙ НИТИ (у вашего канала нет сессии — комната "
                       "собрала её из журнала; ваши реплики помечены «Вы»):\n"
@@ -1510,6 +1561,8 @@ def turn(name: str, prompt, acc=None) -> dict:
                         # в полном: хвост тоже может не вместить.
     ptext = prompt if isinstance(prompt, str) else ""
     fact: dict = {}          # факт клетки — в событие при любом исходе
+    anchored = False         # ход «отсюда» (нить сброшена deliver'ом)
+    anchor_prev = None       # прежняя сессия при «продолжить отсюда»
     prompt_via = ""
     seen_text = None
     try:
@@ -1519,6 +1572,8 @@ def turn(name: str, prompt, acc=None) -> dict:
         with gate as g:
             ch = by_gate(chans, g)
             st = load_state(name, ch)
+            anchored = anchored_state(st)      # нить сброшена deliver'ом, ход первый
+            anchor_prev = st.get("session_prev") if anchored else None
             session = st.get("session")
             if not session and v.get("new_session"):
                 session = v["new_session"]()
@@ -1769,6 +1824,14 @@ def turn(name: str, prompt, acc=None) -> dict:
     # состояние уже утверждает обратное. Поймано сразу после починки
     # порядка флагов: голос падал второй раз подряд, но уже по другой,
     # унаследованной причине.
+    if anchored:
+        # факт в событии: ход шёл от якоря; сессия свежая — только если
+        # она у канала есть и ход её создал (не error; не deepseek)
+        ev["anchor"] = anchor_mod.field(ANCHOR)     # тот же словарь, что у реплики Автора (deepseek: один тип поля)
+        if ev["kind"] != "error" and not v.get("no_session"):
+            ev["session_fresh"] = True
+        if anchor_prev:
+            ev["session_prev"] = anchor_prev
     if ev["kind"] != "error":
         st["session"] = session
         st["turns"] = st.get("turns", 0) + 1
@@ -1806,7 +1869,24 @@ def deliver(names: list[str], blind: bool = False) -> list[dict]:
     acc = access.load(PROJECT, hide=_hide_dirs())
     _DELIVER_ACC = acc
     for n in names:
+        if ANCHOR and n not in _ANCHORED:
+            # «Продолжить отсюда»: нить заново — на диске, по всем линиям,
+            # до сборки промпта и до хода. Контекст хода — якорь и то,
+            # что сказано С реплики Автора, к которой он прикреплён: для
+            # первого голоса это сама реплика, для следующих — ещё и
+            # ответы на неё (это разговор). Что было ДО неё — не
+            # подаётся: ни дельтой, ни памятью из ленты (курсор и origin
+            # на реплике Автора). Один раз на голос за акт: второй ход
+            # того же голоса — обычная дельта его новой нити.
+            since = (ANCHOR_EV["id"] - 1) if ANCHOR_EV else max(0, next_id() - 2)
+            for c in (channels_of(n) or (None,)):
+                st0 = load_state(n, c)
+                anchor_fresh(st0, VOICES[n], ANCHOR.get("addr"), since)
+                save_state(n, st0, c)
+            _ANCHORED.add(n)
+
         def _make(st, n=n):
+            an = ANCHOR if anchored_state(st) else None
             if memory_on(n):
                 # Память из ленты: вся нить с её начала, включая свои
                 # реплики (см. MEMORY_CAP); origin — курсор при рождении
@@ -1816,11 +1896,12 @@ def deliver(names: list[str], blind: bool = False) -> list[dict]:
                 origin = _origin_of(st)
                 hist = read_events(since=origin)
                 return build_prompt(n, st, hist, True, blind, acc=acc, memory=True,
-                                    origin=origin)
+                                    origin=origin, anchor=an)
             delta = read_events(since=st.get("cursor", 0))
             # Свои же реплики голосу не пересказываем: он их помнит нитью.
             delta = [e for e in delta if e["author"] != n]
-            return build_prompt(n, st, delta, not st.get("turns"), blind, acc=acc)
+            return build_prompt(n, st, delta, not st.get("turns"), blind, acc=acc,
+                                anchor=an)
         # У голоса с линиями промпт считается для КАЖДОЙ: какая
         # достанется, решат ворота уже внутри хода (см. per_channel).
         prompts[n] = per_channel(n, _make)
@@ -2294,12 +2375,24 @@ def roster() -> list[str]:
 # ─────────────────────────────────────────────────────────────────────
 def cmd_ask(a) -> int:
     """Новая тема — слепым первым ходом (решение стола от 2026-08-14)."""
-    global THREAD, GOAL_SNAPSHOT
+    global THREAD, GOAL_SNAPSHOT, ANCHOR_EV
     THREAD = None
     GOAL_SNAPSHOT = _read_goal()      # одна цель на акт — всем одинаково
     names = a.voices.split(",") if a.voices else roster()
-    post(HUMAN, "topic", a.text, topic=a.topic or "")
+    try:
+        an = _anchor_arg(a)
+    except anchor_mod.AnchorError as e:
+        print(f"якорь: {e}", file=sys.stderr)
+        return 2
+    mono = _anchor_chain(an, names)
+    ev0 = post(HUMAN, "topic", a.text, topic=a.topic or "", **_anchor_fields(an, names))
+    if an:
+        ANCHOR_EV = ev0
+        _anchor_note(an, mono)
     _tr(f"❯ {a.text}")
+    if an:
+        _tr(f"⚓ продолжение отсюда: {an['addr']} ({an['author']}, "
+            f"{len(an['text'])} симв., sha {an['sha']}); нити голосов — заново")
 
     # С досье контролёр в слепую фазу не идёт: его такт — второй, и
     # сверять он должен уже сказанное, а не отвечать наравне.
@@ -2435,13 +2528,78 @@ def cmd_threads(a) -> int:
     return 0
 
 
+def _anchor_arg(a) -> dict | None:
+    """--anchor <адрес> → разрешённый якорь или None. Отказ — словами
+    и кодом 2: сервер окна проверяет адрес раньше, здесь второй рубеж
+    (ручной запуск)."""
+    global ANCHOR, ANCHOR_EV
+    ANCHOR = None
+    ANCHOR_EV = None
+    _ANCHORED.clear()
+    addr = (getattr(a, "anchor", None) or "").strip()
+    if not addr:
+        return None
+    ANCHOR = anchor_mod.resolve(addr, live_path=LIVE, room_path=_room_path(),
+                                project=str(event_project()) if event_project() else None)
+    return ANCHOR
+
+
+def _room_path() -> Path:
+    return Path(os.environ.get("CHOIR_ROOM") or JOURNAL / "room.jsonl")
+
+
+def _anchor_fields(an: dict | None, targets: list[str]) -> dict:
+    """Поля события Автора: anchor (адрес, автор, sha, род) и адресаты
+    этого хода — по ним считается цепочка монолога."""
+    if not an:
+        return {}
+    return {"anchor": anchor_mod.field(an), "anchor_targets": list(targets)}
+
+
+def _anchor_chain(an: dict | None, targets: list[str]) -> int:
+    """Длина цепочки монолога, считая этот ход (до его записи)."""
+    if not an:
+        return 0
+    return anchor_mod.chain_mono(read_events(), an["author"], targets)
+
+
+def _anchor_note(an: dict | None, n: int) -> None:
+    """Мягкий сигнал о монологе — заметкой в ленту ПОСЛЕ реплики, к
+    которой он относится (субагент), не запретом."""
+    note = anchor_mod.mono_note(n, an["author"]) if an else None
+    if note:
+        post(CONDUCTOR, "note", note)
+        _out(note)
+
+
 def cmd_say(a) -> int:
-    global THREAD, GOAL_SNAPSHOT
+    global THREAD, GOAL_SNAPSHOT, ANCHOR_EV
     THREAD = None                    # ветка живёт внутри одного акта
     GOAL_SNAPSHOT = _read_goal()     # одна цель на акт — всем одинаково
-    ev = post(HUMAN, "say", a.text)
-    _tr(f"❯ {a.text}")
+    try:
+        an = _anchor_arg(a)
+    except anchor_mod.AnchorError as e:
+        print(f"якорь: {e}", file=sys.stderr)
+        return 2
     allowed = a.voices.split(",") if a.voices else roster()
+    # Адресаты хода известны до записи реплики: pick_voices читает
+    # событие, поэтому сначала считаем по черновику с тем же текстом.
+    draft = {"id": 0, "author": HUMAN, "kind": "say", "text": a.text}
+    targets0, why0 = pick_voices(draft, allowed)
+    targets0 = _cap_group(targets0)     # тот же отбор, что ниже у names (субагент)
+    prefer0 = getattr(a, "prefer", None)
+    if getattr(a, "once", False) and prefer0 and prefer0 in allowed \
+            and not why0.startswith("по адресу"):
+        targets0 = [prefer0]        # быстрый вопрос «случайному»: адресат — выбранный окном
+    mono = _anchor_chain(an, targets0)  # считать ДО записи реплики, писать — после неё
+    ev = post(HUMAN, "say", a.text, **_anchor_fields(an, targets0))
+    if an:
+        ANCHOR_EV = ev
+        _anchor_note(an, mono)
+    _tr(f"❯ {a.text}")
+    if an:
+        _tr(f"⚓ продолжение отсюда: {an['addr']} ({an['author']}, "
+            f"{len(an['text'])} симв., sha {an['sha']}); нить голоса — заново")
     names, why = pick_voices(ev, allowed)
     if not names:
         _out("никто не вступает")
@@ -2629,15 +2787,22 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Choir Live — живая комната")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
+    anchor_help = ("«продолжить отсюда»: адрес сообщения журнала "
+                   "(live:<id> или room:<id>) — оно уйдёт голосам дословно "
+                   "перед репликой, нить голоса начнётся заново; текст "
+                   "вставляет комната, не вызывающий (правило 8.5); "
+                   f"потолок {anchor_mod.ANCHOR_CAP} симв., сверх — отказ")
     p = sub.add_parser("ask", help="новая тема слепым первым ходом")
     p.add_argument("text")
     p.add_argument("--topic", default="")
     p.add_argument("--voices", help="через запятую; по умолчанию все")
+    p.add_argument("--anchor", help=anchor_help)
     p.set_defaults(fn=cmd_ask)
 
     p = sub.add_parser("say", help="реплика в разговор")
     p.add_argument("text")
     p.add_argument("--voices")
+    p.add_argument("--anchor", help=anchor_help)
     p.add_argument("--once", action="store_true",
                    help="один ход: вступают только названные голоса, "
                         "разговор дальше сам не идёт (для «быстрого "

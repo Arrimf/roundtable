@@ -52,6 +52,7 @@ import access                                   # noqa: E402  ACCESS.txt про�
 import coverage as cover                        # noqa: E402  карта покрытия: одна арифметика с окном
 import early                                    # noqa: E402  ранние отказы: тень и снятие
 import promptio                                 # noqa: E402  длинный промпт — не аргументом
+import anchor as anchor_mod                     # noqa: E402  «продолжить отсюда»: якорь раунда
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -1439,6 +1440,13 @@ def cli_version(name: str) -> str:
     return v
 
 
+def lot_excluded(rnd: list[dict]) -> list[str]:
+    """Кто в этом раунде вне жребия и свода (автор якоря) — по записи
+    жребия; нет записи или поля — никто."""
+    lots = [r for r in rnd if r.get("role") == "lot"]
+    return list((lots[-1].get("excluded") or [])) if lots else []
+
+
 def read_round(round_id: str) -> list[dict]:
     """Все записи раунда из журнала."""
     if not ROOM.exists():
@@ -2448,6 +2456,35 @@ def cmd_pick(a: argparse.Namespace) -> int:
     q_sha = hashlib.sha256(q.encode()).hexdigest()
     names = sorted([n.strip() for n in a.voices.split(",")] if a.voices
                    else list(VOICES))
+    # «ПРОДОЛЖИТЬ ОТСЮДА» (раунд prodolzhit-lyuboe-v1): автор якоря —
+    # вне жребия ведущего и свода (4 из 5; правило 13 по духу: кто дал
+    # тезис, тот не формулирует, что стол о нём решил). Участником он
+    # остаётся: --voices у ask его не теряет. Сам якорь — полем записи
+    # жребия (в room.jsonl, а не только в ленте окна — grok): адрес,
+    # автор, sha, род; в ПАКЕТ имя автора не идёт (решение Автора).
+    excluded = [v for v in (getattr(a, "exclude", None) or "").split(",") if v.strip()]
+    anchor_rec = None
+    addr = (getattr(a, "anchor", None) or "").strip()
+    if addr:
+        try:
+            anchor_rec = anchor_mod.field(anchor_mod.resolve(
+                addr, live_path=JOURNAL / "live.jsonl", room_path=ROOM,
+                project=str(PROJECT) if PROJECT else None))
+        except anchor_mod.AnchorError as e:
+            print(f"якорь: {e}", file=sys.stderr)
+            return 2
+    if excluded:
+        unknown = [v for v in excluded if v not in VOICES]
+        if unknown:
+            print(f"--exclude: неизвестные голоса: {', '.join(unknown)}",
+                  file=sys.stderr)
+            return 2
+        names = [n for n in names if n not in excluded]
+        if not names:
+            print("жребий не из кого: все названные голоса исключены",
+                  file=sys.stderr)
+            return 2
+        print(f"вне жребия ведущего: {', '.join(excluded)} (автор якоря)")
     try:
         b = beacon()
     except Exception as e:                        # noqa: BLE001
@@ -2466,6 +2503,11 @@ def cmd_pick(a: argparse.Namespace) -> int:
            "drand_signature": b["signature"], "mix_sha": mix,
            "index": idx, "choir": CHOIR_VERSION,
            "project": str(PROJECT) if PROJECT else None}
+    if excluded:
+        rec["excluded"] = excluded
+        rec["excluded_why"] = "автор якоря (продолжить отсюда): вне жребия и свода"
+    if anchor_rec:
+        rec["anchor"] = anchor_rec
     _append(rec)
     print(f"жребий: ведёт раунд — {winner}\n")
     print(f"  вопрос sha256   {q_sha}")
@@ -2697,6 +2739,13 @@ def cmd_summarize(a: argparse.Namespace) -> int:
         print(f"неизвестный голос: {a.by}", file=sys.stderr)
         return 2
     rnd = read_round(a.round)
+    if a.by in lot_excluded(rnd):
+        # автор якоря сводить не может — и по --by тоже: запрет,
+        # обходимый флагом, не запрет (правило 8.5)
+        print(f"{a.by} — автор якоря этого раунда и свод не пишет "
+              f"(вне жребия и свода); укажите --by другого голоса",
+              file=sys.stderr)
+        return 2
     # Позиции — ДЕЙСТВУЮЩИЕ записи (без аннулированных, одна на голос
     # в фазе): тот же отбор, что у карты, иначе сводчик видел позицию,
     # которую карта отрицала (ревизия 22.09: codex, grok, deepseek).
@@ -2995,8 +3044,14 @@ def cmd_run(a: argparse.Namespace) -> int:
                 return finish("failed", f"проект жребия исчез: {lp}", 2)
         done.append("pick:существующий")
     else:
-        if cmd_pick(argparse.Namespace(round=a.round, seed=str(seed_path),
-                                       voices=a.voices)) != 0:
+        rc_pick = cmd_pick(argparse.Namespace(round=a.round, seed=str(seed_path),
+                                              voices=a.voices,
+                                              exclude=getattr(a, "exclude", None),
+                                              anchor=getattr(a, "anchor", None)))
+        if rc_pick == 2:
+            return finish("failed", "жребий не брошен: кривые аргументы "
+                                    "(якорь или --exclude, см. stderr)", 2)
+        if rc_pick != 0:
             return finish("failed", "маяк drand недоступен — жребия нет, "
                                     "такт не начат (правило 11, fail-closed)",
                           3)
@@ -3184,7 +3239,8 @@ def cmd_run(a: argparse.Namespace) -> int:
             # Кандидаты — только ответившие ok в ЭТОМ раунде: сводить
             # должен тот, кто в раунде был. Ведущий из списка исключён —
             # он уже отказал.
-            cands = [v for v in answered if v != conductor]
+            excl = set(lot_excluded(read_round(a.round)))     # автор якоря — не сводит
+            cands = [v for v in answered if v != conductor and v not in excl]
             if not cands:
                 break
             base = f"{a.round}:summary:{','.join(cands)}"
@@ -4865,6 +4921,12 @@ def main() -> int:
     pk.add_argument("--round", required=True)
     pk.add_argument("--seed", required=True, help="файл с вопросом")
     pk.add_argument("--voices", help="через запятую; по умолчанию все")
+    pk.add_argument("--exclude", help="голоса вне жребия ведущего и свода "
+                    "(автор якоря при «продолжить отсюда»); участниками "
+                    "остаются")
+    pk.add_argument("--anchor", help="адрес якоря (live:<id> | room:<id>): "
+                    "пишется в запись жребия; текст якоря в вопрос кладёт "
+                    "окно, без имени автора")
     pk.set_defaults(fn=cmd_pick)
 
     ex_ = sub.add_parser("expand", help="ведущий разворачивает вопрос в затравку")
@@ -4916,6 +4978,8 @@ def main() -> int:
     rn.add_argument("--out", help="файл карточки свода .md "
                                   "(по умолчанию SUMMARY-<раунд латиницей>.md)")
     rn.add_argument("--voices", help="через запятую; по умолчанию все")
+    rn.add_argument("--exclude", help="вне жребия ведущего и свода (см. pick)")
+    rn.add_argument("--anchor", help="адрес якоря (см. pick)")
     rn.add_argument("--caller", default="arr",
                     help="кто запустил такт — пишется в журнал "
                          "(окно передаёт «roundtable»)")
