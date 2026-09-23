@@ -80,8 +80,11 @@ a = argv("grok")
 check("--model grok-4.5" in a[2] and "--effort high" in a[2],
       "grok: --model (новый рычаг) и --effort в строке script")
 a = argv("kimi")
-check(flag(a, "-m") == "moonshotai/kimi-k2.6",
-      "kimi: провайдер из default_model конфига, не литерал")
+# провайдер — у кого алиас объявлен в живом ~/.kimi-code/config.toml, иначе
+# провайдер default_model (не литерал moonshotai); модель — из окна
+check(flag(a, "-m").endswith("/kimi-k2.6") and flag(a, "-m").split("/")[0] in
+      (edits._kimi_default_model().split("/")[0], "kimi-code", "moonshotai", "moonshotai2"),
+      "kimi: провайдер из конфига (объявленный алиас или default_model), не литерал")
 a = argv("deepseek")
 check('model: "deepseek-v4-pro"' in Path(flag(a, "--patch")).read_text(),
       "deepseek: любая модель — свой патч-файл")

@@ -39,7 +39,7 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
-GATE_DIR = Path.home() / ".cache" / "choir" / "gates"
+GATE_DIR = Path(os.environ.get("CHOIR_GATE_DIR") or (Path.home() / ".cache" / "choir" / "gates"))   # тесты — свой каталог
 
 # Сколько ждать своей очереди. Больше самого длинного хода голоса: смысл
 # ворот в том, чтобы дождаться, а не в том, чтобы вежливо сдаться.
@@ -66,9 +66,16 @@ def _holders(names, paths) -> str:
     return " · ".join(f"{n}: {_busy_note(p)}" for n, p in zip(names, paths))
 
 
-@contextmanager
-def mark_quota(gate: str) -> None:
-    """Пометить линию исчерпанной на СЕГОДНЯ (UTC-дата в файле).
+PLAN_QUOTA_TTL = 3600     # с; подписка Kimi Code — 5-часовое скользящее окно:
+                          # ровного «до полуночи» у него нет, пробуем снова через час
+
+
+def mark_quota(gate: str, ttl: int | None = None) -> None:
+    """Пометить линию исчерпанной на СЕГОДНЯ (UTC-дата в файле) — или
+    на `ttl` секунд (в файле — момент истечения, unix-время): у
+    подписки Kimi Code квота не суточная, а скользящая 5-часовая, и
+    метка «до полуночи» держала бы живую линию мёртвой полдня либо
+    воскрешала бы мёртвую в полночь (2026-09-23).
 
     Ворота знают только «занято/свободно», а линия с выбранной дневной
     квотой свободна ВСЕГДА — по ней никто не работает. Без этой пометки
@@ -81,18 +88,36 @@ def mark_quota(gate: str) -> None:
     но не давал отказоустойчивости, хотя читатель ждёт именно её.
     """
     GATE_DIR.mkdir(parents=True, exist_ok=True)
-    (GATE_DIR / f"{gate}.quota").write_text(
-        time.strftime("%Y-%m-%d", time.gmtime()), encoding="utf-8")
+    stamp = (f"until:{int(time.time()) + int(ttl)}" if ttl
+             else time.strftime("%Y-%m-%d", time.gmtime()))
+    # атомарно: читатель не должен поймать полфайла (kimi, ревизия 23.09)
+    tmp = GATE_DIR / f"{gate}.quota.{os.getpid()}.tmp"
+    tmp.write_text(stamp, encoding="utf-8")
+    os.replace(tmp, GATE_DIR / f"{gate}.quota")
 
 
 def quota_dead(gate: str) -> bool:
-    """Линия помечена исчерпанной сегодня? Метка вчерашняя — квота
-    сброшена, линия снова в игре (TPD суточный)."""
+    """Линия помечена исчерпанной сегодня (или до момента `until:`)?
+    Метка вчерашняя / момент прошёл — квота сброшена, линия снова в
+    игре."""
     try:
         stamp = (GATE_DIR / f"{gate}.quota").read_text(encoding="utf-8").strip()
     except OSError:
         return False
+    if stamp.startswith("until:"):
+        try:
+            return time.time() < int(stamp[6:])
+        except ValueError:
+            return False
     return stamp == time.strftime("%Y-%m-%d", time.gmtime())
+
+
+def clear_quota(gate: str) -> None:
+    """Снять метку (удачный вызов по линии — квота жива)."""
+    try:
+        (GATE_DIR / f"{gate}.quota").unlink()
+    except OSError:
+        pass
 
 
 def alive_gates(names: list[str]) -> list[str]:

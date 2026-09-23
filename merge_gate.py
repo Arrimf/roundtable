@@ -467,8 +467,9 @@ def _run_reviewers(picked: dict, pf: Path, timeout: int, *, cwd: str):
         if name == "kimi":
             sys.path.insert(0, str(edits.CHOIR))
             from serial_gate import first_free_gate    # noqa: PLC0415
-            from channels import kimi_channels         # noqa: PLC0415
-            gates = sorted({c["gate"] for c in kimi_channels()}) or ["kimi"]
+            from channels import kimi_channels, gates_for_model   # noqa: PLC0415
+            alias = argv[argv.index("-m") + 1] if "-m" in argv else ""
+            gates = gates_for_model(kimi_channels(), alias) or ["kimi"]   # замок той же линии
             with first_free_gate(gates):
                 return _plain(name, argv, t0)
         return _plain(name, argv, t0)

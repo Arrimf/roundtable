@@ -43,7 +43,7 @@ if ss -ltn 2>/dev/null | grep -q ":$PORT "; then
   echo "порт $PORT занят: $(ss -ltnp | grep ":$PORT ") — задайте RT_HTTP_TEST_PORT"; exit 2
 fi
 ( cd "$RT_DIR" && ROUNDTABLE_CHAMBER="$W/chamber" ROUNDTABLE_JOURNAL="$W/journal" CHOIR_RT_VOICES="$W/rt-voices.json" CHOIR_RT_ACTS="$W/acts" CHOIR_LEASE_DIR="$W/leases" CHOIR_RT_NO_AUTOREVIEW=1 CHOIR_RT_WINDOWS="$W/windows" CHOIR_RT_LAST_RUN="$W/rt-last.json" \
-  CHOIR_RT_MODELS="$W/rt-models.json" CHOIR_RT_NO_DISCOVERY=1 CHOIR_DSH_PATCH_DIR="$W/dshp" CHOIR_RT_NO_BWRAP=1 \
+  CHOIR_RT_MODELS="$W/rt-models.json" CHOIR_RT_NO_DISCOVERY=1 CHOIR_RT_NO_KIMI_WEB=1 CHOIR_DSH_PATCH_DIR="$W/dshp" CHOIR_RT_NO_BWRAP=1 \
   CHOIR_WT_DIR="$W/wt" ROUNDTABLE_PORT="$PORT" nohup python3 roundtable.py --no-project \
   > "$W/srv.log" 2>&1 ) &
 for _ in $(seq 1 40); do sleep 0.25; curl -s -o /dev/null "$B/state" && break; done
@@ -206,6 +206,32 @@ echo "$R" | grep -q '"act"' && pass "/round с проектом → 200" || fail
 sleep 2
 grep -q "^pick --round pj2 --seed .* --project $W/proj2$" "$W/chamber/argv.log" && pass "/round: --project уходит в pick (цепочка по шагам)" || fail "argv pick без --project: $(grep pick "$W/chamber/argv.log")"
 grep -q "^ask --round pj2 --seed" "$W/chamber/argv.log" && ! grep "^ask --round pj2" "$W/chamber/argv.log" | grep -q -- "--project" && pass "/round: ask без --project (берёт из жребия)" || fail "argv ask: $(grep '^ask' "$W/chamber/argv.log")"
+# ── резерв Кими по ключам API (подписка Kimi Code первой линией, 2026-09-23) ──
+[ "$(code /voices '{"voice":"kimi","scope":"room","reserve":false}')" = 200 ] && pass "reserve kimi room → 200" || fail "reserve kimi room"
+[ "$(code /voices '{"voice":"kimi","scope":"rounds","reserve":true}')" = 200 ] && pass "reserve kimi rounds → 200 (одна галочка на обе вкладки)" || fail "reserve kimi rounds"
+[ "$(code /voices '{"voice":"claude","scope":"room","reserve":false}')" = 400 ] && pass "reserve claude → 400 (резервной линии нет)" || fail "reserve claude"
+[ "$(code /voices '{"voice":"kimi","scope":"exec","reserve":false}')" = 400 ] && pass "reserve exec → 400" || fail "reserve exec"
+[ "$(code /voices '{"voice":"kimi","scope":"room","reserve":"no"}')" = 400 ] && pass "reserve не bool → 400" || fail "reserve not bool"
+[ "$(code /voices '{"voice":"kimi","scope":"room","reserve":false,"model":"kimi-k3"}')" = 400 ] && pass "reserve вместе с model → 400" || fail "reserve+model"
+post /voices '{"voice":"kimi","scope":"room","reserve":false}' >/dev/null
+curl -s "$B/voices" > "$W/reserve.json"
+python3 - "$W/reserve.json" <<'PY' && pass "GET /voices: reserve=false на room и rounds, can_reserve только у kimi" || fail "GET /voices reserve: $(head -c 300 "$W/reserve.json")"
+import json,sys; d=json.load(open(sys.argv[1])); v={x["name"]: x for x in d["voices"]}
+k=v["kimi"]["tabs"]
+assert k["room"]["reserve"] is False and k["room"]["can_reserve"] and "plan_line" in k["room"], k["room"]
+assert k["rounds"]["reserve"] is False and k["rounds"]["can_reserve"], k["rounds"]
+assert "can_reserve" not in v["claude"]["tabs"]["room"]
+PY
+grep -q '"reserve": false' "$W/rt-voices.json" && pass "reserve сохранён в rt-voices.json (room)" || fail "reserve не в файле"
+grep -q 'резерв по ключам API ВЫКЛЮЧЕН' "$W/journal/live.jsonl" && pass "voice_config в ленте о резерве" || fail "voice_config reserve"
+python3 - "$W/rt-voices.json" <<'PY' && pass "rt-voices: reserve у claude отбрасывается валидацией при чтении" || fail "rt-voices reserve validation"
+import json,sys,subprocess,os
+p=sys.argv[1]; d=json.load(open(p)); d.setdefault("claude",{}).setdefault("room",{})["reserve"]=False; json.dump(d,open(p,"w"))
+PY
+[ "$(code /voices '{"voice":"kimi","scope":"room","model":"k3-256k"}')" = 200 ] && pass "модель подписки k3-256k проходит model_re" || fail "model_re k3"
+post /voices '{"voice":"kimi","scope":"room","reserve":true}' >/dev/null
+post /voices '{"voice":"kimi","scope":"room","model":""}' >/dev/null 2>&1 || true
+
 # ── «продолжить отсюда» (раунд prodolzhit-lyuboe-v1; решения Автора 2026-09-23) ──
 # адрес → текст из журнала на сервере; отказы словами; в раунд — без имени автора,
 # автор вне жребия (--exclude у pick), поле anchor в событии запуска

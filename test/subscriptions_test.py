@@ -6,6 +6,7 @@ import base64
 import importlib.util
 import json
 import os
+os.environ["CHOIR_RT_NO_KIMI_WEB"] = "1"
 import sys
 import tempfile
 import time
@@ -122,8 +123,10 @@ rt._get_json = lambda url, h, timeout=5: (200, {"account": {"has_claude_max": Tr
                                                   "organization": {"subscription_status": "active",
                                                                    "subscription_created_at": "2026-04-20"}}, "")
 cl = rt._sub_claude()
-check("claude: статус active из профиля, план max, дата продления честно не обещана",
-      cl["state"] == "active" and cl["plan"] == "max" and "не отдаёт" in cl["note"] and not cl.get("until"))
+check("claude: статус active из профиля, план max; дата — ОЦЕНКА по месячному циклу от подключения (20-е число), помечена estimated",
+      cl["state"] in ("active", "ending") and cl["plan"] == "max" and "не отдаёт" in cl["note"]
+      and cl.get("estimated") is True and str(cl.get("until", "")).endswith("-20T00:00:00Z")
+      and "оценка" in cl["until_kind"])
 rt._get_json = lambda url, h, timeout=5: (200, {"account": {"has_claude_max": False, "has_claude_pro": False},
                                                   "organization": {"subscription_status": "canceled"}}, "")
 check("claude: статус canceled — expired", rt._sub_claude()["state"] == "expired")
@@ -139,9 +142,11 @@ rt._get_json = _orig
 # сборка: все шесть, баланс — none
 rt._sub_claude = lambda: {"state": "active"}; rt._sub_codex = lambda: {"state": "expired"}; rt._sub_grok = lambda: {"state": "active"}
 allsub = rt.collect_subscriptions()
-check("collect_subscriptions: шесть голосов; kimi/deepseek/gemini — none с причиной",
+check("collect_subscriptions: шесть голосов; deepseek/gemini — none с причиной; kimi — через kimi web (здесь выключен → unknown с причиной)",
       set(allsub) == {"claude", "codex", "grok", "kimi", "deepseek", "gemini"}
-      and allsub["kimi"]["state"] == "none" and "баланс" in allsub["kimi"]["note"] and allsub["gemini"]["state"] == "none")
+      and ((allsub["kimi"]["state"] == "unknown" and "kimi web" in allsub["kimi"]["note"])
+           or (allsub["kimi"]["state"] == "none" and "kimi login" in allsub["kimi"]["note"]))
+      and "баланс" in allsub["deepseek"]["note"] and allsub["gemini"]["state"] == "none")
 rt._sub_codex = lambda: (_ for _ in ()).throw(RuntimeError("boom"))
 _r = rt.collect_subscriptions(force=True)
 check("сборщик упал — unknown с причиной, остальные целы",

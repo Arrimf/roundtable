@@ -42,6 +42,7 @@ import secrets
 import shlex
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -1599,7 +1600,7 @@ VOICE_CTL: dict[str, dict] = {
     "kimi": {
         "rounds_default": "умолчание: модель линии из ~/.kimi-code/config.toml",
         "model_env": "CHOIR_KIMI_MODEL",
-        "model_re": r"kimi-[\w.-]{1,40}",
+        "model_re": r"(?:kimi-[\w.-]{1,40}|k\d[\w.-]{0,30})",   # kimi-k3 · k3 · k3-256k (подписка)
         "applies_to": ["live.py"],
         "scope": "живая комната; имя БЕЗ провайдера (kimi-k3, не "
                  "moonshotai/kimi-k3): провайдер выбирает КЛЮЧ линии, и "
@@ -1678,6 +1679,20 @@ SCOPES = ("room", "rounds", "exec")
 # Голоса без сессии CLI: память нити им собирает комната из ленты
 # (live.memory_on); галочка «память» в строке голоса, область room.
 MEMORY_VOICES = frozenset(n for n, v in live.VOICES.items() if v.get("no_session"))
+# Голоса с резервной линией по ключам API (галочка «резерв API»): Кими —
+# подписка Kimi Code первой линией, ключи moonshotai* резервом
+# (channels.py, 2026-09-23).
+RESERVE_VOICES = frozenset({"kimi"})
+
+
+def _kimi_plan_declared() -> bool:
+    """Объявлен ли в ~/.kimi-code/config.toml алиас подписки (вход сделан)."""
+    try:
+        from channels import _models_from_config, KIMI_CONFIG, PLAN_MODEL
+        return PLAN_MODEL in (_models_from_config(KIMI_CONFIG) or {})
+    except Exception:                               # noqa: BLE001
+        return False
+
 
 
 def _load_voice_cfg() -> None:
@@ -1720,7 +1735,7 @@ def _load_voice_cfg() -> None:
         ctl = VOICE_CTL.get(name) or {}
         for sc in list(ent):
             keys = ("model", "effort", "pool") if sc == "exec" \
-                else ("model", "effort", "memory") if sc == "room" \
+                else ("model", "effort", "memory", "reserve") if sc == "room" \
                 else ("model", "effort")
             pair = {k: ent[sc][k] for k in keys
                     if k in ent[sc]}          # белый список ключей
@@ -1731,6 +1746,10 @@ def _load_voice_cfg() -> None:
                                      or name not in MEMORY_VOICES):
                 drop(name, sc, "memory", "не bool или у голоса есть сессия")
                 pair.pop("memory", None)
+            if "reserve" in pair and (not isinstance(pair["reserve"], bool)
+                                      or name not in RESERVE_VOICES):
+                drop(name, sc, "reserve", "не bool или у голоса нет резервной линии")
+                pair.pop("reserve", None)
             for what, why in _pair_problems(name, sc, pair):
                 drop(name, sc, what, why)
                 pair.pop(what, None)
@@ -1886,6 +1905,10 @@ def _spawn_env(voices: list[str]) -> dict:
             room = cfg.get("room") or {}
             if name in MEMORY_VOICES:
                 env[f"CHOIR_{name.upper()}_MEMORY"] = "0" if room.get("memory") is False else "1"
+            if name in RESERVE_VOICES:
+                # резерв по ключам API у Кими: одна галочка на комнату,
+                # раунды и кресло — читает channels.py при импорте
+                env[f"CHOIR_{name.upper()}_RESERVE"] = "0" if room.get("reserve") is False else "1"
             if room.get("model") and ctl.get("model_env"):
                 env[ctl["model_env"]] = room["model"]
             if room.get("effort") and ctl.get("effort_env"):
@@ -2211,6 +2234,12 @@ def voice_report(name: str, limit: dict) -> dict:
         if sc == "room" and name in MEMORY_VOICES:
             t.update(memory=set_.get("memory", True) is not False, can_memory=True,
                      memory_cap=live.MEMORY_CAP)
+        if sc in ("room", "rounds") and name in RESERVE_VOICES:
+            # галочка «резерв API» хранится в паре room, показывается на
+            # обеих вкладках: резерв один на комнату и раунды
+            rpair = (cfg.get("room") or {}) if isinstance(cfg, dict) else {}
+            t.update(reserve=rpair.get("reserve", True) is not False, can_reserve=True,
+                     plan_line=bool(_kimi_plan_declared()))
         if sc == "exec":
             t.update(pool=set_.get("pool", name not in edits.EDIT_COSTLY),
                      costly=name in edits.EDIT_COSTLY,
@@ -2973,8 +3002,12 @@ def _kimi_key() -> str | None:
             provs = tomllib.load(f).get("providers") or {}
     except Exception:                               # noqa: BLE001
         return None
-    for _, p in sorted(provs.items()):
-        if isinstance(p, dict) and isinstance(p.get("api_key"), str):
+    for pname, p in sorted(provs.items()):
+        # управляемый провайдер подписки (managed:kimi-code, type kimi)
+        # держит в api_key пустую строку/заглушку — это не ключ линии
+        if not isinstance(p, dict) or str(pname).startswith("managed:"):
+            continue      # тип не критерий: ключ «Kimi For Coding» тоже type=kimi (deepseek)
+        if isinstance(p.get("api_key"), str) and p["api_key"].strip():
             return p["api_key"]
     return None
 
@@ -3010,10 +3043,165 @@ def _lim_kimi_log() -> dict | None:
                        "успешном вызове Кими счётчика не сообщает")
 
 
+# ── kimi: ПОДПИСКА Kimi Code (2026-09-23, «Кими пересел на CLI») ─────
+# Расход плана и уровень аккаунта CLI отдаёт только через свой локальный
+# сервер (`kimi web`, документированный REST: /api/v1/oauth/usage —
+# «plan quota and booster wallet», /api/v1/oauth/userinfo, /api/v1/auth);
+# прямого адреса account-service в бинаре нет, а токен OAuth живёт 900 с
+# и обновляется самим CLI. Поэтому окно поднимает `kimi web --no-open`
+# на свободном порту НА ВРЕМЯ ЗАПРОСА (2–3 с, три GET) и гасит его;
+# bearer — `~/.kimi-code/server.token` (постоянный, пишет сам CLI).
+# Снимок кэшируется KIMI_PLAN_TTL: спавнить 180-мегабайтный процесс
+# каждый проход лимитов (180 с) незачем.
+KIMI_WEB_BIN = Path.home() / ".kimi-code" / "bin" / "kimi"
+KIMI_WEB_TOKEN = Path.home() / ".kimi-code" / "server.token"
+KIMI_PLAN_TTL = 300.0
+_KIMI_PLAN_CACHE: dict = {"ts": 0.0, "data": None}
+_KIMI_PLAN_LOCK = threading.Lock()
+KIMI_PLAN_WINDOWS = (   # ключ ответа → подпись, окно в минутах (None — календарное)
+    ("limit5h", "5 часов", 300),
+    ("limit7d", "неделя", 10080),
+    ("monthTotal", "месяц (всё)", None),
+    ("monthCode", "месяц (код)", None),
+)
+
+
+def _free_port() -> int:
+    with socket.socket() as sk:
+        sk.bind(("127.0.0.1", 0))
+        return int(sk.getsockname()[1])
+
+
+def kimi_web_query(paths: tuple[str, ...] = ("/api/v1/auth", "/api/v1/oauth/usage",
+                                              "/api/v1/oauth/userinfo"),
+                   timeout: float = 25.0) -> dict:
+    """{путь: data | {"error": …}} — через временный `kimi web`.
+    Ничего не пишет и не звонит модели: только служебные GET."""
+    out: dict = {}
+    if os.environ.get("CHOIR_RT_NO_KIMI_WEB"):
+        # тесты и стенды: 180-мегабайтный процесс CLI не поднимать
+        return {p: {"error": "kimi web выключен (CHOIR_RT_NO_KIMI_WEB)"} for p in paths}
+    if not KIMI_WEB_BIN.exists():
+        return {p: {"error": f"нет {KIMI_WEB_BIN}"} for p in paths}
+    port = _free_port()
+    try:
+        proc = subprocess.Popen([str(KIMI_WEB_BIN), "web", "--no-open", "--port", str(port)],
+                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, start_new_session=True,
+                                cwd=str(Path.home()))
+    except OSError as e:
+        return {p: {"error": f"kimi web не запустился: {e}"} for p in paths}
+    try:
+        base = f"http://127.0.0.1:{port}"
+        t0 = time.monotonic()
+        up = False
+        while time.monotonic() - t0 < 20:
+            if proc.poll() is not None:
+                break
+            code, d, _ = _get_json(f"{base}/api/v1/healthz", {}, timeout=2)
+            if code == 200 and isinstance(d, dict) and (d.get("data") or {}).get("ok"):
+                up = True
+                break
+            time.sleep(0.4)
+        if not up:
+            return {p: {"error": "kimi web не поднялся за 20 с"} for p in paths}
+        try:
+            token = KIMI_WEB_TOKEN.read_text(encoding="utf-8").strip()
+        except OSError as e:
+            return {p: {"error": f"нет {KIMI_WEB_TOKEN}: {e}"} for p in paths}
+        hdr = {"Authorization": f"Bearer {token}"}
+        for pth in paths:
+            code, d, err = _get_json(base + pth, hdr, timeout=timeout)
+            if isinstance(d, dict) and d.get("code") == 0:
+                out[pth] = d.get("data")
+            else:
+                out[pth] = {"error": err or f"HTTP {code}: {str(d)[:200]}"}
+    finally:
+        # всю группу процессов (start_new_session): terminate лидера
+        # оставлял бы детей `kimi web` на порту (ревизия 23.09: все четверо)
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+                os.killpg(proc.pid, sig)
+            try:
+                proc.wait(timeout=5)
+                break
+            except subprocess.TimeoutExpired:
+                continue
+    return out
+
+
+def kimi_plan_snapshot(force: bool = False) -> dict:
+    """Снимок подписки Kimi Code: auth, usage, userinfo, at (кэш KIMI_PLAN_TTL)."""
+    with _KIMI_PLAN_LOCK:
+        if not force and _KIMI_PLAN_CACHE["data"] and time.time() - _KIMI_PLAN_CACHE["ts"] < KIMI_PLAN_TTL:
+            return dict(_KIMI_PLAN_CACHE["data"])
+        if not _kimi_plan_declared():
+            # входа нет — kimi web ради заведомого «не подключено» не
+            # поднимать каждые 5 минут (kimi, ревизия 23.09)
+            q = {"/api/v1/auth": {"managed_provider": None, "models_ready": None},
+                 "/api/v1/oauth/usage": {"error": "подписка Kimi Code не подключена (kimi login)"},
+                 "/api/v1/oauth/userinfo": {"error": "подписка Kimi Code не подключена (kimi login)"}}
+        else:
+            q = kimi_web_query()
+        snap = {"auth": q.get("/api/v1/auth"), "usage": q.get("/api/v1/oauth/usage"),
+                "userinfo": q.get("/api/v1/oauth/userinfo"), "at": _iso(time.time())}
+        _KIMI_PLAN_CACHE.update(ts=time.time(), data=dict(snap))
+        return snap
+
+
+def kimi_plan_gauges(usage: dict | None, at: str) -> tuple[list[dict], str]:
+    """Шкалы из ответа /api/v1/oauth/usage: окна плана (проценты, момент
+    сброса) и кошелёк доп. расхода. Второе значение — заметка/ошибка."""
+    src = "kimi web → /api/v1/oauth/usage (account service Kimi Code)"
+    if not isinstance(usage, dict):
+        return [], "расход плана не запросился: kimi web не ответил"
+    if usage.get("error"):
+        return [], f"расход плана не запросился: {usage['error']}"
+    if usage.get("kind") != "ok":
+        return [], f"account service Kimi Code: {usage.get('message') or usage.get('kind')}"
+    quota = usage.get("quota") or {}
+    usages = quota.get("usages") or {}
+    gauges: list[dict] = []
+    for key, label, win in KIMI_PLAN_WINDOWS:
+        w = usages.get(key)
+        if not isinstance(w, dict) or not isinstance(w.get("usedRatio"), (int, float)):
+            continue
+        g = _gauge(label, meaning="used", known=round(float(w["usedRatio"]) * 100, 1),
+                   total=100.0, unit="percent", measured_at=at, source=src,
+                   note="процент израсходованного окна ПОДПИСКИ Kimi Code, как его "
+                        "считает провайдер: сюда входит вся работа Автора этим "
+                        "аккаунтом (CLI, web, VS Code), не только стол")
+        if win:
+            g["window_minutes"] = win
+        if isinstance(w.get("resetAt"), str):
+            g["resets_at"] = w["resetAt"]
+        gauges.append(g)
+    ex = quota.get("extraUsage")
+    if isinstance(ex, dict) and isinstance(ex.get("balanceCents"), (int, float)):
+        cur = str(ex.get("currency") or "").lower() or "cny"
+        gauges.append(_gauge("доп. расход", meaning="left", known=float(ex["balanceCents"]) / 100,
+                             unit=cur, measured_at=at, source=src,
+                             note="кошелёк Extra Usage: списывается ПОСЛЕ квот подписки; "
+                                  + (f"за месяц потрачено {float(ex.get('monthlyUsedCents') or 0) / 100:.2f}"
+                                     if isinstance(ex.get("monthlyUsedCents"), (int, float)) else "")))
+    note = "" if gauges else "план без окон в ответе (usages пуст)"
+    return gauges, note
+
+
 def _lim_kimi(room: dict) -> dict:
-    key = _kimi_key()
     gauges: list[dict] = []
     extra: dict = {}
+    # 1. Подписка Kimi Code — основная линия
+    snap = kimi_plan_snapshot()
+    pg, pnote = kimi_plan_gauges(snap.get("usage"), snap.get("at") or _iso(time.time()))
+    gauges.extend(pg)
+    if pnote:
+        extra["plan_note"] = pnote
+    ui = snap.get("userinfo")
+    if isinstance(ui, dict) and ui.get("kind") == "ok":
+        extra["plan"] = str((ui.get("userInfo") or {}).get("userLevelName") or "")
+    # 2. Резерв по ключу API (галочка «резерв API»): баланс кошелька
+    key = _kimi_key()
     if key:
         hdr = {"Authorization": f"Bearer {key}"}
         code, d, err = _get_json(f"{KIMI_API}/users/me/balance", hdr)
@@ -3021,14 +3209,15 @@ def _lim_kimi(room: dict) -> dict:
         bal = (data or {}).get("available_balance")
         if isinstance(bal, (int, float)):
             gauges.append(_gauge(
-                "баланс", meaning="left", known=float(bal), unit="usd",
+                "резерв: баланс", meaning="left", known=float(bal), unit="usd",
                 measured_at=_iso(time.time()),
                 source=f"{KIMI_API}/users/me/balance",
-                note="ОДИН кошелёк на обе линии (moonshotai и "
-                     "moonshotai2 — один org/project/user); потолка у "
-                     "баланса нет, поэтому нет и шкалы"))
+                note="кошелёк ключевой линии (резерв на случай исчерпания "
+                     "квоты подписки; галочка «резерв API»); один на все "
+                     "ключевые линии одной организации; потолка у баланса "
+                     "нет, поэтому нет и шкалы"))
         else:
-            extra["note"] = f"баланс не запросился — {err}"
+            extra["note"] = f"баланс резерва не запросился — {err}"
         code, d, err = _get_json(f"{KIMI_API}/users/me", hdr)
         org = (((d or {}).get("data") or {}).get("organization")
                if isinstance(d, dict) else None)
@@ -3055,7 +3244,7 @@ def _lim_kimi(room: dict) -> dict:
                     f"serial_gate.py записано 1. Не проверено живым "
                     f"параллельным вызовом — очередь оставлена как есть")
     else:
-        extra["note"] = f"ключа не нашлось в {KIMI_CFG}"
+        extra["note"] = f"ключевой линии (резерва) в {KIMI_CFG} нет"
     snap = _lim_kimi_log()
     if snap:
         gauges.append(snap)
@@ -3345,8 +3534,13 @@ def _jwt_payload(token: str) -> dict:
         return {}
 
 
-def _sub_state(until_iso: str | None, active: bool | None) -> str:
+def _sub_state(until_iso: str | None, active: bool | None, soft: bool = False) -> str:
     """active / ending (меньше 7 дней) / expired / unknown.
+
+    soft=True — дата СПРАВОЧНАЯ (оценка у Claude, сброс месячной квоты
+    у Kimi), а не срок подписки: из неё не выводятся ни ending, ни
+    expired — иначе «⚠ подписка до…» вспыхивало бы неделю каждый месяц
+    у автопродляемого плана (ревизия 23.09: kimi, deepseek, grok, субагент).
 
     Флаг провайдера СИЛЬНЕЕ даты: план free с датой в будущем или
     неактивная подписка Грока с недавним billingPeriodEnd иначе
@@ -3354,6 +3548,8 @@ def _sub_state(until_iso: str | None, active: bool | None) -> str:
     меньше недели — ending."""
     if active is False:
         return "expired"
+    if soft:
+        return "active" if active is True else "unknown"
     if until_iso:
         try:
             dt = datetime.fromisoformat(str(until_iso).replace("Z", "+00:00"))
@@ -3426,12 +3622,85 @@ def _sub_claude() -> dict:
     else:
         hm = acc.get("has_claude_max") or acc.get("has_claude_pro")
         active = bool(hm) if hm is not None else None
-    return {"state": _sub_state(None, active),
+    since = org.get("subscription_created_at")
+    est = _monthly_anniversary(since) if active else None
+    return {"state": _sub_state(est, active, soft=True),
             "plan": (plan or org.get("organization_type") or "")
                     + (f" ({status})" if status in ("trialing", "past_due") else ""),
-            "status": status, "since": org.get("subscription_created_at"),
+            "status": status, "since": since,
+            "until": est, "estimated": bool(est),
+            "until_kind": "оценка: следующее списание по месячному циклу от даты подключения",
             "source": CLAUDE_PROFILE,
-            "note": "дату продления Anthropic не отдаёт: известен только статус"}
+            "note": "дату продления Anthropic не отдаёт: известен статус и дата "
+                    "подключения; «до» — ОЦЕНКА по месячному циклу от неё (наказ "
+                    "Автора 2026-09-23: срок показывать), не факт провайдера"}
+
+
+def _monthly_anniversary(since_iso: str | None, now: float | None = None) -> str | None:
+    """Ближайшая (после now) месячная годовщина даты since — как оценка
+    следующего списания; день переносится на последний день короткого
+    месяца. None — даты нет или она кривая."""
+    if not since_iso:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(since_iso).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    now_dt = datetime.fromtimestamp(now if now is not None else time.time(), timezone.utc)
+    import calendar
+    y, m = now_dt.year, now_dt.month
+    for _ in range(3):
+        day = min(dt.day, calendar.monthrange(y, m)[1])
+        cand = dt.replace(year=y, month=m, day=day)
+        if cand > now_dt:
+            return cand.isoformat().replace("+00:00", "Z")
+        m += 1
+        if m > 12:
+            m, y = 1, y + 1
+    return None
+
+
+def _sub_kimi() -> dict:
+    """Подписка Kimi Code через временный `kimi web`: состояние входа
+    (/api/v1/auth: authenticated / expired / revoked / unauthenticated),
+    уровень (/oauth/userinfo: userLevelName — Plus, Pro, …), дата —
+    сброс МЕСЯЧНОЙ квоты (/oauth/usage: monthTotal.resetAt): дату
+    окончания самой подписки Kimi через CLI не отдаёт, и подписывать
+    сброс квоты как «до» без оговорки нельзя (правило 8.5)."""
+    snap = kimi_plan_snapshot()
+    auth = snap.get("auth")
+    if not isinstance(auth, dict) or auth.get("error"):
+        return {"state": "unknown", "source": "kimi web → /api/v1/auth",
+                "note": f"вход не проверился: {(auth or {}).get('error') if isinstance(auth, dict) else 'kimi web не ответил'}"}
+    mp = auth.get("managed_provider")
+    if not isinstance(mp, dict):
+        return {"state": "none", "source": "kimi web → /api/v1/auth",
+                "note": "подписка Kimi Code не подключена: провайдера managed:kimi-code "
+                        "в конфиге нет — вход командой `kimi login`"}
+    status = str(mp.get("status") or "")
+    active = {"authenticated": True, "expired": False, "revoked": False,
+              "unauthenticated": False}.get(status)
+    ui = snap.get("userinfo")
+    plan = ""
+    if isinstance(ui, dict) and ui.get("kind") == "ok":
+        plan = str((ui.get("userInfo") or {}).get("userLevelName") or "")
+    until = None
+    us = snap.get("usage")
+    if isinstance(us, dict) and us.get("kind") == "ok":
+        mt = ((us.get("quota") or {}).get("usages") or {}).get("monthTotal") or {}
+        if isinstance(mt.get("resetAt"), str):
+            until = mt["resetAt"]
+    st = _sub_state(until, active, soft=True) if status == "authenticated" else (
+        "expired" if status in ("expired", "revoked") else "none")
+    return {"state": st, "plan": plan, "until": until, "status": status,
+            "until_kind": "сброс месячной квоты",
+            "source": "kimi web → /api/v1/auth, /oauth/userinfo, /oauth/usage",
+            "note": ("дата — сброс месячной квоты плана (дату окончания подписки "
+                     "Kimi через CLI не отдаёт); вход: " + status)
+                    if status == "authenticated" else
+                    f"вход в Kimi Code: {status or '?'} — `kimi login`"}
 
 
 def _sub_grok() -> dict:
@@ -3469,7 +3738,8 @@ SUB_TTL = 3600           # профиль и подписки — раз в ча
 def collect_subscriptions(force: bool = False) -> dict[str, dict]:
     if not force and _SUB_CACHE["data"] and time.time() - _SUB_CACHE["ts"] < SUB_TTL:
         return dict(_SUB_CACHE["data"])
-    jobs = {"claude": _sub_claude, "codex": _sub_codex, "grok": _sub_grok}
+    jobs = {"claude": _sub_claude, "codex": _sub_codex, "grok": _sub_grok,
+            "kimi": _sub_kimi}
     out: dict[str, dict] = {}
     with ThreadPoolExecutor(max_workers=len(jobs)) as ex:
         futs = {ex.submit(fn): n for n, fn in jobs.items()}
@@ -3479,7 +3749,7 @@ def collect_subscriptions(force: bool = False) -> dict[str, dict]:
                 out[n] = f.result()
             except Exception as e:                      # noqa: BLE001
                 out[n] = {"state": "unknown", "note": f"сборщик упал: {type(e).__name__}: {e}"}
-    for n in ("kimi", "deepseek", "gemini"):
+    for n in ("deepseek", "gemini"):
         out[n] = {"state": "none", "note": SUB_NONE_BALANCE if n != "gemini"
                   else "ключи API без подписки — срок не применим"}
     for v in out.values():
@@ -4879,6 +5149,33 @@ class Handler(BaseHTTPRequestHandler):
                 # VOICE_CFG (нашёл gemini).
                 return self._json(400, {"error": "нет такого голоса: "
                                         + (name or "(пусто)")})
+            if "reserve" in req:
+                # Резерв Кими по ключам API (наказ Автора 2026-09-23):
+                # одна галочка, хранится в паре room, действует на
+                # комнату, раунды и кресло (env CHOIR_KIMI_RESERVE)
+                if name not in RESERVE_VOICES or vscope not in ("room", "rounds"):
+                    return self._json(400, {"error": "резерв по ключам API: только "
+                                            f"{', '.join(sorted(RESERVE_VOICES))} "
+                                            "(комната или раунды)"})
+                if not isinstance(req["reserve"], bool):
+                    return self._json(400, {"error": "reserve — bool"})
+                if req.get("model") or req.get("effort") or "model" in req or "effort" in req:
+                    return self._json(400, {"error": "reserve — отдельным запросом"})
+                with CFG_LOCK:
+                    ent = VOICE_CFG.setdefault(name, {})
+                    pair = dict(ent.get("room") or {})
+                    pair["reserve"] = req["reserve"]
+                    ent["room"] = pair
+                    _save_voice_cfg(name, "room")
+                ev = feed_append(
+                    "voice_config",
+                    f"голос {name}: резерв по ключам API "
+                    + ("ВКЛЮЧЁН — при исчерпании квоты подписки тот же ход уходит "
+                       "ключевой линии (платно, с баланса)" if req["reserve"]
+                       else "ВЫКЛЮЧЕН — только подписка Kimi Code; квота кончилась — "
+                            "отказ канала"),
+                    voice=name, cfg_scope="room", reserve=req["reserve"], by="arr")
+                return self._json(200, {"ok": True, "event": ev["id"]})
             if "memory" in req:
                 # Память нити из ленты — только область room и только
                 # голосу без сессии; отдельным запросом, как pool
@@ -6620,12 +6917,12 @@ function renderSub(row,m){
   let txt,cls='';
   if(s.state==='none'){txt='подписка: нет'+(s.plan?' · '+s.plan:'')+(s.note&&/баланс/.test(s.note)?' (баланс)':'');cls='dim'}
   else if(s.state==='expired'){txt='⛔ подписка ИСТЕКЛА'+(d?' '+d:'')+(s.plan?' · '+s.plan:'');cls='bad'}
-  else if(s.state==='ending'){txt='⚠ подписка до '+d+(s.plan?' · '+s.plan:'');cls='warn'}
-  else if(s.state==='active'){txt='подписка: '+(d?'до '+d:'активна')+(s.plan?' · '+s.plan:'');cls='ok'}
+  else if(s.state==='ending'){txt='⚠ подписка до '+(s.estimated?'≈':'')+d+(s.plan?' · '+s.plan:'');cls='warn'}
+  else if(s.state==='active'){txt='подписка: '+(d?(s.estimated?'до ≈'+d:'до '+d):'активна')+(s.plan?' · '+s.plan:'');cls='ok'}
   else if(s.state==='stale'){txt='подписка: жива по провайдеру, дата '+d+' прошла — снимок устарел';cls='warn'}
   else{txt='подписка: неизвестно'+(s.plan?' · '+s.plan:'');cls='dim'}
   el.classList.add(cls);el.textContent=txt;
-  el.title=[s.note||'',s.status?'статус: '+s.status:'',s.since?'с: '+s.since:'',
+  el.title=[s.note||'',s.until_kind?'дата: '+s.until_kind:'',s.status?'статус: '+s.status:'',s.since?'с: '+s.since:'',
     s.checked_at?'провайдер проверял: '+s.checked_at:'',s.source?'источник: '+s.source:'']
     .filter(Boolean).join('\n')||txt;
 }
@@ -7255,6 +7552,28 @@ function applyVoices(list,fresh){
           if(t)t.memory=want;
         };
         const tx=document.createElement('span');tx.textContent='память';
+        lb.appendChild(cb);lb.appendChild(tx);
+        memc.appendChild(lb);
+      }
+      // «резерв API» — у Кими (подписка Kimi Code первой линией, ключи
+      // moonshotai* резервом): одна галочка на комнату и раунды
+      if((sc==='room'||sc==='rounds')&&t.can_reserve){
+        const lb=document.createElement('label');lb.className='memlab';
+        lb.title='Резерв по ключам API: первая линия '+name+' — подписка Kimi Code'+(t.plan_line?'':' (вход не сделан: kimi login)')+'. Галочка — при исчерпании квоты подписки тот же ход сразу уходит ключевой линии (платно, с баланса; в ленте — «⇄ … линия»). Без галочки — только подписка: квота кончилась — отказ канала.';
+        const cb=document.createElement('input');cb.type='checkbox';cb.checked=!!t.reserve;cb.className='memck';
+        cb.onchange=async function(ev){
+          ev.stopPropagation();
+          const want=cb.checked;
+          memc.dataset.busy='1';
+          let r,j={};
+          try{r=await fetch('/voices',{method:'POST',headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({voice:name,scope:sc,reserve:want})});j=await r.json();}
+          catch(e){cb.checked=!want;delete memc.dataset.busy;return acterr('сервер не ответил: '+e)}
+          delete memc.dataset.busy;
+          if(!r.ok){cb.checked=!want;return acterr((j&&j.error)||('ошибка '+r.status))}
+          if(t)t.reserve=want;
+        };
+        const tx=document.createElement('span');tx.textContent='резерв API';
         lb.appendChild(cb);lb.appendChild(tx);
         memc.appendChild(lb);
       }

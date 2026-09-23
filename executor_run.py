@@ -549,8 +549,11 @@ def _run(a, wt: Path, cmd: list, lease) -> int:
             # которым раунды не пересекаются, — серийность деградировала
             # молча, и 429 вернулись бы под видом починенного (deepseek).
             try:
-                from channels import kimi_channels   # noqa: PLC0415
-                gates = sorted({c["gate"] for c in kimi_channels()})
+                from channels import kimi_channels, gates_for_model   # noqa: PLC0415
+                import edits as _edits                                  # noqa: PLC0415
+                # замок — той линии, чьим алиасом идёт кресло (подписка
+                # ИЛИ ключ), а не «любой свободный» (ревизия 23.09)
+                gates = gates_for_model(kimi_channels(), _edits._kimi_model_arg())
                 if not gates:
                     raise RuntimeError("пустой список каналов")
             except Exception as e:                   # noqa: BLE001

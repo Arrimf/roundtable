@@ -59,9 +59,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
-from channels import by_gate, describe, kimi_channels
+from channels import by_gate, describe, kimi_channels, resolve_alias
 from serial_gate import (first_free_gate, with_retry,
-                         alive_gates, mark_quota)
+                         alive_gates, mark_quota, quota_dead, clear_quota,
+                         PLAN_QUOTA_TTL)
 
 SCHEMA = 2                      # версия формата записи в room.jsonl
 CHOIR_VERSION = "0.3"
@@ -421,6 +422,13 @@ TIMEOUT_OVERRIDE: int | None = None
 # Переменные окружения (их выставляет окно RoundTable при явной
 # настройке) по-прежнему сильнее умолчания — и это видно в ленте
 # событием voice_config, а не происходит молча.
+def _kimi_alias(ch: dict) -> str:
+    """Алиас `-m` линии Кими с моделью окна (CHOIR_KIMI_MODEL) — см.
+    channels.resolve_alias."""
+    return resolve_alias(ch, _renv("kimi", "MODEL"),
+                         warn=lambda m: print(m, file=sys.stderr))
+
+
 def _renv(voice: str, kind: str, default: str = "") -> str:
     """Настройка голоса ДЛЯ РАУНДОВ из окружения.
 
@@ -1082,11 +1090,9 @@ VOICES: dict[str, dict] = {
         # ключ линии и остаётся родным (та же механика, что в live.py).
         "cmd": lambda p, f, a, ch: [
             str(KIMI_BIN), *_kimi_dirs(),
-            "-m",
-            ((ch["model"].split("/")[0] + "/"
-              + _renv("kimi", "MODEL").split("/")[-1])
-             if _renv("kimi", "MODEL") and "/" in ch["model"]
-             else (_renv("kimi", "MODEL") or ch["model"])),
+            # только ОБЪЯВЛЕННЫЙ алиас: у подписки и ключей имена моделей
+            # разные, склейка без проверки роняла ход (channels.resolve_alias)
+            "-m", _kimi_alias(ch),
             "-p", p],
         "channels": KIMI_CHANNELS,
         "bin": str(KIMI_BIN),
@@ -1634,7 +1640,8 @@ def flush_blind_notes() -> None:
 
 
 def ask_one(name: str, prompt: str, round_id: str, phase: str,
-            parent: str | None, visibility: str, use_role: bool = True) -> dict:
+            parent: str | None, visibility: str, use_role: bool = True,
+            _fallback: str | None = None) -> dict:
     """Спросить один голос. Возвращает запись для room.jsonl.
 
     Ошибку НЕ поглощаем и не подменяем пустым ответом: пустая строка
@@ -1642,6 +1649,7 @@ def ask_one(name: str, prompt: str, round_id: str, phase: str,
     «ответил ничем».
     """
     v = VOICES[name]
+    prompt0 = prompt                  # исходный — для повтора хода резервной линией
     # Роль, если голос её за собой закрепил, едет вместе с вопросом —
     # но НЕ в своде: свод, написанный «адвокатом дьявола», уже не свод
     # (нашёл голос claude, раунд roles-v1).
@@ -1818,9 +1826,9 @@ def ask_one(name: str, prompt: str, round_id: str, phase: str,
                     # месяц прочтутся как загадка, а разница в скорости —
                     # как свойство участника (правило 1: условия обязаны
                     # быть названы).
-                    rec |= {"channel": ch["name"], "model": ch["model"],
+                    rec |= {"channel": ch["name"], "model": _kimi_alias(ch),   # что ушло в -m
                             "gate": ch["gate"]}
-                    if ch is not chans[0]:
+                    if ch is not chans[0] and not _fallback:
                         _say(visibility, f"  ⇄ {name}: основная линия занята — иду "
                                          f"запасной ({ch['model']}). Это ТОТ ЖЕ голос, "
                                          f"не второй участник")
@@ -1920,10 +1928,14 @@ def ask_one(name: str, prompt: str, round_id: str, phase: str,
                                  f"{last.get('line')}" if last else "")}
         elif quota_detail:
             rec |= {"status": "quota", "text": out, "detail": quota_detail}
-            # Пометить линию на сутки: следующий вызов пойдёт по живой,
-            # а не будет добивать исчерпанную (см. mark_quota).
+            # Пометить линию: ключ — на сутки (TPD), подписка — на
+            # PLAN_QUOTA_TTL (окно скользящее); следующий вызов пойдёт
+            # по живой, а не будет добивать исчерпанную (см. mark_quota).
+            # До 2026-09-23 mark_quota стоял под @contextmanager и без
+            # `with` НЕ ИСПОЛНЯЛСЯ — метка никогда не ставилась (нашёл
+            # при переезде Кими на подписку; сутки резерва были обещанием).
             if rec.get("gate"):
-                mark_quota(rec["gate"])
+                mark_quota(rec["gate"], PLAN_QUOTA_TTL if (ch or {}).get("role") == "plan" else None)
         elif run["status"] == "stalled":
             # ОТДЕЛЬНЫЙ статус, не `timeout`: «перестал подавать признаки
             # жизни через N с тишины» и «работал дольше лимита» — разные
@@ -1946,6 +1958,8 @@ def ask_one(name: str, prompt: str, round_id: str, phase: str,
                     "detail": "код 0, но ответ пуст"}
         else:
             rec |= {"status": "ok", "text": out}
+            if rec.get("gate") and quota_dead(rec["gate"]):
+                clear_quota(rec["gate"])       # линия ответила — метка квоты снята
         # Фактическая модель Джемини — в запись раунда. Комментарий у
         # голоса обещал, что подмену видно, «потому что дирижёр пишет
         # stderr в журнал» — а при status=ok stderr никуда не пишется:
@@ -1972,6 +1986,29 @@ def ask_one(name: str, prompt: str, round_id: str, phase: str,
         with contextlib.suppress(OSError):
             cdir.rmdir()
     rec["elapsed_s"] = round(time.monotonic() - t0, 1)
+    if (rec.get("status") == "quota" and rec.get("channel") and not _fallback
+            and v.get("channels")):
+        # Резерв СРАЗУ, тем же ходом: живая линия того же голоса есть —
+        # ответ раунда не теряется, отказ первой линии остаётся полями
+        # в записи (правило 4). Ворота на повторе сами обойдут
+        # помеченную линию (alive_gates).
+        chans = tuple(v.get("channels") or ())
+        others = [c for c in chans if c["name"] != rec["channel"] and not quota_dead(c["gate"])]
+        if others:
+            _say(visibility, f"  ⇄ {name}: линия {rec['channel']} ({rec.get('model')}) — "
+                             f"квота исчерпана; тот же ход уходит линии {others[0]['name']} "
+                             f"({others[0]['model']}). Это ТОТ ЖЕ голос, не второй участник")
+            rec2 = ask_one(name, prompt0, round_id, phase, parent, visibility,
+                           use_role=use_role, _fallback=rec["channel"])
+            rec2["fallback_from"] = rec["channel"]
+            rec2["fallback_detail"] = f"квота: {str(rec.get('detail') or '')[:300]}"
+            rec2["fallback_first"] = {k: rec.get(k) for k in
+                                      ("id", "channel", "model", "status", "detail", "elapsed_s",
+                                       "queued_s", "early_warns", "returncode", "silence_s", "jail")
+                                      if rec.get(k) is not None}
+            return rec2
+    if _fallback:
+        rec["fallback_from"] = _fallback
     r_new = declared_role(rec.get("text", ""))
     if r_new:
         rec["role_declared"] = r_new

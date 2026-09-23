@@ -394,8 +394,12 @@ def _discover_kimi() -> dict:
     local = parse_kimi_config(cfg)
     provs = cfg.get("providers") or {}
     key, base = None, "https://api.moonshot.ai/v1"
-    for _, p in sorted(provs.items()):
-        if isinstance(p, dict) and isinstance(p.get("api_key"), str):
+    for pname, p in sorted(provs.items()):
+        # управляемый провайдер подписки (managed:kimi-code) держит в
+        # api_key заглушку — не ключ линии (ревизия 23.09: kimi, grok, субагент)
+        if str(pname).startswith("managed:"):
+            continue
+        if isinstance(p, dict) and isinstance(p.get("api_key"), str) and p["api_key"].strip():
             key = p["api_key"]
             base = str(p.get("base_url") or base).rstrip("/")
             break

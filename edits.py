@@ -169,12 +169,20 @@ def _kimi_default_model() -> str:
     замороженное умолчание расходилось бы с тем, что показывают
     комната и раунды (нашли grok, субагент)."""
     v = ""
+    models: dict = {}
     try:
         import tomllib
         with (Path.home() / ".kimi-code" / "config.toml").open("rb") as f:
-            v = str(tomllib.load(f).get("default_model") or "").strip()
+            cfg = tomllib.load(f)
+        v = str(cfg.get("default_model") or "").strip()
+        models = cfg.get("models") or {}
     except Exception:                               # noqa: BLE001
         v = ""
+    # Подписка Kimi Code (2026-09-23, «Кими пересел на CLI»): кресло идёт
+    # по ней, если вход сделан (алиас kimi-code/k3 объявлен входом), —
+    # default_model конфига CLI при этом может оставаться ключевым.
+    if isinstance(models, dict) and "kimi-code/k3" in models:
+        return "kimi-code/k3"
     if not v:
         return "moonshotai/kimi-k3"
     return v if "/" in v else "moonshotai/" + v
@@ -281,6 +289,20 @@ def _kimi_model_arg() -> str:
     m = exec_value("kimi", "model")
     if "/" in m:
         return m
+    # Провайдер — тот, у которого алиас `<провайдер>/<модель>` ОБЪЯВЛЕН
+    # в конфиге CLI (подписка kimi-code предпочтительна: 2026-09-23);
+    # ни у кого не объявлен — провайдер default_model, как раньше.
+    try:
+        import tomllib
+        with (Path.home() / ".kimi-code" / "config.toml").open("rb") as f:
+            models = tomllib.load(f).get("models") or {}
+    except Exception:                               # noqa: BLE001
+        models = {}
+    provs = [str(a).split("/")[0] for a in models if str(a).endswith("/" + m)]
+    if "kimi-code" in provs:
+        return f"kimi-code/{m}"
+    if provs:
+        return f"{provs[0]}/{m}"
     prov = _kimi_default_model().split("/")[0] or "moonshotai"
     return f"{prov}/{m}"
 

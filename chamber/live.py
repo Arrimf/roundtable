@@ -67,8 +67,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
-from channels import by_gate, kimi_channels
-from serial_gate import serial_gate, first_free_gate, alive_gates
+from channels import by_gate, kimi_channels, resolve_alias
+from serial_gate import (serial_gate, first_free_gate, alive_gates, mark_quota,
+                         quota_dead, clear_quota, PLAN_QUOTA_TTL)
 
 HERE = Path(__file__).resolve().parent
 # Журнал — в journal/ рядом с chamber/ (переезд 2026-09-06); CHOIR_JOURNAL
@@ -481,27 +482,22 @@ def _kimi_line_model(c: dict) -> str:
     """Модель линии Кими с учётом переопределения из окна.
 
     `-m` у kimi-code — это «провайдер/модель», и провайдер выбирает
-    КЛЮЧ (см. channels.py). Окно задаёт только модель, БЕЗ провайдера:
-    подставь Автор полное имя — обе линии сели бы на один ключ, и
-    двухлинейность молча умерла бы. Поэтому провайдер всегда родной
-    для линии, подменяется только часть после «/».
+    КЛЮЧ или подписку (см. channels.py). Окно задаёт только модель, БЕЗ
+    провайдера: подставь Автор полное имя — обе линии сели бы на один
+    ключ, и двухлинейность молча умерла бы. Провайдер в значении не
+    игнорируется молча (первая редакция игнорировала — Автор думал, что
+    сменил модель, а нить шла на старой; нашли kimi, codex, grok и
+    субагент в один голос): берётся хвост после «/». Принимается только
+    объявленный алиас — см. channels.resolve_alias.
     """
-    if not KIMI_MODEL:
-        return c["model"]
-    want = KIMI_MODEL
-    if "/" in want:
-        # Провайдер в значении НЕ игнорируется молча (первая редакция
-        # игнорировала — Автор думал, что сменил модель, а нить шла на
-        # старой; нашли kimi, codex, grok и субагент в один голос).
-        # Берём хвост после «/», говорим об этом вслух: намерение
-        # «сменить модель» исполняется, выбор ключа остаётся за линией.
-        want = want.split("/")[-1]
+    if KIMI_MODEL and "/" in KIMI_MODEL and "kimi:prov" not in _WARN_ONCE:
+        _WARN_ONCE.add("kimi:prov")
         print(f"⚠ CHOIR_KIMI_MODEL содержит провайдера — он у каждой "
-              f"линии свой, беру только модель: {want}", file=sys.stderr)
-    if not want:
-        return c["model"]
-    prov = c.get("provider") or c["model"].split("/")[0]
-    return f"{prov}/{want}"
+              f"линии свой, беру только модель: {KIMI_MODEL.split('/')[-1]}", file=sys.stderr)
+    return resolve_alias(c, KIMI_MODEL, warn=lambda m: print(m, file=sys.stderr))
+
+
+_WARN_ONCE: set[str] = set()
 
 
 def _add_dir(proj: Path | None) -> list[str]:
@@ -1516,7 +1512,7 @@ def _claude_result(out: str) -> str:
 _DELIVER_ACC = None            # снимок ACCESS.txt текущей раздачи (deliver)
 
 
-def turn(name: str, prompt, acc=None) -> dict:
+def turn(name: str, prompt, acc=None, _fallback: str | None = None) -> dict:
     """Один ход голоса в его нити. Возвращает событие для ленты.
 
     Ошибку не поглощаем и пустым ответом не подменяем: «промолчал» и
@@ -1562,6 +1558,7 @@ def turn(name: str, prompt, acc=None) -> dict:
     ptext = prompt if isinstance(prompt, str) else ""
     fact: dict = {}          # факт клетки — в событие при любом исходе
     anchored = False         # ход «отсюда» (нить сброшена deliver'ом)
+    actual_model = None      # алиас, реально ушедший в -m (Кими)
     anchor_prev = None       # прежняя сессия при «продолжить отсюда»
     prompt_via = ""
     seen_text = None
@@ -1609,6 +1606,7 @@ def turn(name: str, prompt, acc=None) -> dict:
                 # (или без записи о каталоге), там не найдётся («No session
                 # found for current directory») — начинаем заново
                 use_cont = False
+            actual_model = _kimi_line_model(ch) if (name == "kimi" and ch) else None
             cmd = _voice_cmd(v, "cont" if use_cont else "start", ptext,
                              pfile, afile, session, ch)
             # Длинный промпт аргументом — за MAX_ARG_STRLEN (128 КБ на
@@ -1789,11 +1787,43 @@ def turn(name: str, prompt, acc=None) -> dict:
 
     if ch:
         ev["channel"] = ch["name"]
-        ev["model"] = ch["model"]
-        if ch is not chans[0]:
+        ev["model"] = actual_model or ch["model"]   # что ушло в -m, не шаблон линии (grok)
+        if ev.get("kind") != "error" and quota_dead(ch["gate"]):
+            clear_quota(ch["gate"])                 # линия ответила — метка квоты снята
+        if ch is not chans[0] and not _fallback:
             _note(f"  ⇄ {name}: основная линия была занята — ход ушёл "
                   f"запасной ({ch['model']}). Это ТОТ ЖЕ голос, не второй "
                   f"участник")
+        if ev.get("kind") == "error" and ev.get("status") == "quota":
+            # КВОТА ЛИНИИ: пометить (подписка — на PLAN_QUOTA_TTL, окно
+            # у неё скользящее 5-часовое; ключ — до полуночи UTC, TPD) и,
+            # если есть живой резерв, отдать ТОТ ЖЕ ход ему сразу — иначе
+            # реплика пропала бы, а резерв включался бы лишь со
+            # следующего хода (наказ Автора 2026-09-23: резерв «на случай
+            # быстрого исчерпания лимитов»). Отказ первой линии — полями
+            # fallback_from/fallback_detail в реплике (правило 4).
+            mark_quota(ch["gate"], PLAN_QUOTA_TTL if ch.get("role") == "plan" else None)
+            others = [c for c in chans if c is not ch and not quota_dead(c["gate"])]
+            if others and not _fallback:
+                nxt = others[0]
+                _note(f"  ⇄ {name}: линия {ch['name']} ({ch['model']}) — квота "
+                      f"исчерпана: {str(ev.get('detail') or '')[:120]}; тот же ход "
+                      f"уходит линии {nxt['name']} ({nxt['model']}). Это ТОТ ЖЕ "
+                      f"голос, не второй участник")
+                ev2 = turn(name, prompt, acc, _fallback=ch["name"])
+                ev2["fallback_from"] = ch["name"]
+                ev2["fallback_detail"] = f"квота: {str(ev.get('detail') or '')[:300]}"
+                # первая попытка — целиком полями, не 300 символами (субагент):
+                # её время, очередь и тень иначе пропадали бы из журнала
+                ev2["fallback_first"] = {k: ev.get(k) for k in
+                                         ("channel", "model", "status", "detail", "elapsed_s",
+                                          "queued_s", "early_warns", "jail", "returncode")
+                                         if ev.get(k) is not None}
+                return ev2
+        elif ev.get("kind") != "error" and ch.get("role") == "plan":
+            pass      # удачный ход по подписке: метка, если была, истечёт сама по TTL
+    if _fallback and ch:
+        ev["fallback_from"] = _fallback
 
     # Отпечаток ТОГО, ЧТО ГОЛОС РЕАЛЬНО ВИДЕЛ. Нашёл голос claude на первом
     # живом прогоне: в раундах затравка одна на всех и её sha лежит в

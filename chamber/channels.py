@@ -35,6 +35,7 @@ HTTP-вызова прошли параллельно (18.7 с каждый, о�
 """
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 
@@ -52,10 +53,30 @@ KIMI_CONFIG = Path.home() / ".kimi-code" / "config.toml"
 # сессии по одной реплике в каждой. Плюс `state.json` (нить, курсор,
 # счётчик ходов) лежит в каталоге голоса и пишется без блокировки —
 # два пишущих процесса просто затрут друг друга.
+#
+# С 2026-09-23 (наказ Автора: «Кими пересел на CLI») первая линия —
+# ПОДПИСКА Kimi Code: провайдер `managed:kimi-code` (вход `kimi login`,
+# токен в ~/.kimi-code/credentials/kimi-code.json), алиас `kimi-code/k3`,
+# адрес api.kimi.com/coding/v1. Ключевые линии (`moonshotai*`) остаются
+# РЕЗЕРВОМ на случай быстрого исчерпания квоты плана (5-часовое окно и
+# месячный лимит — по документации Kimi Code); резерв включает галочка
+# окна (`CHOIR_KIMI_RESERVE`, умолчание — включён). Роль линии —
+# поле `role`: plan | api; в журнал уходит имя линии (`channel`) и
+# модель, как раньше.
 _KIMI = (
-    {"name": "main", "model": "moonshotai/kimi-k3",  "dir": "kimi"},
-    {"name": "alt",  "model": "moonshotai2/kimi-k3", "dir": "kimi-alt"},
+    {"name": "code", "model": "kimi-code/k3",      "dir": "kimi-code", "role": "plan"},
+    {"name": "main", "model": "moonshotai/kimi-k3",  "dir": "kimi",      "role": "api"},
+    {"name": "alt",  "model": "moonshotai2/kimi-k3", "dir": "kimi-alt",  "role": "api"},
 )
+PLAN_MODEL = _KIMI[0]["model"]
+
+
+def reserve_on(env: dict | None = None) -> bool:
+    """Галочка «резерв по ключам API»: CHOIR_KIMI_RESERVE=0 выключает.
+    Умолчание — включён: резерв и заведён ради «квота плана кончилась,
+    а стол идёт»."""
+    env = os.environ if env is None else env
+    return str(env.get("CHOIR_KIMI_RESERVE", "1")).strip().lower() not in ("0", "false", "off", "")
 
 
 def gate_name(provider: str) -> str:
@@ -122,11 +143,64 @@ def kimi_channels(path: Path = KIMI_CONFIG) -> tuple[dict, ...]:
             continue
         prov = declared.get(c["model"]) or c["model"].split("/")[0]
         out.append(dict(c, provider=prov, gate=gate_name(prov)))
+    plan = [c for c in out if c.get("role") == "plan"]
+    if plan and not reserve_on():
+        # Подписка есть, резерв выключен галочкой: ключевые линии не
+        # зовутся вовсе — иначе «резерв выключен» было бы полем без
+        # механики (правило 8.5), а баланс списывался бы молча.
+        out = plan
     if not out:
-        c = _KIMI[0]
+        # Ни подписки, ни ключей в конфиге: ведём себя как до правки —
+        # одна ключевая линия по умолчанию CLI (не подписка: её без
+        # входа нет, и «code» в журнале врало бы про транспорт).
+        c = _KIMI[1]
         prov = c["model"].split("/")[0]
         out = [dict(c, provider=prov, gate=gate_name(prov))]
     return tuple(out)
+
+
+_WARNED: set[str] = set()
+
+
+def resolve_alias(c: dict, want: str, path: Path = KIMI_CONFIG, warn=None) -> str:
+    """Алиас `-m` для линии с учётом модели, заданной окном (без
+    провайдера: провайдер — у линии, он выбирает ключ/подписку).
+
+    Принимается только ОБЪЯВЛЕННЫЙ в конфиге CLI алиас: у подписки
+    свои имена (k3, k3-256k, kimi-for-coding…), у ключей — свои
+    (kimi-k3); склейка «префикс линии + модель окна» без проверки
+    роняла бы ход «неизвестной моделью» под именем голоса — ровно на
+    резерве, ради которого линия заведена (ревизия 23.09: субагент,
+    grok, deepseek). Конфиг не прочитан: подписка — своя модель линии,
+    ключевая линия — склейка, как до правки."""
+    if not want:
+        return c["model"]
+    want = want.split("/")[-1]
+    alias = c["model"].split("/")[0] + "/" + want
+    declared = _models_from_config(path) or {}
+    if alias in declared or (not declared and c.get("role") != "plan"):
+        return alias
+    if warn and alias not in _WARNED:
+        _WARNED.add(alias)
+        warn(f"⚠ kimi: алиас {alias} не объявлен в {path.name} — линия "
+             f"{c['name']} идёт своей моделью {c['model']}")
+    return c["model"]
+
+
+def gates_for_model(chans: tuple[dict, ...], model_alias: str) -> list[str]:
+    """Ворота линий, чей провайдер стоит в алиасе `-m` (кресло и
+    ревизия зовут Кими ОДНИМ алиасом — замок обязан быть той же
+    организации/подписки, иначе кресло берёт свободный ключевой замок и
+    всё равно бьёт в занятую подписку; ревизия 23.09: grok, субагент).
+    Нет совпадений — все ворота (как раньше)."""
+    pref = (model_alias or "").split("/")[0]
+    out = sorted({c["gate"] for c in chans if c["model"].split("/")[0] == pref})
+    return out or sorted({c["gate"] for c in chans})
+
+
+def plan_line(chans: tuple[dict, ...]) -> dict | None:
+    """Линия подписки среди каналов голоса (None — подписки нет)."""
+    return next((c for c in chans if c.get("role") == "plan"), None)
 
 
 def by_gate(chans: tuple[dict, ...], gate: str | None) -> dict | None:
