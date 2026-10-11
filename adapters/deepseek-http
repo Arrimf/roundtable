@@ -1,0 +1,352 @@
+#!/usr/bin/env python3
+"""deepseek-http — голос DeepSeek за столом, прямым HTTP.
+
+ЗАЧЕМ БЕЗ CLI. Официальный `dsh` — агентная оболочка целиком, конкурент
+Claude Code: он тянет свой цикл, свои инструменты и свою сессию. Столу
+нужен не агент, а один вопрос и один ответ той моделью, которой голос
+подписан. Плюс урок Джемини (2026-08-16): его CLI молча подменял модель,
+и увидеть это можно было только в JSON-статистике. Между столом и
+моделью не должно быть прослойки, которая вправе решать за нас.
+
+Неофициальные CLI (`@sluisr/deepseek-cli`, `deepseek-tui`,
+`@trenchwork/erosolar`) не рассматривались вовсе: все три ведут частные
+лица, а каждому из них пришлось бы отдать ключ от предоплаченного
+баланса.
+
+Контракт с choir.py — тот же, что у gemini-http:
+    stdout   — только текст ответа;
+    stderr   — диагностика (модель, токены, стоимость, ретраи);
+    exit 0   — ответ получен;
+    exit 3   — кончился баланс или квота (честный отказ);
+    exit 1/2 — прочие ошибки.
+
+Ключ: ~/.deepseek/key (одна строка, права 600). История вызовов —
+~/.deepseek/choir-http/, по образцу Джемини: `choir.py recover` достаёт
+потерянный ответ по sha256 промпта, а у HTTP-вызова своей истории нет.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import socket
+import sys
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime
+from pathlib import Path
+
+HOME = Path.home()
+KEY_FILE = HOME / ".deepseek" / "key"
+HIST_DIR = HOME / ".deepseek" / "choir-http"
+BASE = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+DEFAULT_MODEL = "deepseek-v4-pro"
+# Цены на 2026-08 (за 1M токенов), для строки диагностики.
+PRICE_IN_MISS, PRICE_IN_HIT, PRICE_OUT = 0.435, 0.0036, 0.87
+RETRIES = 3
+# Дедлайн первого байта (раунд «ранние-отказы»): см. gemini-http — одна
+# молчащая попытка не должна съедать весь бюджет вызова.
+# 90, не 60: v4-pro с рассуждениями в пробный день дважды не дал первого
+# байта за 60 с и ответил с третьей попытки — при потолке 60 три попытки
+# (180 с) перекрывали ход комнаты (180). STREAM_IDLE_S — сторож тишины
+# МЕЖДУ порциями после первого байта (двое часов из свода раунда):
+# поток, молчащий полторы минуты, мёртв, весь бюджет ему не отдаётся.
+FIRST_BYTE_S = max(10, int(os.environ.get("DEEPSEEK_FIRST_BYTE_S", "90")))
+STREAM_IDLE_S = max(10, int(os.environ.get("DEEPSEEK_STREAM_IDLE_S", "90")))
+
+
+def log(msg: str) -> None:
+    print(msg, file=sys.stderr, flush=True)
+
+
+def read_key() -> str:
+    env = os.environ.get("DEEPSEEK_API_KEY")
+    if env:
+        return env.strip()
+    if not KEY_FILE.exists():
+        log(f"нет ключа: положите его в {KEY_FILE} (одна строка, chmod 600)")
+        sys.exit(2)
+    k = KEY_FILE.read_text().strip()
+    if not k:
+        log(f"файл ключа {KEY_FILE} пуст")
+        sys.exit(2)
+    return k
+
+
+class StreamBroken(Exception):
+    """Поток закрылся без завершающего чанка или дедлайн вышел посреди
+    ответа: усечённый текст нельзя выдавать за полный (ревизия: codex,
+    субагент — «EOF без [DONE] читался как успех»)."""
+
+
+_PRINTED = False       # хоть что-то ушло в stdout/stderr — повтор запрещён
+
+
+_FIRST_BYTE_SEEN = False
+
+
+def _set_sock_timeout(resp, timeout: float) -> None:
+    try:
+        sock = getattr(getattr(resp, "fp", None), "raw", None)
+        sock = getattr(sock, "_sock", None) or resp.fp.fp.raw._sock   # обе цепочки http.client
+        sock.settimeout(timeout)
+    except Exception as e:                                # noqa: BLE001
+        log(f"таймаут сокета не переставлен ({type(e).__name__}): порции "
+            f"ждутся по {FIRST_BYTE_S} с")
+
+
+def stream_read(r, deadline: float, t_open: float | None = None,
+                timeout: float | None = None) -> dict:
+    """Собрать ответ из SSE-потока, ПЕЧАТАЯ ПО МЕРЕ ПРИХОДА (правило 17,
+    наказ Автора 2026-09-14: «хочется похожесть на общение в терминале»):
+    мысли — в stderr между маркерами «💭 мысли модели» / «💭 конец
+    мыслей» (по CHOIR_THOUGHTS=1), текст ответа — в stdout. Возвращает
+    словарь той же формы, что обычный ответ, плюс _streamed=True — чтобы
+    main() не печатал текст второй раз."""
+    global _PRINTED
+    thoughts_on = os.environ.get("CHOIR_THOUGHTS") == "1"
+    think: list[str] = []
+    text: list[str] = []
+    usage: dict = {}
+    model = ""
+    opened = closed = done = False
+    first_byte: float | None = None
+    try:
+        for raw in r:
+            if first_byte is None:
+                global _FIRST_BYTE_SEEN
+                _FIRST_BYTE_SEEN = True
+                first_byte = round(time.monotonic() - (t_open or time.monotonic()), 1)
+                if t_open is not None:           # живой вызов, не разбор потока в тесте
+                    log(f"первый байт через {first_byte} с")
+                if timeout:
+                    _set_sock_timeout(r, min(timeout, STREAM_IDLE_S))
+            if time.monotonic() > deadline:
+                raise StreamBroken("дедлайн вышел посреди потока")
+            line = raw.decode("utf-8", "replace").strip()
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if data == "[DONE]":
+                done = True
+                break
+            try:
+                d = json.loads(data)
+            except ValueError:
+                continue
+            model = d.get("model") or model
+            if d.get("usage"):
+                usage = d["usage"]
+            for ch in d.get("choices") or []:
+                if ch.get("finish_reason"):
+                    done = True
+                delta = ch.get("delta") or {}
+                rc = delta.get("reasoning_content")
+                if rc:
+                    think.append(rc)
+                    if thoughts_on:
+                        if not opened:
+                            print("💭 мысли модели (reasoning_content, поток):",
+                                  file=sys.stderr, flush=True)
+                            opened = True
+                        print(rc, end="", file=sys.stderr, flush=True)
+                        _PRINTED = True
+                c = delta.get("content")
+                if c:
+                    if opened and not closed:
+                        print(f"\n💭 конец мыслей ({len(''.join(think))} симв.)",
+                              file=sys.stderr, flush=True)
+                        closed = True
+                    text.append(c)
+                    print(c, end="", flush=True)
+                    _PRINTED = True
+    finally:
+        # Маркер закрывается и при обрыве: иначе strip_thoughts у стола
+        # съел бы всё до следующего «конец мыслей», включая причину
+        # отказа канала (ревизия: субагент).
+        if opened and not closed:
+            print(f"\n💭 конец мыслей ({len(''.join(think))} симв.)",
+                  file=sys.stderr, flush=True)
+    if text:
+        print(flush=True)                  # завершающий перевод строки
+    if not done:
+        raise StreamBroken(f"поток закрылся без завершающего чанка "
+                           f"(получено {len(''.join(text))} симв.)")
+    return {"model": model, "usage": usage, "_streamed": True,
+            "choices": [{"message": {"content": "".join(text),
+                                     "reasoning_content": "".join(think)}}]}
+
+
+def call(prompt: str, model: str, key: str, timeout: int,
+         effort: str | None = None, stream: bool = True) -> dict:
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": stream,
+    }
+    if stream:
+        payload["stream_options"] = {"include_usage": True}
+    if effort:
+        # Ручка проверена лесенкой 2026-08-22 (один вопрос, по 3 повтора):
+        # low ~520 / medium ~1060 / high ~1390 reasoning-токенов — крутит.
+        payload["reasoning_effort"] = effort
+    body = json.dumps(payload).encode()
+    req = urllib.request.Request(
+        f"{BASE}/chat/completions", data=body,
+        headers={"Authorization": f"Bearer {key}",
+                 "Content-Type": "application/json"})
+    # timeout у urlopen — на КАЖДОЕ чтение сокета; общий потолок потока
+    # считает stream_read по дедлайну (ревизия: субагент, deepseek, codex).
+    deadline = time.monotonic() + timeout
+    t_open = time.monotonic()
+    # Дедлайн первого байта — только потоку: без потока сервер отдаёт
+    # заголовки вместе с готовым телом, и 60 с резали бы долгие ответы
+    # (субагент, gemini, codex)
+    with urllib.request.urlopen(req, timeout=(min(timeout, FIRST_BYTE_S)
+                                              if stream else timeout)) as r:
+        if stream:
+            return stream_read(r, deadline, t_open, timeout)
+        return json.loads(r.read().decode())
+
+
+def _partial_out() -> bool:
+    """Что-то уже ушло наружу? Флаг ставит stream_read при первой печати
+    (первая редакция мерила sys.stdout.tell(), а на pipe он недоступен —
+    и любой сбой ДО первого байта отменял повторы; нашли все четверо
+    ревьюеров)."""
+    return _PRINTED
+
+
+def main() -> int:
+    global _FIRST_BYTE_SEEN
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--prompt-file")
+    ap.add_argument("-p", "--prompt")
+    ap.add_argument("--model", default=os.environ.get("DEEPSEEK_MODEL", DEFAULT_MODEL))
+    ap.add_argument("--timeout", type=int, default=900)
+    ap.add_argument("--effort", default=os.environ.get("DEEPSEEK_EFFORT", "max"),
+                    choices=("low", "medium", "high", "max", "none"),
+                    help="reasoning_effort; none — не слать параметр")
+    ap.add_argument("--no-stream", action="store_true",
+                    help="ответ целиком по завершении (без печати по мере прихода)")
+    ap.add_argument("--version", action="store_true")
+    ap.add_argument("--models", action="store_true", help="что видит ключ")
+    a = ap.parse_args()
+
+    if a.version:
+        print("deepseek-http 1.1 (stream)")
+        return 0
+
+    key = read_key()
+
+    if a.models:
+        req = urllib.request.Request(f"{BASE}/models",
+                                     headers={"Authorization": f"Bearer {key}"})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            for m in json.loads(r.read().decode()).get("data", []):
+                print(m.get("id"))
+        return 0
+
+    if a.prompt_file:
+        prompt = Path(a.prompt_file).read_text()
+    elif a.prompt:
+        prompt = a.prompt
+    else:
+        prompt = sys.stdin.read()
+    if not prompt.strip():
+        log("пустой промпт")
+        return 2
+
+    last = None
+    # ОБЩИЙ дедлайн на все попытки: три по FIRST_BYTE_S без него
+    # перекрывали ход комнаты, и её сторож снимал адаптер снаружи без
+    # причины в журнале (пробник 2026-09-20: 180 с при ответе за 20)
+    t_all = time.monotonic()
+    for attempt in range(1, RETRIES + 1):
+        left = a.timeout - (time.monotonic() - t_all)
+        if left < 5:
+            log(f"дедлайн {a.timeout} с исчерпан после {attempt - 1} попыток; "
+                f"последняя ошибка: {last or 'нет'}")
+            return 1
+        try:
+            t0 = time.time()
+            data = call(prompt, a.model, key, int(left),
+                        None if a.effort == "none" else a.effort,
+                        stream=not a.no_stream)
+            break
+        except urllib.error.HTTPError as e:
+            raw = e.read().decode(errors="replace")[:300]
+            last = f"HTTP {e.code}: {raw}"
+            # 402 — кончились деньги, 429 — упёрлись в лимит: и то и другое
+            # честный отказ, а не поломка. Дирижёр отметит голос как quota.
+            if e.code in (402, 429):
+                log(f"квота/баланс: {last}")
+                return 3
+            log(f"попытка {attempt}/{RETRIES}: {last}")
+        except Exception as e:                                   # noqa: BLE001
+            last = f"{type(e).__name__}: {e}"
+            if isinstance(e, (TimeoutError, socket.timeout)):
+                # честно: до первого байта — «нет первого байта», после —
+                # «тишина после первого байта» (субагент, grok)
+                cap = int(min(left, FIRST_BYTE_S)) if not a.no_stream else int(left)
+                last = (f"нет первого байта за {cap} с ({last})"
+                        if not _FIRST_BYTE_SEEN else f"тишина после первого байта дольше {STREAM_IDLE_S} с ({last})")
+            _FIRST_BYTE_SEEN = False
+            log(f"попытка {attempt}/{RETRIES}: {last}")
+            if not a.no_stream and _partial_out():
+                # Часть ответа уже напечатана: повтор дописал бы второй
+                # экземпляр в stdout, и стол прочёл бы удвоенный текст.
+                log("поток оборвался после начала ответа — без повтора")
+                return 1
+        if attempt < RETRIES:
+            # пауза — в остатке бюджета, не сверх него (codex)
+            time.sleep(min(2 * attempt, max(0, a.timeout - (time.monotonic() - t_all))))
+    else:
+        log(f"не ответил после {RETRIES} попыток: {last}")
+        return 1
+
+    _msg = (data.get("choices") or [{}])[0].get("message", {}) or {}
+    text = _msg.get("content", "") or ""
+    # МЫСЛИ МОДЕЛИ (правило 17, наказ Автора 2026-09-06): reasoning_content
+    # у моделей с рассуждением печатается в stderr — по флагу CHOIR_THOUGHTS=1
+    # (галочка «мысли» в окне стола). Ответ стола в stdout не меняется:
+    # мысли — для человека, который смотрит на ход, а не пакет голосам.
+    _think = _msg.get("reasoning_content")
+    if (not data.get("_streamed") and os.environ.get("CHOIR_THOUGHTS") == "1"
+            and isinstance(_think, str) and _think.strip()):
+        print(f"💭 мысли модели (reasoning_content, {len(_think)} симв.):\n"
+              f"{_think.rstrip()}\n💭 конец мыслей", file=sys.stderr, flush=True)
+    if not text.strip():
+        log("пустой ответ модели")
+        return 1
+
+    u = data.get("usage") or {}
+    hit = u.get("prompt_cache_hit_tokens", 0)
+    miss = u.get("prompt_cache_miss_tokens", u.get("prompt_tokens", 0))
+    out = u.get("completion_tokens", 0)
+    cost = (miss * PRICE_IN_MISS + hit * PRICE_IN_HIT + out * PRICE_OUT) / 1e6
+    log(f"модель {data.get('model', a.model)} · {time.time()-t0:.1f} с · "
+        f"вход {miss}+{hit} кэш, выход {out} · ≈${cost:.4f}")
+
+    # История — для choir.py recover: у HTTP-вызова своей нет, а ответ
+    # уже оплачен, терять его при аварии дирижёра нельзя.
+    try:
+        HIST_DIR.mkdir(parents=True, exist_ok=True)
+        sha = hashlib.sha256(prompt.encode()).hexdigest()
+        rec = dict(ts=datetime.now().isoformat(timespec="seconds"),
+                   prompt_sha256=sha, model=data.get("model", a.model),
+                   usage=u, cost_usd=round(cost, 6), text=text)
+        with (HIST_DIR / f"{sha[:16]}.json").open("w") as f:
+            json.dump(rec, f, ensure_ascii=False, indent=1)
+    except OSError as e:
+        log(f"история не записана: {e}")
+
+    if not data.get("_streamed"):
+        print(text)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

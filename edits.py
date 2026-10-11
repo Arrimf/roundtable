@@ -1,0 +1,1113 @@
+"""Правки проекта из окна: worktree, интент, вердикт, читатель маркеров.
+
+Этап 1 SPEC-ispolnitel-v1 (v2): окно выдаёт кресло исполнителя ОДНОМУ
+голосу на ОДИН акт. Порядок такта:
+
+    открыть   → чеканим эпоху, строим worktree от base_sha, пишем
+                интент edit_open В ЛЕНТУ (до запуска — намерение видно,
+                даже если дальше всё умрёт);
+    работать  → executor_run.py держит аренду и водит CLI (см. его
+                докстроку: он не песочница и не сторож зависаний);
+    вердикт   → замок пал; close ЭТОЙ ЭПОХИ есть (в ленте или маркером)
+                — штатно; нет — ВЫЛЕТ, worktree в карантин.
+
+ЧИТАТЕЛЬ МАРКЕРОВ ЖИВЁТ ЗДЕСЬ — тот самый, которого ревизия ядра
+называла недостающим («маркер декоративен, пока его никто не читает»,
+codex). Маркер <act>.<epoch>.close.json пишет исполнитель, когда лента
+недоступна; наше дело — допостить его в ленту и только потом снять.
+Симметричный маркер <act>.<epoch>.crash.json пишет НАБЛЮДАТЕЛЬ, когда
+лента недоступна ему самому: вылет при лежащей ленте иначе не оставлял
+ни одной записи вовсе (нашёл kimi).
+
+ГРАНИЦЫ ЧЕСТНО, БЕЗ ПРИУКРАС (ревизия 2026-09-01, все пять голосов):
+— исполнителю-codex открывается запись в <base>/.git ЦЕЛИКОМ — иначе
+  линкованный worktree несовместим с его песочницей (git-метаданные
+  дерева лежат в <base>/.git/worktrees/, без этого не создать даже
+  index.lock; проверено живым прогоном). Через .git достижимы и чужие
+  ветки, и hooks, и config;
+— «Bash(git:*)» у клода — это и git push, и `git -c alias.x='!cmd' x`,
+  то есть произвольная команда под uid Автора. Узкой эта граница НЕ
+  является (grok, codex);
+— merge-гейт и пломба refs/heads/main — ЭТАП 3, их ещё НЕТ. Сегодня
+  запись исполнителя вне worktree не обнаруживает никто, кроме глаз
+  ревизии. Единственная механика прямо сейчас — авторство и намерение
+  в ленте плюс изоляция по умолчанию (CLI направлен в своё дерево).
+Это осознанная цена этапа 1 (вердикт раунда право-записи-v1:
+«контроль = обнаружение, не запрет»), и она НАЗВАНА, а не спрятана.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import shutil
+import os
+import re
+import shlex
+import subprocess
+import sys
+import threading
+import uuid
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import catalog                                           # noqa: E402
+import leases                                            # noqa: E402
+
+# Раскладка (переезд 2026-09-06): код стола — chamber/, журналы — journal/
+# рядом; ROUNDTABLE_CHAMBER / ROUNDTABLE_JOURNAL переопределяют каждый.
+_HERE = Path(__file__).resolve().parent
+# ROUNDTABLE_CHOIR — прежнее имя и старая раскладка «код и журнал в одной
+# папке»: значит и код, и журнал там, независимо от того, родилась ли уже
+# лента (ревизия переезда 2026-09-06: проверка «есть ли live.jsonl» делала
+# выбор зависимым от момента запуска). Явные ROUNDTABLE_CHAMBER/JOURNAL
+# сильнее. Пути делаются абсолютными сразу: дочерние процессы стартуют с
+# другим cwd, и относительная переменная означала бы там другое место.
+_legacy = os.environ.get("ROUNDTABLE_CHOIR")
+if _legacy and not (Path(_legacy).expanduser() / "live.py").is_file():
+    # переменная пережила переезд, а каталог — нет: молча вести окно в
+    # пустоту хуже предупреждения (ревизия переезда, deepseek 2026-09-06)
+    print(f"ROUNDTABLE_CHOIR={_legacy!r} не содержит live.py — переменная "
+          "проигнорирована, раскладка chamber/ + journal/", file=sys.stderr)
+    _legacy = ""
+_abs = lambda p: Path(p).expanduser().absolute()
+CHAMBER = _abs(os.environ.get("ROUNDTABLE_CHAMBER") or _legacy or _HERE / "chamber")
+JOURNAL = _abs(os.environ.get("ROUNDTABLE_JOURNAL") or os.environ.get("CHOIR_JOURNAL")
+               or _legacy or CHAMBER.parent / "journal")
+CHOIR = CHAMBER
+# live.py/choir.py в дочерних процессах обязаны видеть ТОТ ЖЕ журнал, что
+# окно: присваивание, не setdefault — унаследованный CHOIR_JOURNAL иначе
+# перекрыл бы явный ROUNDTABLE_JOURNAL тестового окна, и дирижёр писал бы в
+# живой журнал (ревизия переезда, grok 2026-09-06).
+os.environ["CHOIR_JOURNAL"] = str(JOURNAL)
+WT_DIR = Path(os.environ.get("CHOIR_WT_DIR")
+              or Path.home() / ".cache" / "choir" / "worktrees")
+
+# ── Исполнители этапа 1 ──────────────────────────────────────────────
+# Оба проверены живым прогоном 2026-09-01 (файл + коммит в worktree).
+# Каждая запись строит argv CLI; cwd будет worktree (его ставит
+# executor_run). Дефисная инъекция (задание, начинающееся с «-»,
+# читается флагом CLI — вплоть до снятия ограничений; нашли все пять
+# ревьюеров) закрывается ПО-РАЗНОМУ, у кого что есть: codex и claude
+# понимают `--` (проверено живьём), kimi/grok/deepseek — нет, у них
+# щит-префикс «ЗАДАНИЕ СТОЛА.»; у грока поверх — shlex.quote, потому
+# что его строка внутри script — это shell.
+#
+# Авторство коммита: git-автор будет из конфига машины, НЕ голоса —
+# честная запись авторства живёт в ленте (edit_open/edit_close несут
+# voice), а --author к коммиту поставит merge-гейт на этапе 3.
+#
+# Кого здесь НЕТ: gemini — файлов не видит вовсе, он только ревьюер
+# (спека, роли). Остальные пятеро сидят.
+#
+# ГРОК: pty даёт script -qec (без терминала его CLI не работает), сама
+# командная строка внутри script — shell, поэтому задание уходит через
+# shlex.quote — иначе кавычка в тексте исполняла бы команды под uid
+# Автора. ПЕСОЧНИЦЫ НЕТ: --sandbox workspace-write на этой машине
+# падает («deny list could not be prepared», Landlock) — проверено
+# живым прогоном 2026-09-01; граница названа, а не спрятана: грок в
+# кресле ограничен только словами задания, как и клод.
+#
+# DEEPSEEK: в кресле сидит НЕ голос стола (deepseek-http), а dsh
+# --profile headless — агентный харнесс той же лаборатории. Обкатан
+# живым прогоном 2026-09-01 (файл + коммит с первого раза). Щит-префикс
+# и здесь: дефисное задание не должно читаться флагом.
+#
+# КИМИ СИДИТ С ПОМЕТКОЙ (наказ Автора 2026-09-01: «сажаем Кими с
+# пометкой»). Пометка — три цены, названные вслух в подсказке окна:
+#   1) МОНОПОЛЬНЫЙ ПО ЛИНИИ: у каждой его организации concurrency=1,
+#      обёртка держит ворота ОДНОЙ линии весь акт (EDIT_GATES); вторая
+#      линия, если жива её квота, остаётся столу — но всё встаёт в
+#      очередь (уточнил codex: «совсем без Кими» было неправдой);
+#   2) ДОРОГОЙ: правка — длинная агентная сессия, 15–20 внутренних
+#      запросов с перечитыванием контекста (замер 2026-09-01, ~5 USD
+#      за ночь ревизий);
+#   3) обрывает длинные ответы (грабля CLAUDE.md) — большая правка
+#      рискует недоделкой.
+# Его лучший случай — НЕБОЛЬШАЯ точная правка, где вдумчивость
+# окупается. Разделитель `--` его CLI не понимает (проверено: съедает
+# текст как команду), поэтому дефисное задание прикрывает ЩИТ-ПРЕФИКС
+# «ЗАДАНИЕ СТОЛА.» — он же даёт голосу контекст.
+# Переопределения кресел ИЗ ОКНА (вкладка 🔧 coder): {voice: {model,
+# effort, pool}}. Заполняет roundtable по VOICE_CFG ПЕРЕД open_edit —
+# лямбды ниже строят argv в процессе окна, env спавна тут ни при чём.
+# pool=False выводит голос из random-выбора (kimi дополнительно заперт
+# EDIT_COSTLY — дорогой только явно).
+EXEC_OVERRIDES: dict = {}
+
+
+def _exec_over(voice: str, key: str) -> str:
+    v = (EXEC_OVERRIDES.get(voice) or {}).get(key)
+    return str(v) if v else ""
+
+
+# ЯВНЫЕ УМОЛЧАНИЯ КРЕСЕЛ (наказ Автора 2026-09-02: «умолчание — не
+# понятно какая модель и какое усилие — давай прописывать явно»). До
+# этого кресло без настройки шло «как CLI решит», окно честно ставило
+# прочерк — а читалось это как поломка. Теперь у каждого рычага есть
+# значение, и оно либо УХОДИТ ФЛАГОМ в argv (claude, kimi, deepseek —
+# скрытый дефолт CLI нам не хозяин: у Клода он берётся из личного
+# ~/.claude/settings.json Автора, у dsh — из профиля харнесса), либо
+# названо ТЕМ, кто его хранит: пустая строка значит «умолчание хранит
+# канал» — codex в ~/.codex/config.toml, grok в кэше моделей своего CLI
+# (первая модель списка и её reasoning_effort); окно их читает и
+# показывает с подписью источника.
+#
+# Клод в кресле — opus/high, как в комнате (live.py), а не fable/max
+# раундов: у Fable отдельное недельное окно, и оно уже упиралось в 100 %
+# (замер 2026-08-25) — кресло, молча садящееся на исчерпанную квоту,
+# падало бы целым актом. Переключить — вкладка 🔧 окна.
+# Один класс символов имени на окно, кресло и каталог — ИМПОРТОМ, не
+# копией: три копии разошлись бы молча (правило 7 в миниатюре).
+MODEL_RE = catalog.MODEL_RE
+
+
+def _kimi_default_model() -> str:
+    """default_model из ~/.kimi-code/config.toml — С провайдером (он
+    выбирает ключ линии); имя без провайдера получает moonshotai;
+    нет файла — то же имя, что было литералом. Читается ПРИ КАЖДОЙ
+    сборке argv, не на импорте: конфиг правят, окно живёт сутками, и
+    замороженное умолчание расходилось бы с тем, что показывают
+    комната и раунды (нашли grok, субагент)."""
+    v = ""
+    models: dict = {}
+    try:
+        import tomllib
+        with (Path.home() / ".kimi-code" / "config.toml").open("rb") as f:
+            cfg = tomllib.load(f)
+        v = str(cfg.get("default_model") or "").strip()
+        models = cfg.get("models") or {}
+    except Exception:                               # noqa: BLE001
+        v = ""
+    # Подписка Kimi Code (2026-09-23, «Кими пересел на CLI»): кресло идёт
+    # по ней, если вход сделан (алиас kimi-code/k3 объявлен входом), —
+    # default_model конфига CLI при этом может оставаться ключевым.
+    if isinstance(models, dict) and "kimi-code/k3" in models:
+        return "kimi-code/k3"
+    if not v:
+        return "moonshotai/kimi-k3"
+    return v if "/" in v else "moonshotai/" + v
+
+
+# Явные значения кресел; пустая строка = «умолчание хранит канал»,
+# kimi — динамически из конфига (см. exec_default).
+EXEC_DEFAULTS: dict[str, dict[str, str]] = {
+    "codex": {"model": "", "effort": ""},
+    "claude": {"model": "opus", "effort": "high"},
+    "grok": {"model": "", "effort": ""},
+    "kimi": {"model": ""},
+    "deepseek": {"model": "deepseek-v4-flash"},
+}
+# Умолчания, РАЗРЕШЁННЫЕ ОКНОМ из чужих хранилищ (кэш моделей grok:
+# первая модель и её reasoning_effort). Окно кладёт их сюда, а лямбды
+# ниже шлют ФЛАГАМИ: то, что панель показывает как «умолчание», обязано
+# быть тем, что ушло CLI, — не догадкой о серверном дефолте (нашли
+# codex и claude: кресло grok молчало про --effort, а окно показывало
+# «high (умолчание)»).
+EXEC_RESOLVED: dict = {}
+# Какие рычаги у кресла ЕСТЬ — то есть за какими стоит флаг в argv ниже.
+# Окно принимает настройку только по этому списку (правило 8.5: рычаг,
+# за которым ничего не стоит, — поле, которое врёт). У kimi усилия нет
+# в самом CLI (только -m); у dsh нет ручки усилия вовсе.
+EXEC_LEVERS: dict[str, tuple[str, ...]] = {
+    "codex": ("model", "effort"),
+    "claude": ("model", "effort"),
+    "grok": ("model", "effort"),
+    "kimi": ("model",),
+    "deepseek": ("model",),
+}
+EXEC_DEFAULT_SRC: dict[str, str] = {
+    "codex": "~/.codex/config.toml (model, model_reasoning_effort) — "
+             "кресло флагов не шлёт, CLI читает свой конфиг",
+    "claude": "edits.EXEC_DEFAULTS: флаги --model/--effort уходят в argv "
+              "всегда",
+    "grok": "кэш моделей CLI (~/.grok/models_cache.json): первая модель и "
+            "её reasoning_effort; окно разрешает их и кресло шлёт флагами "
+            "--model/--effort всегда, когда кэш есть",
+    "kimi": "default_model из ~/.kimi-code/config.toml (читается при "
+            "каждом акте), флаг -m всегда; усилия у kimi CLI нет",
+    "deepseek": "edits.EXEC_DEFAULTS → патч-слой dsh (agent-default-model) "
+                "всегда; усилия у dsh нет",
+}
+DSH_PATCH_DIR = Path(os.environ.get("CHOIR_DSH_PATCH_DIR")
+                     or Path.home() / ".cache" / "choir" / "dsh-patches")
+
+
+def exec_default(voice: str, key: str) -> str:
+    """Явное умолчание кресла; kimi — из конфига при каждом вызове."""
+    if voice == "kimi" and key == "model":
+        return _kimi_default_model()
+    return (EXEC_DEFAULTS.get(voice) or {}).get(key, "")
+
+
+def exec_value(voice: str, key: str) -> str:
+    """Настройка окна → разрешённое окном умолчание → явное умолчание;
+    пусто — хранит канал."""
+    return (_exec_over(voice, key)
+            or str((EXEC_RESOLVED.get(voice) or {}).get(key) or "")
+            or exec_default(voice, key))
+
+
+_PATCH_LOCK = threading.Lock()
+
+
+def dsh_patch(model: str) -> Path:
+    """Оверлей dsh на ЛЮБУЮ модель канала, а не только pro: прежний
+    статический dsh-model-pro.yaml знал одно имя, и селектор окна врал
+    бы для всех остальных. Имя проверено тем же классом символов, что
+    в окне, и стоит в двойных кавычках — yaml не разберёт его иначе,
+    чем строкой. Файл пишется атомарно и перезаписывается лишь при
+    расхождении: два акта подряд не гоняют диск."""
+    if not MODEL_RE.match(model or ""):
+        raise ValueError(f"имя модели dsh не прошло проверку: {model!r}")
+    # Имя файла — по ХЕШУ полного имени: замена символов давала одно имя
+    # для `a/b` и `a_b`, и поздний акт переписывал yaml раннего под
+    # чужую модель (нашли codex, grok). Запись под замком и tmp по
+    # потоку: два кресла подряд в одном процессе окна.
+    digest = hashlib.sha1(model.encode("utf-8")).hexdigest()[:16]
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", model)[:40]
+    p = DSH_PATCH_DIR / f"model-{safe}-{digest}.yaml"
+    body = ("- id: agent-default-model\n  config:\n"
+            "    provider: deepseek-official\n"
+            f"    model: \"{model}\"\n")
+    with _PATCH_LOCK:
+        try:
+            if p.read_text(encoding="utf-8") == body:
+                return p
+        except OSError:
+            pass
+        DSH_PATCH_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_name(p.name + f".{os.getpid()}.{threading.get_ident()}.tmp")
+        tmp.write_text(body, encoding="utf-8")
+        tmp.replace(p)
+    return p
+
+
+def _kimi_model_arg() -> str:
+    """Имя для `kimi -m`: короткое имя окна получает провайдера из
+    default_model конфига (не литерал moonshotai — провайдер выбирает
+    КЛЮЧ линии, и второй линии он другой)."""
+    m = exec_value("kimi", "model")
+    if "/" in m:
+        return m
+    # Провайдер — тот, у которого алиас `<провайдер>/<модель>` ОБЪЯВЛЕН
+    # в конфиге CLI (подписка kimi-code предпочтительна: 2026-09-23);
+    # ни у кого не объявлен — провайдер default_model, как раньше.
+    try:
+        import tomllib
+        with (Path.home() / ".kimi-code" / "config.toml").open("rb") as f:
+            models = tomllib.load(f).get("models") or {}
+    except Exception:                               # noqa: BLE001
+        models = {}
+    provs = [str(a).split("/")[0] for a in models if str(a).endswith("/" + m)]
+    if "kimi-code" in provs:
+        return f"kimi-code/{m}"
+    if provs:
+        return f"{provs[0]}/{m}"
+    prov = _kimi_default_model().split("/")[0] or "moonshotai"
+    return f"{prov}/{m}"
+
+
+EDIT_VOICES = {
+    "codex": lambda task, base_git: [
+        "codex", "exec", "-s", "workspace-write",
+        # json.dumps даёт валидную TOML basic string: путь с кавычкой
+        # или бэкслешем иначе ломал конфиг или РАСШИРЯЛ песочницу
+        # (нашли kimi, codex и grok независимо).
+        # Корни записи — СПИСОК из codex_roots(): весь <base>/.git давал
+        # Кодексу hooks, refs/heads/main и config (раунд стол-v3-изоляция,
+        # 2026-09-16); строка — прежний вызов (тесты), тоже допустима.
+        "-c", "sandbox_workspace_write.writable_roots="
+              + json.dumps([str(r) for r in
+                            (base_git if isinstance(base_git, (list, tuple))
+                             else [base_git])]),
+        *(["-c", f"model={_exec_over('codex', 'model')}"]
+          if _exec_over("codex", "model") else []),
+        # значение БЕЗ кавычек: -c 'k="v"' вешает codex до таймаута
+        # (проверено живьём дважды)
+        *(["-c", "model_reasoning_effort="
+                 + _exec_over("codex", "effort")]
+          if _exec_over("codex", "effort") else []),
+        "--", task,
+    ],
+    "claude": lambda task, base_git: [
+        "claude", "-p",
+        "--allowedTools", "Write,Edit,Bash(git:*)",
+        # Оба флага ВСЕГДА (явное умолчание, см. EXEC_DEFAULTS): без них
+        # кресло брало модель из личного settings.json Автора, и окно
+        # не могло сказать, чем пойдёт правка.
+        "--model", exec_value("claude", "model"),
+        "--effort", exec_value("claude", "effort"),
+        "--", task,
+    ],
+    "kimi": lambda task, base_git: [
+        str(Path.home() / ".kimi-code" / "bin" / "kimi"),
+        # провайдер дописывается, как в live.py: селектор окна даёт
+        # «kimi-k3», а CLI ждёт «moonshotai/kimi-k3» — голое имя ломало
+        # запуск (нашли codex и grok)
+        "-m", _kimi_model_arg(),   # провайдер = ключ линии
+        "-p",
+        "ЗАДАНИЕ СТОЛА. " + task,
+    ],
+    "grok": lambda task, base_git: [
+        "script", "-qec",
+        "grok -p " + shlex.quote("ЗАДАНИЕ СТОЛА. " + task) + " --no-plan"
+        # --model был только у комнаты; кресло молча шло серверным
+        # дефолтом, и окно писало «нет рычага» (Автор, 2026-09-02).
+        + (" --model " + shlex.quote(exec_value("grok", "model"))
+           if exec_value("grok", "model") else "")
+        + (" --effort " + shlex.quote(exec_value("grok", "effort"))
+           if exec_value("grok", "effort") else ""),
+        "/dev/null",
+    ],
+    # Модель dsh КРУТИТСЯ патч-слоем (нашлось по вопросу Автора «а
+    # почему Дипсик с прочерками»): умолчание харнесса — v4-flash,
+    # оверлей agent-default-model пересаживает на любую модель канала
+    # (проверено живьём с v4-pro: агент сам называет модель). Патч
+    # уходит ВСЕГДА — явное умолчание, не «что решит профиль». Усилия
+    # у dsh нет по-прежнему.
+    "deepseek": lambda task, base_git: [
+        "dsh", "--profile", "headless",
+        "--patch", str(dsh_patch(exec_value("deepseek", "model"))),
+        "ЗАДАНИЕ СТОЛА. " + task,
+    ],
+}
+
+# Голоса, чей канал сериен: обёртка исполнителя берёт ворота организации
+# на весь акт (executor_run --serial-gate). Смотрит /edit при спавне.
+EDIT_GATES = {"kimi"}
+
+# Дорогие кресла НЕ разыгрываются случайно — только явный выбор Автора.
+# Обещание подсказки обеспечено механикой, а не текстом (правило 8.5):
+# random.choice по всем однажды посадил бы Кими на грошовую правку.
+EDIT_COSTLY = {"kimi"}
+
+
+def random_pool() -> list:
+    """Кто разыгрывается случайно: умеющие − дорогие − снятые галочкой
+    пула (вкладка coder). Пустой список — random невозможен, /edit
+    честно откажет."""
+    return sorted(v for v in EDIT_VOICES
+                  if v not in EDIT_COSTLY
+                  and (EXEC_OVERRIDES.get(v) or {}).get("pool") is not False)
+
+
+def _git(repo: Path, *args, timeout: int = 60):
+    """git с rc-проверкой; (None, why) = не ответил."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    try:
+        r = subprocess.run(["git", "-C", str(repo), *args],
+                           capture_output=True, text=True,
+                           stdin=subprocess.DEVNULL, timeout=timeout, env=env)
+    except (OSError, subprocess.SubprocessError) as e:
+        return None, f"git {' '.join(args)}: {e}"
+    if r.returncode != 0:
+        return None, f"git {' '.join(args)}: rc={r.returncode} " \
+                     f"{r.stderr.strip()[:200]}"
+    return r.stdout, ""
+
+
+def post(kind: str, text: str, **extra) -> dict:
+    sys.path.insert(0, str(CHOIR))
+    import live                                          # noqa: PLC0415
+    return live.post("roundtable", kind, text, **extra)
+
+
+class EditRefused(RuntimeError):
+    """Правка не открыта — причина в тексте, следов не осталось."""
+
+
+def _chair_access(project):
+    """ACCESS.txt проекта для кресла (наказ Автора 2026-09-20) — ОДИН
+    снимок на акт: из него rw идут в writable_roots Кодекса (клетки у
+    него нет, песочница — единственная ограда) и в --add-dir Клода и
+    Кими (bwrap разрешит запись, а CLI без флага откажет сам —
+    субагент), сам снимок уходит окну и дальше креслу (executor_run
+    --access-json): перечитывание файла там давало бы права, не
+    совпадающие с записью close (codex). Читается из главного checkout,
+    не из worktree."""
+    if str(CHOIR) not in sys.path:
+        sys.path.insert(0, str(CHOIR))
+    import access                                        # noqa: PLC0415
+    return access.load(project)
+
+
+def _chair_note(acc) -> str:
+    """Строка задания: что креслу открыто сверх worktree — и чтение, и
+    запись (правило 8.5: bind без слова голос не найдёт)."""
+    import access                                        # noqa: PLC0415
+    n = access.notice(acc, chair=True).strip()
+    return ("\n\n" + n) if n else ""
+
+
+def _with_add_dir(voice: str, cmd: list[str], rw: list[str]) -> list[str]:
+    """rw-каталоги — рабочими каталогами CLI: у claude `--add-dir`
+    сразу за `-p` (variadic, следующий токен — флаг), у kimi — перед
+    `-p` (как в комнате). Без этого клетка запись разрешает, а CLI в
+    -p режиме отказывает сам, и обещание в задании — ложь (субагент)."""
+    if not rw or voice not in ("claude", "kimi"):
+        return cmd
+    i = cmd.index("-p")
+    at = i + 1 if voice == "claude" else i
+    return [*cmd[:at], "--add-dir", *rw, *cmd[at:]]
+
+
+def _access_snapshot(acc) -> dict:
+    import access                                        # noqa: PLC0415
+    return access.snapshot(acc)
+
+
+def codex_roots(common: str, act: str, gitdir: str = "") -> list[str]:
+    """Куда Кодексу в кресле можно писать помимо worktree: свой gitdir
+    (HEAD, index, logs), объекты и ТОЛЬКО ветки act/ с их reflog. Не весь
+    .git: hooks, config, refs/heads/main остаются недоступны (раунд
+    стол-v3-изоляция: «writable_roots открывает весь .git»).
+    gitdir — фактический `rev-parse --absolute-git-dir` дерева: git
+    именует его по basename каталога и при совпадении дописывает число,
+    так что «<common>/worktrees/<акт>» — лишь умолчание (ревизия: codex,
+    субагент). Каталоги refs/heads/act и logs/refs/heads/act создаются
+    заранее: `git pack-refs` Автора их удаляет, и кресло падало бы на
+    «cannot lock ref» (субагент, наблюдал). Известная цена: в конце
+    commit git пишет «Unable to create packed-refs.lock: Read-only file
+    system» — это транзакция удаления CHERRY_PICK_HEAD, коммит при этом
+    проходит; кресло об этом предупреждается в задании."""
+    c = str(common).rstrip("/")
+    for d in (f"{c}/refs/heads/act", f"{c}/logs/refs/heads/act"):
+        try:
+            Path(d).mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+    return [gitdir or f"{c}/worktrees/{act}", f"{c}/objects",
+            f"{c}/refs/heads/act", f"{c}/logs/refs/heads/act"]
+
+
+CODEX_CHAIR_NOTE = ("ПЕСОЧНИЦА: запись разрешена только в этом рабочем дереве и "
+                    "в ветку act/… . Строка git «Unable to create packed-refs.lock: "
+                    "Read-only file system» после commit — норма, коммит прошёл: "
+                    "проверяйте `git log -1`, не повторяйте commit.\n\n")
+
+
+def open_edit(project: Path, task: str, voice: str,
+              files: list[str] | None = None) -> dict:
+    """Открыть акт правки: эпоха → worktree → интент в ленту.
+
+    Порядок именно такой. Эпоха первой — она дешёвая и монотонная,
+    брошенная эпоха ничего не ломает. Worktree до интента — если git
+    откажет, в ленте не останется намерения без дерева. Интент
+    ПОСЛЕДНИМ и ДО запуска исполнителя; не записался — дерево и ветка
+    УБИРАЮТСЯ: worktree без интента не существует ни для кого, и
+    оставить его значило бы копить безымянные деревья (нашли grok и
+    codex). Восстановление после рестарта окна — recover_edits().
+    """
+    if voice not in EDIT_VOICES:
+        raise EditRefused(f"исполнитель {voice!r} не умеет правки "
+                          f"(умеют: {', '.join(EDIT_VOICES)})")
+    task = (task or "").strip()
+    if not task:
+        raise EditRefused("пустое задание")
+    files = [f.strip() for f in (files or []) if f and f.strip()]
+    for f in files:
+        if f.startswith("/") or ".." in f.split("/"):
+            raise EditRefused(f"скоуп — пути ВНУТРИ проекта, без /"
+                              f" в начале и без ..: {f!r}")
+    project = Path(project).resolve()
+    if not project.is_dir():
+        raise EditRefused(f"нет такого каталога: {project}")
+    top, err = _git(project, "rev-parse", "--show-toplevel")
+    if top is None or Path(top.strip()).resolve() != project:
+        raise EditRefused(f"--project должен быть корнем git-репозитория: "
+                          f"{err or top}")
+    # Ветка базы — В ИНТЕНТ: приёмка двигает ИМЕННО её по имени.
+    # Прежде гейт брал «текущую ветку checkout» в момент merge — detached
+    # HEAD или переключение Автора на другую ветку с тем же sha двинуло
+    # бы не то, вплоть до создания refs/heads/HEAD (нашли codex, grok и
+    # deepseek независимо).
+    branch, err = _git(project, "rev-parse", "--abbrev-ref", "HEAD")
+    branch = (branch or "").strip()
+    if not branch or branch == "HEAD":
+        raise EditRefused("checkout проекта в detached HEAD — правке "
+                          "некуда возвращаться; встаньте на ветку")
+    base_sha, err = _git(project, "rev-parse", "HEAD")
+    if base_sha is None:
+        raise EditRefused(f"base_sha не взят: {err}")
+    base_sha = base_sha.strip()
+
+    act = uuid.uuid4().hex[:12]
+    epoch = leases.mint_epoch()          # EpochCorrupt летит наружу: без
+    #                                      эпох кресло не выдаётся вовсе
+    WT_DIR.mkdir(parents=True, exist_ok=True)
+    wt = WT_DIR / act
+    out, err = _git(project, "worktree", "add", "-b", f"act/{act}",
+                    str(wt), base_sha, timeout=120)
+    if out is None:
+        raise EditRefused(f"worktree не построен: {err}")
+
+    def _undo():
+        _git(project, "worktree", "remove", "--force", str(wt))
+        _git(project, "branch", "-D", f"act/{act}")
+
+    base_git, err = _git(project, "rev-parse", "--path-format=absolute",
+                         "--git-common-dir")
+    if base_git is None:
+        _undo()
+        raise EditRefused(f"git-common-dir не взят: {err}")
+
+    try:
+        gitdir, _e = _git(wt, "rev-parse", "--absolute-git-dir")
+        acc = _chair_access(project)
+        rw_extra = list(acc.rw)
+        cmd = _with_add_dir(voice, EDIT_VOICES[voice](
+            ((CODEX_CHAIR_NOTE + task) if voice == "codex" else task)
+            + _chair_note(acc),
+            [*codex_roots(base_git.strip(), act, (gitdir or "").strip()),
+             *rw_extra]), rw_extra)
+    except (ValueError, OSError) as e:
+        # argv не собрался (кривое имя модели, диск под патч dsh) — до
+        # интента; worktree уже есть, и без отката он остался бы сиротой.
+        _undo()
+        raise EditRefused(f"argv кресла {voice} не собрался: {e}")
+    # seat — ЧЕМ исполняется голос (бинарь кресла): у deepseek в кресле
+    # dsh-харнесс, а не HTTP-голос стола, и без метки читатель ленты их
+    # не различит (нашли deepseek и kimi). cmd в событии полный, seat —
+    # его читаемая выжимка.
+    seat = Path(cmd[0]).name
+    try:
+        post("edit_open",
+             f"правка {act} [{voice}]: {task[:200]}",
+             act=act, epoch=epoch, voice=voice, project=str(project),
+             base_sha=base_sha, worktree=str(wt), task=task[:1000],
+             branch=branch, seat=seat,
+             # Скоуп — ЗАЯВЛЕНИЕ исполнительского намерения (спека п.1):
+             # гейт сверит диф с ним при приёмке. Пусто — «не заявлен»,
+             # и событие merge честно скажет, что сверки не было.
+             files=sorted(files) if files else None,
+             # Команда — в ленту: через месяц «что именно запускали» не
+             # восстановить из памяти окна (правило 8.5).
+             cmd=" ".join(shlex.quote(c) for c in cmd),
+             # Снимок ACCESS.txt на открытии: ревизия сверит с файлом
+             # главного checkout и назовёт подмену между ними.
+             access_sha=acc.sha or "", access_rw=list(acc.rw) or None)
+    except Exception as e:               # noqa: BLE001
+        _undo()
+        raise EditRefused(f"интент не записался в ленту ({e}) — "
+                          f"акт не открыт, дерево убрано") from e
+    return {"act": act, "epoch": epoch, "worktree": wt,
+            "base_sha": base_sha, "voice": voice, "cmd": cmd,
+            "project": project, "access": _access_snapshot(acc)}
+
+
+# ── Вердикт и читатель маркеров ──────────────────────────────────────
+# Авторы, чьим event'ам close верит вердикт. Под одним uid подделать
+# можно любую строку (обнаружение, не запрет) — но случайный чужой
+# kind=edit_close от голоса в разговоре не должен закрывать акт.
+def _conductor_aliases() -> tuple:
+    """Метки дирижёра — из live.py (одна истина); без него — обе известные."""
+    try:
+        sys.path.insert(0, str(CHOIR))
+        import live                                          # noqa: PLC0415
+        return tuple(live.CONDUCTOR_ALIASES)
+    except Exception:                                        # noqa: BLE001
+        return ("chamber", "choir")
+
+
+_CLOSE_AUTHORS = {*_conductor_aliases(), "roundtable"}   # choir — прежняя метка дирижёра
+
+
+def _act_events(act: str) -> list[dict]:
+    """События акта из ленты, свежие первыми, только доверенных авторов."""
+    return [e for e in _feed_events(None)
+            if e.get("act") == act and e.get("author") in _CLOSE_AUTHORS]
+
+
+def _worktree_of(project: Path, branch: str) -> Path | None:
+    """Каталог, где ветка уже выписана (git worktree list), или None."""
+    out, _err = _git(project, "worktree", "list", "--porcelain")
+    cur = None
+    for line in (out or "").splitlines():
+        if line.startswith("worktree "):
+            cur = Path(line[9:].strip())
+        elif line.startswith("branch ") and line[7:].strip() == f"refs/heads/{branch}":
+            return cur
+    return None
+
+
+def continue_edit(project: Path, act: str, text: str,
+                  voice: str | None = None) -> dict:
+    """ПРОДОЛЖИТЬ правку (наказ Автора 2026-09-14: «продолжить —
+    семантически, чтобы продолжала текущую ветвь обсуждений»).
+
+    Та же ветка act/<акт>, то же рабочее дерево (унесла уборка —
+    восстанавливается с ветки), тот же исполнитель (или названный),
+    НОВАЯ эпоха. Задание исполнителю — прежнее задание, замечания ревизии
+    на текущей голове дословно (правило 3) и слова Автора. Без этого
+    «поправь по замечаниям» открывало новый акт с main: исполнитель не
+    видел ни ветки, ни замечаний, и чинил не то (акт 6535864e1323,
+    2026-09-14). Одобрения на новой голове сгорают сами: гейт считает
+    их по sha (checks). Продолжение — дописывание в ленту: история акта
+    остаётся, act_state берёт свежее открытие и close ЕГО эпохи.
+    """
+    text = (text or "").strip()
+    if not text:
+        raise EditRefused("пустое продолжение: скажите, что доработать")
+    evs = _act_events(act)
+    opn = next((e for e in evs if e.get("kind") == "edit_open"), None)
+    if opn is None:
+        raise EditRefused(f"акт {act} не открывался (edit_open нет)")
+    if any(e.get("kind") == "edit_merge" for e in evs):
+        raise EditRefused(f"акт {act} уже принят — продолжать нечего, "
+                          f"откройте новую правку")
+    if any(e.get("kind") == "edit_drop" for e in evs):
+        raise EditRefused(f"акт {act} отброшен — продолжать нечего")
+    if leases.is_held(act):
+        raise EditRefused(f"акт {act}: исполнитель ещё работает")
+    project = Path(opn.get("project") or project).resolve()
+    voice = (voice or opn.get("voice") or "").strip()
+    if voice not in EDIT_VOICES:
+        raise EditRefused(f"исполнитель {voice!r} не умеет правки "
+                          f"(умеют: {', '.join(EDIT_VOICES)})")
+    branch = f"act/{act}"
+    head, err = _git(project, "rev-parse", f"refs/heads/{branch}")
+    if head is None:
+        raise EditRefused(f"ветка {branch} не найдена — продолжать "
+                          f"нечего: {err}")
+    head = head.strip()
+    # Дерево — ТОЛЬКО то, где ветка выписана по данным git (путь из
+    # интента не доверяется: чужой каталог или main — ревизия: субагент,
+    # deepseek, grok); нет такого — восстановить с ветки в каталог актов.
+    _git(project, "worktree", "prune")
+    wt = _worktree_of(project, branch)
+    if wt is None:
+        wt = WT_DIR / act
+        if wt.exists() and wt.resolve().is_relative_to(WT_DIR.resolve()):
+            shutil.rmtree(wt, ignore_errors=True)   # огрызок без .git (gemini)
+        WT_DIR.mkdir(parents=True, exist_ok=True)
+        out, err = _git(project, "worktree", "add", str(wt), branch,
+                        timeout=120)
+        if out is None:
+            raise EditRefused(f"worktree не восстановлен с ветки: {err}")
+    cur, _err = _git(wt, "rev-parse", "--abbrev-ref", "HEAD")
+    if (cur or "").strip() != branch:
+        raise EditRefused(f"дерево {wt} стоит не на {branch} "
+                          f"({(cur or '').strip() or 'detached'}) — "
+                          f"коммиты ушли бы мимо ветки акта")
+    base_git, err = _git(project, "rev-parse", "--path-format=absolute",
+                         "--git-common-dir")
+    if base_git is None:
+        raise EditRefused(f"git-common-dir не взят: {err}")
+    # Замечания ревизии на ТЕКУЩЕЙ голове — дословно, старые первыми;
+    # свои же (исполнитель ревьюером не бывает) не попадут и так.
+    notes = []
+    for e in evs:
+        if (e.get("kind") == "edit_review" and e.get("sha") == head
+                and e.get("voice") != voice):
+            body = (e.get("full_text") or e.get("text") or "").strip()
+            notes.append(f"— {e.get('voice')} [{e.get('verdict') or e.get('status')}]:\n{body}")
+    notes.reverse()
+    base_sha = opn.get("base_sha") or ""
+    prompt = (f"ПРОДОЛЖЕНИЕ ПРАВКИ {act}. Вы уже работали над ней: ветка "
+              f"{branch}, рабочее дерево содержит вашу прежнюю работу "
+              f"(git log и git diff {base_sha[:12]}..HEAD покажут, что "
+              f"сделано). Продолжайте на ней же, не начинайте заново.\n\n"
+              f"Прежнее задание:\n{(opn.get('task') or '').strip()}\n\n"
+              + ((f"Ревизия стола по голове {head[:12]} (замечания — не "
+                  f"приказ: с чем не согласны, объясните в ответе; "
+                  f"закрывайте то, что считаете верным):\n"
+                  + "\n\n".join(notes) + "\n\n")
+                 if notes else "Ревизии на текущей голове нет.\n\n")
+              + f"Автор:\n{text}\n")
+    epoch = leases.mint_epoch()
+    # Эпоха продолжения обязана быть СТАРШЕ эпохи интента: act_state
+    # отличает close прежней жизни акта именно по ней (счётчик эпох
+    # монотонен на машине, но интент мог прийти с другой или из теста).
+    for _ in range(3):
+        if epoch > (opn.get("epoch") or 0):
+            break
+        epoch = leases.mint_epoch()
+    if epoch <= (opn.get("epoch") or 0):
+        raise EditRefused(f"эпоха {epoch} не старше эпохи интента "
+                          f"{opn.get('epoch')} — продолжение не различимо")
+    try:
+        gitdir, _e = _git(wt, "rev-parse", "--absolute-git-dir")
+        acc = _chair_access(project)
+        rw_extra = list(acc.rw)
+        cmd = _with_add_dir(voice, EDIT_VOICES[voice](
+            ((CODEX_CHAIR_NOTE + prompt) if voice == "codex" else prompt)
+            + _chair_note(acc),
+            [*codex_roots(base_git.strip(), act, (gitdir or "").strip()),
+             *rw_extra]), rw_extra)
+    except (ValueError, OSError) as e:
+        raise EditRefused(f"argv исполнителя не собрался: {e}")
+    # В ленту — ИСХОДНОЕ задание и слова Автора, не собранный промпт:
+    # промпт несёт чужие вердикты по именам (ревьюеры читают task —
+    # правило 9) и рос бы снежным комом с каждым продолжением (ревизия:
+    # субагент, grok, gemini). Промпт целиком уходит только в argv.
+    ev = post("edit_open",
+              f"правка {act} [{voice}]: продолжение — {text[:200]}"
+              + (f" · в задании {len(notes)} " + ("замечание" if len(notes) % 10 == 1 and len(notes) % 100 != 11 else "замечания" if 2 <= len(notes) % 10 <= 4 and not 12 <= len(notes) % 100 <= 14 else "замечаний") + f" ревизии по голове {head[:12]}" if notes else " · ревизии на голове нет, в задании только слова Автора"),
+              act=act, epoch=epoch, voice=voice, project=str(project),
+              base_sha=base_sha or None, branch=opn.get("branch"),
+              worktree=str(wt), task=(opn.get("task") or ""),
+              files=opn.get("files") or None,
+              continues=opn.get("id"), head_before=head, author_text=text,
+              reviews_in_prompt=len(notes), prompt_chars=len(prompt),
+              access_sha=acc.sha or "", access_rw=list(acc.rw) or None)
+    return {"act": act, "epoch": epoch, "worktree": wt, "cmd": cmd,
+            "project": project, "base_sha": base_sha, "head_before": head, "event": ev,
+            "access": _access_snapshot(acc),
+            "voice": voice}
+
+
+def drop_edit(project: Path, act: str, why: str = "", by: str = "arr") -> dict:
+    """ОТБРОСИТЬ правку: ветка и дерево удаляются, в ленту — edit_drop с
+    головой ветки (архив знает, что именно выброшено). Только не
+    принятую и не работающую. Событие — дописывание: история акта
+    (интент, закрытие, ревизии) остаётся."""
+    evs = _act_events(act)
+    opn = next((e for e in evs if e.get("kind") == "edit_open"), None)
+    if opn is None:
+        raise EditRefused(f"акт {act} не открывался (edit_open нет)")
+    if any(e.get("kind") == "edit_merge" for e in evs):
+        raise EditRefused(f"акт {act} принят — отбрасывать нечего")
+    if any(e.get("kind") == "edit_drop" for e in evs):
+        raise EditRefused(f"акт {act} уже отброшен")
+    if leases.is_held(act):
+        raise EditRefused(f"акт {act}: исполнитель ещё работает")
+    project = Path(opn.get("project") or project).resolve()
+    head, _err = _git(project, "rev-parse", f"refs/heads/act/{act}")
+    head = (head or "").strip()
+    _git(project, "worktree", "prune")
+    wt = _worktree_of(project, f"act/{act}")     # только по данным git
+    if wt is not None:
+        # два --force: дерево может быть грязным и с неотслеженными
+        # файлами; их и выбрасываем — так решил Автор
+        _out, err = _git(project, "worktree", "remove", "--force", "--force",
+                         str(wt))
+        if _out is None:
+            raise EditRefused(f"дерево {wt} не удалено: {err}")
+    stray = WT_DIR / act
+    if stray.exists() and stray.resolve().is_relative_to(WT_DIR.resolve()):
+        shutil.rmtree(stray, ignore_errors=True)  # огрызок, git его не числит
+    if head:
+        # Страховочный ref: коммиты отброшенной ветки не уходят в gc, а
+        # событие ниже называет sha — восстановить можно (ревизия:
+        # субагент, grok).
+        _git(project, "update-ref", f"refs/rt-dropped/act/{act}", head)
+        _git(project, "branch", "-D", f"act/{act}")
+    try:
+        return post("edit_drop",
+                    f"правка {act} отброшена ({by}): {why or 'без причины'}"
+                    + (f"; голова ветки была {head[:12]} (страховочный ref "
+                       f"refs/rt-dropped/act/{act})" if head
+                       else "; ветки уже не было"),
+                    act=act, epoch=opn.get("epoch"), voice=opn.get("voice"),
+                    head=head or None, why=why, by=by,
+                    backup_ref=(f"refs/rt-dropped/act/{act}" if head else None))
+    except Exception as e:                       # noqa: BLE001
+        raise EditRefused(f"ветка act/{act} удалена (страховочный ref есть), "
+                          f"но запись в ленту не легла: {e} — повторите, "
+                          f"запись допишется") from e
+
+
+def _feed_events(tail_bytes: int | None):
+    """События ленты, свежие первыми. None = читать ЦЕЛИКОМ.
+
+    Хвост годится для быстрых проверок; вердикт и репост обязаны
+    читать всё: close, уехавший за обрезку при болтливой ленте, делал
+    штатный акт «вылетом», а репост — дублём (нашли deepseek, kimi,
+    grok — каждый со своей стороны).
+    """
+    live_path = JOURNAL / "live.jsonl"
+    try:
+        with live_path.open("rb") as f:
+            if tail_bytes is not None:
+                size = live_path.stat().st_size
+                if size > tail_bytes:
+                    f.seek(size - tail_bytes)
+                    f.readline()         # добить обрезанную строку: json
+                    #                      на границе seek иначе терялся
+                    #                      молча (gemini)
+            chunk = f.read().decode("utf-8", errors="replace")
+    except OSError:
+        return
+    for line in reversed(chunk.splitlines()):
+        try:
+            yield json.loads(line)
+        except ValueError:
+            continue
+
+
+def close_in_feed(act: str, epoch: int, *, whole: bool = True):
+    """Событие edit_close ЭТОЙ ЭПОХИ от доверенного автора, или None."""
+    for e in _feed_events(None if whole else 512_000):
+        if (e.get("kind") == "edit_close" and e.get("act") == act
+                and e.get("epoch") == epoch
+                and e.get("author") in _CLOSE_AUTHORS):
+            return e
+    return None
+
+
+def marker_path(act: str, epoch: int, kind: str = "close") -> Path:
+    return leases.LEASE_DIR / f"{act}.{epoch}.{kind}.json"
+
+
+# Поля события, которые никогда не берутся из файла маркера: их ставит
+# лента или репост. Иначе kind/text в маркере (мусор, подделка, будущий
+# формат) роняли post TypeError'ом, и sweep бился об этот маркер каждые
+# 60 с вечно (нашли deepseek и gemini).
+_MARKER_DROP = {"kind", "text", "author", "id", "ts", "schema", "live",
+                "reposted_from_marker"}
+
+
+def repost_marker(act: str, epoch: int):
+    """Маркер → лента → только потом снять. Возвращает событие или None.
+
+    Порядок незыблем: снять маркер до удачного поста значит потерять
+    единственную запись о честном закрытии — ровно то, что ревизия ядра
+    ловила у уборки дважды (правило 4: отказ фиксируется, не стирается).
+    """
+    m = marker_path(act, epoch)
+    try:
+        raw = json.loads(m.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if raw.get("epoch") != epoch or raw.get("act") != act:
+        # Имя и содержимое разошлись — это не наш close, а мусор;
+        # трогать не нам. Читатель обязан сверять эпоху (докстрока
+        # executor_run) — вот эта сверка.
+        return None
+    already = close_in_feed(act, epoch)
+    if already is None:
+        text = str(raw.get("text") or f"правка {act}: close из маркера")
+        ev = {k: v for k, v in raw.items() if k not in _MARKER_DROP}
+        try:
+            already = post("edit_close", text + " [из маркера: лента "
+                           "была недоступна исполнителю]",
+                           reposted_from_marker=True, **ev)
+        except Exception as e:           # noqa: BLE001 — лента всё ещё
+            print(f"репост маркера {m.name} не удался: {e}",
+                  file=sys.stderr)      # лежит: маркер НЕ снимаем
+            return None
+    try:
+        m.unlink()
+    except OSError:
+        pass
+    return already
+
+
+def _post_or_marker(kind: str, text: str, **ev):
+    """Пост в ленту; лента лежит — маркер crash рядом с замком.
+
+    Вылет при недоступной ленте иначе не оставлял НИ ОДНОЙ записи:
+    post падал, исключение глотала нить наблюдателя, sweep читает
+    только close-маркеры — и акт исчезал бесследно (нашёл kimi).
+    """
+    try:
+        return post(kind, text, **ev)
+    except Exception as e:               # noqa: BLE001
+        m = marker_path(ev.get("act", "x"), ev.get("epoch", 0), "crash")
+        try:
+            m.parent.mkdir(parents=True, exist_ok=True)
+            m.write_text(json.dumps(dict(ev, text=text),
+                                    ensure_ascii=False), encoding="utf-8")
+            print(f"лента недоступна ({e}); вылет записан маркером {m.name}",
+                  file=sys.stderr)
+        except OSError as e2:
+            print(f"ни лента, ни маркер вылета: {e} / {e2}", file=sys.stderr)
+        return None
+
+
+def verdict_on_drop(act: str, epoch: int, worktree: Path,
+                    voice: str, why: str | None):
+    """Замок пал — сказать ленте, чем кончился акт.
+
+    Возвращает записанное событие (или None, если и лента, и маркер
+    отказали). Сам НИЧЕГО не решает о worktree: штатный или нет, дерево
+    остаётся на диске — его судьбу (merge, продолжить, выбросить)
+    решает Автор через гейт. «Карантин» — статус в ленте, а не
+    перемещение файлов.
+    """
+    if why:
+        # Наблюдатель не дождался захвата или сломался. Это ещё НЕ
+        # вердикт: медленный старт executor (три git-проверки до
+        # аренды) мог просто не уложиться в грацию — тогда замок уже
+        # держится, и кричать «кресло не занято» значило бы дать два
+        # противоречивых вердикта одному акту (нашли grok и gemini).
+        # Решение принимает вызывающий (re-watch); мы честно скажем
+        # только про случай, когда замка действительно нет.
+        if leases.is_held(act):
+            return None                  # живой — пусть перевзводят
+        return _post_or_marker("edit_crash",
+                               f"правка {act} [{voice}]: кресло не занято "
+                               f"({why}); worktree {worktree} остаётся "
+                               f"для разбора",
+                               act=act, epoch=epoch, voice=voice,
+                               status="no_start", worktree=str(worktree))
+    ev = close_in_feed(act, epoch) or repost_marker(act, epoch)
+    if ev is not None:
+        return ev                        # штатно: close уже в ленте
+    prev = _crash_in_feed(act, epoch)
+    if prev is not None:
+        return prev                      # вылет уже записан — не дублировать
+    out = _post_or_marker("edit_crash",
+                           f"правка {act} [{voice}]: ВЫЛЕТ — замок пал, "
+                           f"close эпохи {epoch} нет ни в ленте, ни "
+                           f"маркером. Worktree {worktree} в карантине "
+                           f"(на диске, не тронут)",
+                           act=act, epoch=epoch, voice=voice,
+                           status="crash", worktree=str(worktree))
+    if out is not None:
+        # Вердикт в ленте — черновик-маркер (если успел лечь при
+        # прежней попытке с лежащей лентой) больше не нужен: sweep
+        # иначе донёс бы его вторым edit_crash той же эпохи (codex).
+        marker_path(act, epoch, "crash").unlink(missing_ok=True)
+    return out
+
+
+def _crash_in_feed(act: str, epoch: int):
+    """Уже записанный edit_crash этой эпохи, или None."""
+    for e in _feed_events(None):
+        if (e.get("kind") == "edit_crash" and e.get("act") == act
+                and e.get("epoch") == epoch
+                and e.get("author") in _CLOSE_AUTHORS):
+            return e
+    return None
+
+
+# ── Восстановление после рестарта окна ───────────────────────────────
+
+def open_acts_in_feed():
+    """Акты с edit_open БЕЗ парного edit_close/edit_crash той же эпохи.
+
+    Лента читается целиком: это восстановление, оно редкое и обязано
+    быть полным — «хвоста достаточно» здесь стоило бы вечно открытых
+    актов (первый набросок этой механики так и врал, нашли все пятеро
+    ревьюеров: после рестарта окна вердикт не доносил никто).
+    """
+    closed, opened = set(), {}
+    for e in _feed_events(None):         # свежие первыми
+        k = e.get("kind")
+        if k in ("edit_close", "edit_crash"):
+            closed.add((e.get("act"), e.get("epoch")))
+        elif k == "edit_open":
+            key = (e.get("act"), e.get("epoch"))
+            if key not in closed and key not in opened:
+                opened[key] = e
+    return list(opened.values())
+
+
+def recover_edits(watch_fn, *, grace_s: float = 240.0,
+                  now=None) -> int:
+    """Донести вердикты актам, которых окно не сторожит.
+
+    watch_fn(act, epoch, worktree, voice) — взводит наблюдателя окна
+    (передаётся снаружи, чтобы edits не знал про нити roundtable).
+    Для каждого открытого акта из ленты:
+      замок держится      → взвести наблюдателя заново (окно перезапущено,
+                            исполнитель жив и работает);
+      замок пал, акт СТАР → вердикт прямо сейчас (close/маркер/crash);
+      замок пал, акт МОЛОД (моложе grace_s) → взвести наблюдателя и
+                            ждать: executor до аренды делает git-пробы,
+                            и рестарт окна в эту минуту иначе объявлял
+                            вылет ЖИВОМУ исполнителю, который затем
+                            писал close — два вердикта одному акту
+                            (нашёл codex вторым кругом).
+
+    Ошибка на одном акте не рвёт цикл: одно кривое событие иначе
+    оставляло без вердикта все остальные (нашёл deepseek).
+    """
+    n = 0
+    now = now if now is not None else __import__("time").time()
+    for e in open_acts_in_feed():
+        try:
+            act, epoch = e.get("act"), e.get("epoch")
+            voice = e.get("voice", "?")
+            wt = Path(e.get("worktree", ""))
+            if not act or not isinstance(epoch, int):
+                continue
+            young = False
+            ts = e.get("ts")
+            if isinstance(ts, str):
+                try:
+                    from datetime import datetime
+                    t0 = datetime.fromisoformat(ts).timestamp()
+                    young = (now - t0) < grace_s
+                except ValueError:
+                    pass
+            if leases.is_held(act) or young:
+                try:
+                    watch_fn(act, epoch, wt, voice)
+                    n += 1
+                except ValueError:
+                    pass                 # наблюдатель уже стоит
+            else:
+                verdict_on_drop(act, epoch, wt, voice, None)
+                n += 1
+        except Exception as err:         # noqa: BLE001
+            print(f"recover {e.get('act')}: {err}", file=sys.stderr)
+    return n
+
+
+def sweep(active_ids) -> int:
+    """Уборка закрытых актов + репост осиротевших маркеров (close и crash).
+
+    Осиротевший маркер = исполнитель (или наблюдатель) писал при
+    недоступной ленте. Репостим и снимаем; после этого следующий
+    проход уборки унесёт и стенограф.
+    """
+    n = leases.sweep_closed(active_ids)
+    if not leases.LEASE_DIR.exists():
+        return n
+    for m in (list(leases.LEASE_DIR.glob("*.close.json"))
+              + list(leases.LEASE_DIR.glob("*.crash.json"))
+              + list(leases.LEASE_DIR.glob("*.merge.json"))
+              + list(leases.LEASE_DIR.glob("*.rebase.json"))):
+        mm = re.fullmatch(r"(.+)\.(\d+)\.(close|crash|merge|rebase)\.json",
+                          m.name)
+        if not mm:
+            continue
+        act, epoch, kind = mm.group(1), int(mm.group(2)), mm.group(3)
+        if act in (active_ids or ()):
+            continue
+        if leases.is_held(act):
+            continue                     # акт ещё живёт — не наш ход
+        if kind == "close":
+            repost_marker(act, epoch)
+        elif kind in ("merge", "rebase"):
+            # merge случился при лежащей ленте (гейт оставил маркер) —
+            # донести как edit_merge, той же дисциплиной, что close.
+            try:
+                raw = json.loads(m.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if raw.get("act") != act or raw.get("epoch") != epoch:
+                continue
+            text = str(raw.get("text") or f"правка {act}: событие гейта")
+            ev = {k: v for k, v in raw.items() if k not in _MARKER_DROP}
+            try:
+                post(f"edit_{kind}", text + " [из маркера: лента была "
+                     "недоступна гейту]", reposted_from_marker=True, **ev)
+                m.unlink(missing_ok=True)
+            except Exception as e:       # noqa: BLE001
+                print(f"репост merge-маркера {m.name}: {e}",
+                      file=sys.stderr)
+        else:
+            try:
+                raw = json.loads(m.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if raw.get("act") != act or raw.get("epoch") != epoch:
+                continue                 # имя и содержимое разошлись —
+                #                          мусор, не наш (та же сверка,
+                #                          что у close; нашёл codex)
+            if _crash_in_feed(act, epoch) is not None:
+                m.unlink(missing_ok=True)
+                continue                 # вылет уже в ленте — не дублировать
+            text = str(raw.get("text") or f"правка {act}: вылет")
+            ev = {k: v for k, v in raw.items() if k not in _MARKER_DROP}
+            try:
+                post("edit_crash", text + " [из маркера: лента была "
+                     "недоступна наблюдателю]",
+                     reposted_from_marker=True, **ev)
+                m.unlink(missing_ok=True)
+            except Exception as e:       # noqa: BLE001
+                print(f"репост crash-маркера {m.name}: {e}", file=sys.stderr)
+    return n

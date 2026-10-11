@@ -1,0 +1,10267 @@
+#!/usr/bin/env python3
+"""RoundTable — окно Автора в живую комнату. Прототип, раунд roundtable-v1.
+
+Зачем. Сейчас Автор говорит со столом через Клода: и реплики, и код, и
+быстрые ответы идут одним каналом — перекос по построению (затравка
+Автора, 2026-08-24). Это окно даёт Автору прямой вход в ленту: реплика
+уходит от имени `arr`, а не через дирижёра.
+
+Что это НЕ. Не вторая база и не второй журнал: единственная истина —
+`live.jsonl` (вердикт стола, раунд `оболочки-v1`). Сервер только читает
+ленту хвостом и зовёт `live.py` подпроцессом — весь протокол (слепой
+первый ход, очередь drand, остывание, карта покрытия) остаётся в live.py.
+
+Что тут из решений стола:
+  • жребий дирижёра — commit-reveal НА БУДУЩИЙ drand-раунд (идея kimi,
+    дыры v1 нашли claude/codex/kimi в ревью В1): commit публикуется до
+    существования подписи, имя не вычислимо без соли, соль раскрывается
+    при закрытии — сверить может любой;
+  • маяка нет — жребия нет (правило 11, fail-closed);
+  • «тест безрукого голоса»: окно не требует от голосов ничего сверх
+    live.py — HTTP-голоса (gemini, deepseek) равноправны;
+  • панель галочек «из кого рандом» — просьба Автора дословно.
+
+Запуск:  python3 roundtable.py            # http://127.0.0.1:8770
+  Порт по умолчанию — 8770, не 8765: 8765 на этой машине занят чужим
+  сервисом, отвечающим "forbidden"/"not found" на любой запрос, —
+  обнаружено при живом прогоне, когда окно «открывалось», а отвечал
+  не наш процесс. Переопределяется через ROUNDTABLE_PORT.
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import contextlib
+import fcntl
+import hashlib
+import html
+import json
+import os
+import re
+import secrets
+import shlex
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.request
+import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import parse_qs
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+import catalog                           # модели и ступени: разведка + кэш
+import edits                             # правки: worktree + вердикт
+import leases                            # аренды кресла исполнителя
+import merge_gate                        # этап 3: ревизия дифа + приёмка
+
+# Комната остаётся в chamber/ — RoundTable лишь окно в неё. РАСКЛАДКА
+# (переезд 2026-09-06): код стола — chamber/ (live.py, choir.py), журналы и
+# раунды — journal/ рядом; свежий публичный клон работает без настройки.
+# ROUNDTABLE_CHAMBER и ROUNDTABLE_JOURNAL переопределяют каждый каталог.
+_HERE = Path(__file__).resolve().parent
+# ROUNDTABLE_CHOIR — прежнее имя и старая раскладка «код и журнал в одной
+# папке»: значит и код, и журнал там, независимо от того, родилась ли уже
+# лента (ревизия переезда 2026-09-06: проверка «есть ли live.jsonl» делала
+# выбор зависимым от момента запуска). Явные ROUNDTABLE_CHAMBER/JOURNAL
+# сильнее. Пути делаются абсолютными сразу: дочерние процессы стартуют с
+# другим cwd, и относительная переменная означала бы там другое место.
+_legacy = os.environ.get("ROUNDTABLE_CHOIR")
+if _legacy and not (Path(_legacy).expanduser() / "live.py").is_file():
+    # переменная пережила переезд, а каталог — нет: молча вести окно в
+    # пустоту хуже предупреждения (ревизия переезда, deepseek 2026-09-06)
+    print(f"ROUNDTABLE_CHOIR={_legacy!r} не содержит live.py — переменная "
+          "проигнорирована, раскладка chamber/ + journal/", file=sys.stderr)
+    _legacy = ""
+_abs = lambda p: Path(p).expanduser().absolute()
+CHAMBER = _abs(os.environ.get("ROUNDTABLE_CHAMBER") or _legacy or _HERE / "chamber")
+JOURNAL = _abs(os.environ.get("ROUNDTABLE_JOURNAL") or os.environ.get("CHOIR_JOURNAL")
+               or _legacy or CHAMBER.parent / "journal")
+CHOIR = CHAMBER                      # прежнее имя: каталог кода стола
+# live.py/choir.py в дочерних процессах обязаны видеть ТОТ ЖЕ журнал, что
+# окно: присваивание, не setdefault — унаследованный CHOIR_JOURNAL иначе
+# перекрыл бы явный ROUNDTABLE_JOURNAL тестового окна, и дирижёр писал бы в
+# живой журнал (ревизия переезда, grok 2026-09-06).
+os.environ["CHOIR_JOURNAL"] = str(JOURNAL)
+# Относительный --project считается от корня песочницы (родителя RoundTable/).
+# Раньше он считался от каталога стола (Choir/), то есть `myproject` означал
+# Choir/myproject — никто этим не пользовался; после переезда база chamber/ была
+# бы ещё на уровень глубже (grok), поэтому база названа явно: SANDBOX.
+SANDBOX = _abs(os.environ.get("ROUNDTABLE_SANDBOX") or _HERE.parent)
+FEED = JOURNAL / "live.jsonl"
+PORT = int(os.environ.get("ROUNDTABLE_PORT", "8770"))
+# Каталог, о котором идёт разговор. Умолчание — ТОТ, ИЗ КОТОРОГО ОКНО
+# ЗАПУСТИЛИ: Автор набирает `roundtable` в папке проекта и ждёт, что
+# стол уже смотрит туда, а не заставляет копировать путь руками.
+# Переопределяется флагом --project и переменной ROUNDTABLE_PROJECT;
+# `-c/--continue` берёт путь прошлого запуска (LAST_RUN).
+PROJECT = os.environ.get("ROUNDTABLE_PROJECT") or os.getcwd()
+LAST_RUN = Path(os.environ.get("CHOIR_RT_LAST_RUN")           # тесты — свой файл, память -c Автора не трогают
+                or Path.home() / ".cache" / "choir" / "rt-last.json")
+
+# Каталоги, которые НЕЛЬЗЯ подставлять молча, и файлы, выдающие такой
+# каталог. Причина найдена ревьюером дифа и она денежная, а не
+# теоретическая: `--project` уходит голосам как `--add-dir` и как cwd,
+# то есть шесть чужих CLI получают каталог НА ЧТЕНИЕ. «Набираю
+# roundtable в папке проекта» — но домашний каталог тоже папка, и запуск
+# оттуда отдал бы им ~/.claude/.credentials.json, ~/.codex/auth.json и
+# остальные ключи, которые сборщик лимитов рядом старательно не пускает
+# наружу. Умолчание — удобство; удобство не стоит ключей Автора.
+SECRET_MARKS = (".credentials.json", "auth.json", ".env", "keys.txt",
+                "credentials", ".netrc", "id_rsa", ".ssh")
+
+
+PROJECT_DOC_TEMPLATE = """# {name}
+
+<!-- ОПИСАНИЕ ПРОЕКТА. Этот файл уходит в пакет ВСЕМ голосам стола одинаково
+(правило 1), в отличие от CLAUDE.md/AGENTS.md, которые читает только чей-то
+CLI. Пишите здесь то, что должен знать каждый участник: что за проект, цель,
+ограничения, где что лежит. Первые ~4000 символов; дальше — ссылки. -->
+
+## Что это
+
+## Цель и критерии «готово»
+
+## Ограничения и договорённости
+
+## Где что лежит
+
+- Стол: `.roundtable/` → {table} (окно `roundtable.py`, комната
+  `chamber/live.py`, дирижёр `chamber/choir.py`).
+- Раунды этого проекта: `{table}/journal/rounds/{name}/`.
+- Кресло исполнителя пишет ТОЛЬКО сюда (worktree этого каталога);
+  остальное пространство голоса читают, а пишут по отдельному заданию.
+"""
+
+
+def scaffold_project(project: Path, *, force: bool = False) -> None:
+    """Каркас нового проекта (наказ Автора 2026-09-10): в каталоге запуска
+    ссылка `.roundtable` на установленный стол и `PROJECT.md` с
+    инструкциями для всех голосов. История стола остаётся в одном месте
+    (journal/), проект держит своё описание у себя. Создаётся только в
+    ПУСТОМ каталоге (или по --init-project): в чужой проект стол
+    ничего не кладёт без просьбы."""
+    if not project.is_dir():
+        return
+    project = project.resolve()
+    table = Path(__file__).resolve().parent
+    if project == table or project == table.parent:
+        return                                  # сам стол и песочница — не проект
+    # .git — не содержимое: «git init» в новом каталоге — обычный первый
+    # шаг, каркас после него всё ещё нужен (ревизия: gemini, deepseek, grok)
+    entries = [q for q in project.iterdir()
+               if q.name not in (".roundtable", "PROJECT.md", access.FILE, ".git")]
+    if entries and not force:
+        if not (project / "PROJECT.md").exists():
+            print(f"каталог {project} не пуст — каркас проекта не создан; "
+                  f"roundtable --init-project создаст .roundtable, PROJECT.md и {access.FILE}",
+                  file=sys.stderr)
+        return
+    link = project / ".roundtable"
+    if link.is_symlink() or link.exists():
+        try:
+            if link.resolve() != table:
+                print(f"⚠ {link} уже есть и ведёт в {link.resolve()} — не трогаю",
+                      file=sys.stderr)
+        except OSError:
+            print(f"⚠ {link} уже есть (битая ссылка) — не трогаю", file=sys.stderr)
+    else:
+        link.symlink_to(table, target_is_directory=True)
+        print(f"проект {project.name}: ссылка .roundtable → {table}")
+    # Ссылка на весь стол не должна попасть в коммит проекта (`git add -A`
+    # рукой Автора): через неё в worktree кресла лёг бы путь записи в сам
+    # стол (ревьюер дифа). Исключение — локальное, .gitignore проекта не
+    # трогаем.
+    excl = project / ".git" / "info" / "exclude"
+    if (project / ".git").is_dir():
+        try:
+            excl.parent.mkdir(parents=True, exist_ok=True)
+            cur = excl.read_text(encoding="utf-8") if excl.exists() else ""
+            if ".roundtable" not in cur.split():
+                with open(excl, "a", encoding="utf-8") as fh:
+                    fh.write(("" if cur.endswith("\n") or not cur else "\n") + ".roundtable\n")
+        except OSError as e:
+            print(f"⚠ .git/info/exclude не дописан: {e}", file=sys.stderr)
+    doc = project / "PROJECT.md"
+    if doc.is_symlink():
+        print(f"⚠ {doc} — ссылка, а не файл: не трогаю", file=sys.stderr)   # codex: запись ушла бы по ссылке наружу
+    elif not doc.exists():
+        try:
+            with open(doc, "x", encoding="utf-8") as fh:    # эксклюзивно: чужой файл не затрём
+                fh.write(PROJECT_DOC_TEMPLATE.format(name=project.name, table=table))
+            print(f"проект {project.name}: создан PROJECT.md — опишите проект, "
+                  f"он уйдёт в пакет всем голосам")
+        except FileExistsError:
+            pass
+    # ACCESS.txt — тоже каркас (наказ Автора 2026-09-20): пустой шаблон с
+    # правилами записи; без него голоса видят только сам проект.
+    acc_f = project / access.FILE
+    if acc_f.is_symlink():
+        print(f"⚠ {acc_f} — ссылка, а не файл: не трогаю", file=sys.stderr)
+    elif not acc_f.exists():
+        try:
+            with open(acc_f, "x", encoding="utf-8") as fh:
+                fh.write(access.TEMPLATE)
+            print(f"проект {project.name}: создан {access.FILE} — что открыть "
+                  f"голосам сверх проекта (r/rw)")
+        except FileExistsError:
+            pass
+
+
+def project_risk(path: str) -> str | None:
+    """Почему этот каталог опасно подставлять умолчанием (или None)."""
+    if not path:
+        return None
+    p = Path(path)
+    if p == Path.home():
+        return "домашний каталог: в нём лежат ключи всех голосов"
+    if str(p) in ("/", "/tmp", "/etc", "/var"):
+        return f"{p} — системный каталог"
+    try:
+        for mark in SECRET_MARKS:
+            if (p / mark).exists():
+                return f"в каталоге есть {mark} — это похоже на секреты"
+    except OSError:
+        pass
+    return None
+DRAND = "https://api.drand.sh/v2/beacons/quicknet/rounds/latest"
+
+# Голоса берём у live.py, не дублируем список руками: две копии однажды
+# разойдутся, и панель начнёт врать (тем же образом из канона выпал Грок).
+sys.path.insert(0, str(CHOIR))
+import live  # noqa: E402
+import names as fnames                         # noqa: E402  имена файлов раундов латиницей (alias: в do_POST есть локальная names)
+import canary                                  # noqa: E402  канарейки прав (обещания 1 и 2)
+import secretary                               # noqa: E402  решения Автора, очередь, отчёты (SECRETARY.md)
+import jevproxy                                # noqa: E402  прокси стола к Jev (jev-v2): поднимается при старте окна
+import access                                  # noqa: E402  ACCESS.txt проекта: доступ голосов вне проекта
+import coverage as cover                       # noqa: E402  карта покрытия свода: та же арифметика, что у дирижёра
+import jail                                    # noqa: E402  jail.disabled(): сторож доступа выключен вместе с клеткой
+import anchor as anchor_mod                    # noqa: E402  «продолжить отсюда»: адрес → текст из журнала
+import secretary_turn                          # noqa: E402  кресло секретаря: агенты, состояние нити
+import backup                                  # noqa: E402  резервные снимки журналов и стенограмм
+import ideas as ideas_mod                      # noqa: E402  «свои идеи» голосов: накопитель с оценкой Jev
+
+
+_SEC_AGENTS_CACHE: dict = {"ts": 0.0, "data": None}
+
+
+_IDEAS_CACHE: dict = {"room_fp": None, "recs": None, "feed_fp": None, "taken": None}
+_IDEA_LOCK = threading.Lock()   # внутри ОДНОГО окна; два окна одного проекта —
+                                # граница (ревизия): дубль виден в очереди, снимается drop
+
+
+def _idea_taken() -> set:
+    """id дополнений, взятых в очередь и не снятых (drop возвращает идею в
+    накопитель). Лента читается только строками с полем idea_id или
+    операциями очереди — не вся (ревизия: опрос раз в 15 с)."""
+    try:
+        st = live.LIVE.stat(); fp = (st.st_size, st.st_mtime_ns)
+    except OSError:
+        return set()
+    if _IDEAS_CACHE["feed_fp"] == fp and _IDEAS_CACHE["taken"] is not None:
+        return _IDEAS_CACHE["taken"]
+    item_idea: dict = {}
+    dropped: set = set()
+    closed: set = set()
+    try:
+        with live.LIVE.open(encoding="utf-8") as f:
+            for line in f:
+                if '"kind": "queue"' not in line:
+                    continue
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                if e.get("op") == "add" and e.get("idea_id"):
+                    item_idea[e.get("id")] = e["idea_id"]
+                elif e.get("op") in ("done", "drop") and e.get("item") in item_idea and e["item"] not in closed:
+                    # как fold_queue: первое закрытие окончательно — drop после done
+                    # (гонка двух агентов) не возвращает выполненное в накопитель
+                    closed.add(e["item"])
+                    if e["op"] == "drop":
+                        dropped.add(e["item"])
+    except OSError:
+        pass
+    taken = {iid for item, iid in item_idea.items() if item not in dropped}
+    _IDEAS_CACHE.update(feed_fp=fp, taken=taken)
+    return taken
+
+
+def ideas_view(project: str | None, top: int = 15, fresh: int = 10) -> dict:
+    """Накопитель дополнений для вкладки секретаря: потерянные ценные сверху
+    (ценные по Jev и не дошедшие до свода), затем по ступени; отдельно —
+    дополнения последних раундов (свежие, любой ступени). Свой проект — по
+    правилу ленты (live.belongs). Кэш комнаты — по её отпечатку."""
+    room = Path(os.environ.get("CHOIR_ROOM") or (JOURNAL / "room.jsonl"))
+    try:
+        st = room.stat(); rfp = (st.st_size, st.st_mtime_ns)
+    except OSError:
+        return {"items": [], "fresh": [], "total": 0, "worthy": 0, "lost": 0, "taken": 0}
+    if _IDEAS_CACHE["room_fp"] != rfp:
+        recs, last_sum = [], {}
+        try:
+            with room.open(encoding="utf-8") as f:
+                for line in f:
+                    if '"idea_scores"' in line:
+                        try:
+                            recs.append(json.loads(line))
+                        except ValueError:
+                            pass
+                    elif '"role": "summary"' in line:
+                        try:
+                            r = json.loads(line)
+                        except ValueError:
+                            continue
+                        if r.get("status") == "ok":
+                            last_sum[r.get("round")] = r.get("id")
+        except OSError:
+            pass
+        _IDEAS_CACHE.update(room_fp=rfp, recs=recs, last_sum=last_sum)
+    led = ideas_mod.ledger(_IDEAS_CACHE["recs"] or [], project=project, taken=_idea_taken(),
+                           belongs=lambda e, pj: live.belongs(e, Path(pj)))
+    # «сверено с прежним сводом» — и в накопителе, где дополнение берут в работу
+    # (ревизия: grok — пометка была только в карточке)
+    ls = _IDEAS_CACHE.get("last_sum") or {}
+    for x in led:
+        x["stale"] = bool(x.get("summary_id") and ls.get(x.get("round")) and ls[x["round"]] != x["summary_id"])
+    open_ = [x for x in led if not x.get("taken")]
+    by_ts = sorted(open_, key=lambda x: str(x.get("ts") or ""), reverse=True)
+    top_ids = {x["id"] for x in open_[:top]}
+    return {"items": open_[:top], "fresh": [x for x in by_ts if x["id"] not in top_ids][:fresh],
+            "total": len(led), "worthy": sum(1 for x in led if x.get("worthy")),
+            "lost": sum(1 for x in led if x.get("lost")), "taken": sum(1 for x in led if x.get("taken"))}
+
+
+def sec_agents_report() -> dict:
+    """Кому можно отдать кресло секретаря и чем он пойдёт: модель и усилие —
+    действующие значения вкладки «комната» (решение Автора 2026-10-08);
+    текущий агент нити проекта — из состояния secretary_turn. Карточки
+    голосов — с кэшем 10 с: вкладка спрашивает каждые 15 с и на каждое
+    событие, а voice_report читает конфиги CLI (ревизия)."""
+    now = time.time()
+    if _SEC_AGENTS_CACHE["data"] is not None and now - _SEC_AGENTS_CACHE["ts"] < 10:
+        out = _SEC_AGENTS_CACHE["data"]
+    else:
+        out = _sec_agents_rows()
+        _SEC_AGENTS_CACHE.update(ts=now, data=out)
+    cur = ""
+    try:
+        proj = str(Path(PROJECT or _HERE).resolve())
+        cur = str(secretary_turn.load_state(proj).get("agent") or "")
+        if "/" in cur:
+            cur = Path(cur).name            # старое состояние: путь к бинарю
+    except Exception:                               # noqa: BLE001
+        pass
+    return {"agents": out, "agent": cur}
+
+
+def _sec_agents_rows() -> list[dict]:
+    out = []
+    for n in list(VOICES):
+        row = {"name": n, "can": n in secretary_turn.AGENTS}
+        if not row["can"]:
+            row["why"] = secretary_turn.NO_CHAIR.get(n) or "кресла секретаря нет"
+        try:
+            t = (voice_report(n, {}).get("tabs") or {}).get("room") or {}
+            row["model"] = t.get("model") or ""
+            row["effort"] = t.get("effort") or ""
+        except Exception as e:                      # noqa: BLE001
+            row["model"], row["effort"] = "", ""
+            row["why_model"] = f"карточка не собралась: {type(e).__name__}"
+        out.append(row)
+    return out
+
+
+def anchor_resolve(addr: str) -> dict:
+    """Якорь по адресу — ОДНИМ правилом для комнаты, раунда и секретаря:
+    лента окна, комната раундов по CHOIR_ROOM (как карточка раунда и
+    live._room_path), проект — метка событий окна. Три точки с разными
+    парами (путь, проект) дали бы 200 здесь и rc 2 у ребёнка (ревизия
+    2026-10-08: субагент, grok)."""
+    ep = live.event_project()
+    return anchor_mod.resolve(addr, live_path=live.LIVE, room_path=live._room_path(),
+                              project=str(ep) if ep else None)
+import early                                   # noqa: E402  ранние отказы: снятие голоса по кнопке
+
+VOICES = list(live.VOICES)
+
+# ── реестр запущенных ходов: индикатор «кто думает» ──────────────────
+# Свой реестр, а не парсинг `live.py who`: индикатор должен гаснуть и
+# при аварии подпроцесса, а это видно только его родителю.
+RUNNING: dict[str, dict] = {}
+RUN_LOCK = threading.Lock()
+# Проекты, чьё кресло исполнителя прямо сейчас ОТКРЫВАЕТСЯ (между
+# резервом в /edit и записью спавна в RUNNING). Под RUN_LOCK.
+_EDIT_RESERVED: set[str] = set()
+# Резерв имени раунда между проверкой занятости и spawn шага (/round_step).
+_ROUND_RESERVED: set[str] = set()
+
+# Жребий. Схема v2 — после ревью В1 (2026-08-25), три дыры v1:
+#   • имя было ВЫЧИСЛИМО из commit-события: индекс считался только от
+#     подписи и кандидатов, а оба публиковались (нашёл claude);
+#   • commit публиковался ПОСЛЕ получения маяка — сервер знал победителя
+#     до объявления, перебрасывай пока не понравится (нашёл codex);
+#   • соль жила в памяти: рестарт вешал в ленте навсегда нераскрытый
+#     commit (нашли kimi и codex независимо).
+# Теперь: commit = sha256(salt:candidates:R) публикуется, когда подписи
+# раунда R ещё НЕ СУЩЕСТВУЕТ (R — будущий); победитель =
+# H(sig_R:salt:candidates) — без соли не вычислим никем даже после
+# наступления R; соль до раскрытия лежит в приватном сейфе Автора на
+# диске (это секрет по построению, а не вторая истина: в истине — commit).
+LOT_LOCK = threading.Lock()
+LOT_SAFE = Path(os.environ.get("CHOIR_RT_LOT_SAFE")          # смок и тесты — свой сейф, живой не трогают
+                or Path.home() / ".cache" / "choir" / "roundtable-lot.json")
+LOT_AHEAD = 10          # раундов вперёд ≈ 30 с: подписи ещё нет ни у кого
+
+DRAND_ROUND = "https://api.drand.sh/v2/beacons/quicknet/rounds/{r}"
+
+
+def _lot_load() -> dict | None:
+    try:
+        return json.loads(LOT_SAFE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _lot_store(lot: dict | None) -> None:
+    """Соль — секрет: создаём файл сразу с правами 0600, а не write_text
+    под umask с последующим chmod (окно, в котором секрет читаем всеми)."""
+    LOT_SAFE.parent.mkdir(parents=True, exist_ok=True)
+    if lot is None:
+        LOT_SAFE.unlink(missing_ok=True)
+        return
+    fd = os.open(LOT_SAFE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(lot, f)
+
+
+class _SafeGate:
+    """Межпроцессный замок на сейф жребия. LOT_LOCK — threading, а сейф
+    один на машину: два окна (порт задан переменной, так и задумано)
+    проходили проверку «жребий уже есть» одновременно, оба публиковали
+    commit, второй затирал соль первого — и первый commit оставался
+    нераскрываемым навсегда (нашёл ревьюер дифа)."""
+
+    def __enter__(self):
+        LOT_SAFE.parent.mkdir(parents=True, exist_ok=True)
+        self._fh = open(LOT_SAFE.with_suffix(".gate"), "a+")
+        live.fcntl.flock(self._fh, live.fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            live.fcntl.flock(self._fh, live.fcntl.LOCK_UN)
+        finally:
+            self._fh.close()
+
+
+def drand_latest() -> dict:
+    with urllib.request.urlopen(DRAND, timeout=15) as r:
+        return json.load(r)
+
+
+_ROUND_CACHE: dict[int, dict] = {}
+_ROUND_CACHE_LOCK = threading.Lock()
+
+
+_ROUND_MISS: dict[int, float] = {}      # когда раунда ещё не было
+
+
+def drand_round(r: int) -> dict | None:
+    """Подпись раунда. Кэшируем НАВСЕГДА: раунд drand неизменяем, а
+    /state опрашивается раз в 2 с — без кэша это ~43k запросов в сутки
+    к чужому маяку и до 15 с под LOT_LOCK на каждом тормозе сети
+    (нашёл ревьюер дифа)."""
+    with _ROUND_CACHE_LOCK:
+        hit = _ROUND_CACHE.get(r)
+        # Положительный ответ кэшируется навсегда, а вот ОТРИЦАТЕЛЬНЫЙ не
+        # кэшировался вовсе — и пока целевой раунд не наступил (а это и
+        # есть нормальное состояние commit-фазы), каждый /state раз в
+        # 2 с уходил в сеть на 15 с под LOT_LOCK, вешая вкладку и вместе
+        # с ней /lot и /reveal (нашёл kimi). Отрицательный держим
+        # секунды: раунд drand выходит каждые 3 с.
+        miss_at = _ROUND_MISS.get(r, 0.0)
+    if hit is not None:
+        return hit
+    if time.time() - miss_at < 3.0:
+        return None
+    try:
+        with urllib.request.urlopen(DRAND_ROUND.format(r=r),
+                                    timeout=NET_TIMEOUT) as x:
+            b = json.load(x)
+    except Exception:               # noqa: BLE001 — раунда ещё нет
+        with _ROUND_CACHE_LOCK:
+            _ROUND_MISS[r] = time.time()
+        return None
+    with _ROUND_CACHE_LOCK:
+        _ROUND_CACHE[r] = b
+    return b
+
+
+def cast_lot(candidates: list[str]) -> dict:
+    """Обязательство на БУДУЩИЙ раунд. Маяк недоступен — жребия нет."""
+    beacon = drand_latest()
+    target = beacon["round"] + LOT_AHEAD
+    order = sorted(candidates)
+    salt = secrets.token_hex(16)
+    cands = ",".join(order)
+    commit = hashlib.sha256(f"{salt}:{cands}:{target}".encode()).hexdigest()
+    lot = {"salt": salt, "candidates": order, "target": target,
+           "commit": commit}
+    # СНАЧАЛА публикация, потом сейф. Обратный порядок оставлял в сейфе
+    # жребий, чей commit никто не видел: /lot дальше отвечал 409, а
+    # /reveal раскрывал несуществующее обязательство — зеркало дыры v1,
+    # ради которой делали v2 (нашёл ревьюер дифа).
+    feed_append(
+        "lot_commit",
+        f"жребий дирижёра: commit {commit[:16]}… на drand-раунд {target} "
+        f"(его подписи ещё не существует); кандидаты {{{cands}}}",
+        commit=commit, candidates=order, drand_target=target)
+    _lot_store(lot)
+    return lot
+
+
+def lot_winner(lot: dict) -> str | None:
+    """Имя есть только когда наступил целевой раунд. До reveal его может
+    вычислить лишь держатель соли — то есть это окно Автора."""
+    b = drand_round(lot["target"])
+    if not b:
+        return None
+    cands = ",".join(lot["candidates"])
+    idx = int(hashlib.sha256(
+        f"{b['signature']}:{lot['salt']}:{cands}".encode()).hexdigest(),
+        16) % len(lot["candidates"])
+    return lot["candidates"][idx]
+
+
+def reveal_lot(lot: dict) -> dict | None:
+    winner = lot_winner(lot)
+    if winner is None:
+        return None
+    ev = feed_append(
+        "lot_reveal",
+        f"дирижёром был {winner}: соль {lot['salt']}, раунд "
+        f"{lot['target']} — проверка: sha256(соль:кандидаты:раунд) == "
+        f"commit {lot['commit'][:16]}…; индекс = "
+        f"sha256(подпись:соль:кандидаты) mod {len(lot['candidates'])}",
+        conductor=winner, salt=lot["salt"], commit=lot["commit"],
+        candidates=lot["candidates"], drand_target=lot["target"])
+    _lot_store(None)
+    return ev
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+_GOAL_CACHE: dict = {"key": None, "goal": ""}
+
+
+def _last_goal() -> str:
+    """Действующая цель — последнее событие goal ленты (поле goal;
+    пустое = снята). ВЕСЬ файл с дешёвым префильтром, как у голосов
+    (live.current_goal, choir.goal_notice): хвост в 512 КБ терял цель
+    старше хвоста, и окно с голосами расходились (нашли все шестеро).
+    Кэш по (размер, mtime): /state опрашивается каждые две секунды."""
+    try:
+        st = FEED.stat()
+        key = (st.st_size, st.st_mtime_ns, live.goal_project())
+    except OSError:
+        return ""
+    if _GOAL_CACHE["key"] == key:
+        return _GOAL_CACHE["goal"]
+    goal = ""
+    # Чья цель — live.goal_project(): без проекта окно видит всю ленту,
+    # но цель только стола, как у комнаты и дирижёра (живой раунд 2026-10-05).
+    gp = live.goal_project()
+    try:
+        with FEED.open("r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if '"goal"' not in line:
+                    continue
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(e, dict) and e.get("kind") == "goal" \
+                        and live.belongs(e, gp):
+                    goal = str(e.get("goal") or "").strip()
+    except OSError:
+        return ""
+    _GOAL_CACHE.update(key=key, goal=goal)
+    return goal
+
+
+def _coverage_now(recs: list, name: str):
+    """Карта по записям раунда сейчас; без единой фазы ответов — словами,
+    а не обрывком «: ; долгов нет» (субагент, ревизия 22.09)."""
+    cov = cover.compute(recs, _debts_open_safe(), round_id=name)
+    if not cov.get("phases"):
+        return None
+    return cover.head(cov, None)
+
+
+def _debts_open_safe() -> list:
+    """Открытые долги ответов по choir.py; дирижёр не импортировался —
+    пустой список, карта честно покажет «долгов нет» по тому, что видит."""
+    try:
+        return choir._debts_open() if CHOIR_OK else []
+    except Exception as e:                       # noqa: BLE001
+        print(f"долги не прочитаны: {e}", file=sys.stderr)
+        return []
+
+
+def _access_project(raw) -> tuple:
+    """Каталог проекта для /access: поле окна, иначе проект окна.
+    Относительный — от корня песочницы, как у /round."""
+    s = str(raw or "").strip() or str(PROJECT or "")
+    if not s:
+        return None, "нужен проект: поле «Проект» пусто"
+    p = Path(s).expanduser()
+    if not p.is_absolute():
+        p = SANDBOX / p
+    p = p.resolve()
+    if not p.is_dir():
+        return None, f"нет такого каталога: {p}"
+    return p, None
+
+
+def _cut(s: str, n: int) -> str:
+    """Обрезка с многоточием: молчаливый срез хвоста причин в ленте
+    прочитался бы как полный список (grok, ревизия 22.09)."""
+    return s if len(s) <= n else s[:n - 1] + "…"
+
+
+# Сигнатура НАШЕЙ клетки в командной строке bwrap (jail.prefix): чужие
+# bwrap — собственная песочница Грока (`--cap-drop ALL --bind / /`), флатпаки
+# — не голоса стола, и блокировать ими запись доступа значит врать о
+# причине (ревизия 22.09: субагент, «пока открыт терминал Грока, права из
+# окна не меняются»).
+JAIL_SIGNATURE = ("--ro-bind / /", "--unshare-pid")
+
+
+def _is_our_jail(pgrep_line: str) -> bool:
+    """Строка `pgrep -a`: «<pid> bwrap <аргументы клетки> -- <команда голоса>».
+    Сигнатура ищется ТОЛЬКО в аргументах до разделителя ` -- `: промпт
+    Грока/Кими идёт в argv, и текст, цитирующий jail.py, делал чужой bwrap
+    «нашим» (второй круг ревизии: 409 по собственной песочнице Грока с
+    дифом в промпте). Наша клетка начинается ровно так, как её собирает
+    jail.prefix: `bwrap --ro-bind / / --dev /dev --proc /proc …`."""
+    head = pgrep_line.split(" -- ", 1)[0]
+    body = head.split(" ", 1)[1] if " " in head else head          # без pid
+    return body.startswith("bwrap --ro-bind / / --dev /dev --proc /proc") \
+        and all(sig in body for sig in JAIL_SIGNATURE)
+
+
+def _bwrap_alive() -> bool:
+    """Жив ли bwrap НАШЕЙ клетки у этого пользователя — значит чей-то голос
+    стола сейчас в клетке (любое окно, раунд, ревизия). pgrep -a по имени
+    процесса, не -f: -f ловил бы собственную оболочку; сигнатура — по
+    аргументам. Окно без клетки (jail.disabled(): CHOIR_RT_NO_BWRAP=1 —
+    стенды тестов, машины без bwrap) сторожить не может и не должно: его
+    голоса и так вне клетки; о том, что сторож выключен, окно говорит при
+    старте."""
+    if jail.disabled():
+        return False
+    try:
+        r = subprocess.run(["pgrep", "-u", str(os.getuid()), "-a", "-x", "bwrap"],
+                           capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return False                    # pgrep нет — проверка честно молчит
+    if r.returncode != 0:
+        return False
+    return any(_is_our_jail(line) for line in r.stdout.splitlines())
+
+
+def _access_view(rp: Path) -> dict:
+    """Разбор ACCESS.txt теми же проверками, что у комнаты (сокрытия
+    live._hide_dirs): окно показывает ровно то, что получит голос."""
+    acc = access.load(rp, hide=live._hide_dirs())
+    return {"project": str(rp), "file": acc.file, "exists": acc.file is not None,
+            "text": acc.text, "ro": acc.ro, "rw": acc.rw,
+            "rejects": acc.rejects, "sha": acc.sha}
+
+
+def round_view(name: str) -> dict:
+    """Карточка раунда из room.jsonl: жребий, затравка, слепые ответы,
+    витки, свод — дословно, как записано (правило 3), плюс счётчики
+    стадий для кнопок. Отсутствие записи — честное отсутствие поля."""
+    # Тот же путь, что у choir.py: CHOIR_ROOM переопределяет журнал
+    # (тесты, чужая комната) — окно не должно читать не тот файл (deepseek).
+    room = Path(os.environ.get("CHOIR_ROOM") or (JOURNAL / "room.jsonl"))
+    recs: list[dict] = []
+    needle = json.dumps(name, ensure_ascii=False)
+    try:
+        with room.open(encoding="utf-8") as f:
+            for line in f:
+                # Дешёвый префильтр: журнал 3 МБ и растёт, а клик —
+                # полный разбор; строки чужих раундов не парсим вовсе.
+                if needle not in line:
+                    continue
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(r, dict) and r.get("round") == name:
+                    recs.append(r)
+    except FileNotFoundError:
+        return {"round": name, "found": False}
+    if not recs:
+        return {"round": name, "found": False}
+    lots = [r for r in recs if r.get("role") == "lot"]
+    seeds = ([r for r in recs if r.get("role") == "seed_expanded"]
+             or [r for r in recs if r.get("role") == "seed"])
+    # Схема 1 писала слепые ответы БЕЗ phase — они слепые (как считает
+    # choir.py; нашли kimi, claude). Аннулированные — вон, как у rebut.
+    annul = {i for r in recs if r.get("role") == "annul"
+             for i in (r.get("ids") or [])}
+    answers = [r for r in recs if r.get("phase", "blind") == "blind"
+               and r.get("role") == "answer" and r.get("id") not in annul]
+    rebuts = [r for r in recs if str(r.get("phase", "")).startswith("rebut")
+              and r.get("role") in ("answer", "pass", "digest")   # digest — пересказ для голоса с потолком канала
+              and r.get("id") not in annul]
+    summaries = [r for r in recs if r.get("role") == "summary"]
+    lot_sum = [r for r in recs if r.get("role") == "lot_summary"]
+
+    def slim(r: dict) -> dict:
+        return {k: r.get(k) for k in ("id", "ts", "phase", "role", "voice",
+                                      "status", "model", "model_fallback",
+                                      "elapsed_s", "queued_s", "cli", "jail", "jail_sha", "text",
+                                      "recovered", "error", "detail", "eyes",
+                                      "visibility", "late", "nonblind",
+                                      "channel", "role_declared",
+                                      "ended_by", "early_warns",
+                                      "effort", "packet_chars", "packet_cap",   # усилие хода и отказ oversize (jev-v1, нулевой шаг)
+                                      "digest_for", "digest_by", "digest_id", "digest_budget", "digest_used", "digest_reject",   # пересказ по жребию
+                                      "coverage")            # карта покрытия свода — полем
+                if r.get(k) is not None}
+    ok = ("ok", "pass")
+    # Витки считаются, как у cmd_rebut: только ok/pass — виток, где все
+    # упали, дирижёр назовёт тем же номером (нашёл claude).
+    rebut_rounds = sorted({str(r.get("phase")) for r in rebuts
+                           if r.get("status") in ok})
+    last_sum = summaries[-1] if summaries else None
+    try:
+        cap = int(choir.MAX_REBUT_ROUNDS) if CHOIR_OK else 3
+    except Exception:                               # noqa: BLE001
+        cap = 3
+    return {"round": name, "found": True,
+            "conductor": (lots[-1].get("conductor") if lots else None),
+            "summarizer": (lot_sum[-1].get("text") if lot_sum else None),
+            "project": (lots[-1].get("project") if lots else None),
+            "drand_round": (lots[-1].get("drand_round") if lots else None),
+            "seed": (slim(seeds[-1]) if seeds else None),
+            "answers": [slim(r) for r in answers],
+            "n_ok_answers": sum(1 for r in answers if r.get("status") in ok),
+            "rebut_phases": rebut_rounds,
+            "rebuts": len(rebut_rounds),
+            "rebut_cap": cap,
+            "rebut_records": [slim(r) for r in rebuts],
+            # Шапка из журнала: окно и «Развить тему» обязаны показывать
+            # состав, иначе «все ответили» сводчика — первое, что видит
+            # человек (ревизия 22.09: codex, grok, kimi).
+            "summary_head": (cover.head(last_sum["coverage"], last_sum.get("voice"))
+                             if last_sum and isinstance(last_sum.get("coverage"), dict)
+                             else None),
+            # Карта СЕЙЧАС — по всем записям раунда, до всякого свода (Автор
+            # 22.09: «карту покрытия я увижу только после раунда?»). Та же
+            # арифметика, что у сводчика; долги — из журнала долгов.
+            "coverage_now": _coverage_now(recs, name),
+            "summary": (slim(last_sum) if last_sum else None),
+            "summary_ok": bool(last_sum and last_sum.get("status") == "ok"),
+            # Jev-проверки дирижёра (chamber/jevtable.py): только пометки — пересказ,
+            # свод и усилие не меняются; решает человек
+            # сверка свода — только ПОСЛЕДНЕГО свода (summary_id): прежняя пометка
+            # под новым сводом читалась бы как его (ревизия: субагент)
+            "jev_checks": [{k: r.get(k) for k in ("id", "ts", "phase", "role", "status", "p", "warn",
+                                                   "threshold", "digest_for", "by", "jev_level",
+                                                   "used", "would_lower", "detail", "clipped",
+                                                   "loss", "loss_warn", "loss_levels")
+                            if r.get(k) is not None}
+                           for r in recs if r.get("role") in ("digest_check", "effort_shadow")
+                           or (r.get("role") == "summary_check" and last_sum is not None
+                               and r.get("summary_id") == last_sum.get("id"))],
+            # «свои идеи» раунда с оценкой Jev — последняя запись idea_scores
+            # оценка дополнений — та, что сверена с ПОСЛЕДНИМ сводом (summary_id); иначе
+            # «не в своде» относилось бы к старому своду — поле stale говорит об этом
+            "ideas": (lambda r: (dict(r, stale=bool(last_sum and r.get("summary_id")
+                                                    and r.get("summary_id") != last_sum.get("id")))
+                                 if r else None))(ideas_mod.latest(recs).get(name)),
+            "n_records": len(recs)}
+
+
+def feed_append(kind: str, text: str, **extra) -> dict:
+    """Дописать событие в ленту — ЧЕРЕЗ live.post, не своим форматом.
+
+    Урок первого смока (2026-08-25, пойман дважды): запись со строковым
+    id ломала `read_events` всей комнаты — live.py живёт на числовых id.
+    Формат журнала принадлежит live.py; второй писатель со своим
+    форматом — вторая истина в миниатюре (раунд `оболочки-v1`).
+    Межпроцессную гонку двух писателей закрывает flock в самом
+    live.post — правка по ревью В1.
+    """
+    return live.post("roundtable", kind, text, **extra)
+
+
+# Вывод подпроцессов. Раньше глотался в DEVNULL (нашли kimi и grok):
+# упавший ход не оставлял следов, а судьба действия жила только в памяти
+# RUNNING — рестарт окна её терял. Теперь stdout+stderr каждого действия
+# собираются в файл по act_id, файл остаётся на диске для разбора.
+# Это диагностика, не вторая истина: итог (done/error + хвост) — в ленте.
+ACT_DIR = Path(os.environ.get("CHOIR_RT_ACTS")
+               or Path.home() / ".cache" / "choir" / "rt-acts")
+# АРХИВ СТЕНОГРАММ — запасной источник чтения. До 2026-10-06 уборка окна
+# стирала логи актов старше 14 суток, и вкладка «дирижёр» показывала
+# список актов с пустотой внутри (Автор: «внутри актов пусто»): 94 из 95
+# актов окна RoundTable остались без стенограммы, стенограммы до 21.09
+# потеряны безвозвратно (снимков диска за тот период нет). Уцелевшие
+# логи в день находки продублированы жёсткими ссылками сюда — окна со
+# старым кодом дочищали бы их до перезапуска. Пишется только в ACT_DIR;
+# архив читается, когда в ACT_DIR файла нет.
+ACT_ARCHIVE_DIR = Path(os.environ.get("CHOIR_RT_ACTS_ARCHIVE")
+                       or Path.home() / ".cache" / "choir" / "rt-acts-archive")
+# Срок хранения стенограмм в сутках; 0 (умолчание) — хранить бессрочно.
+# Решение Автора 2026-10-06: история стола дороже 2 МБ на диске.
+# Положительное значение возвращает прежнюю уборку по возрасту.
+def _keep_days(raw: str | None) -> int:
+    """Срок хранения из переменной: пусто → 0 (бессрочно); не целое
+    или меньше нуля → 0 с предупреждением, а не трасса при импорте
+    (субагент-ревьюер: «14d» ронял бы окно без внятного сообщения)."""
+    raw = (raw or "").strip()
+    if not raw:
+        return 0
+    try:
+        n = int(raw)
+    except ValueError:
+        n = -1
+    if n < 0:
+        print(f"⚠ CHOIR_RT_ACTS_KEEP_DAYS={raw!r}: нужно целое ≥ 0 — "
+              "стенограммы хранятся бессрочно", file=sys.stderr)
+        return 0
+    return n
+
+
+ACT_KEEP_DAYS = _keep_days(os.environ.get("CHOIR_RT_ACTS_KEEP_DAYS"))
+
+
+def _sweep_act_logs(live_acts: set, now: float | None = None) -> int:
+    """Уборка стенограмм по возрасту — ТОЛЬКО при ACT_KEEP_DAYS > 0.
+    Умолчание 0 — хранить бессрочно (решение Автора 2026-10-06): прежняя
+    уборка в 14 суток (ревьюер дифа 06.09, «копились бы вечно») стёрла
+    стенограммы 94 из 95 актов окна RoundTable, а вкладка «дирижёр» этим
+    и живёт. Чистка от ключей — на выдаче (_scrub_log), не на диске.
+    Логи живых актов не трогаются; архив (ACT_ARCHIVE_DIR) — никогда.
+    Кресло без окна пишет стенограф в каталог аренд, и его по-прежнему
+    стирает leases.sweep_closed — это не стенограмма окна и сюда не
+    относится (субагент-ревьюер). Возвращает число удалённых."""
+    if ACT_KEEP_DAYS <= 0:
+        return 0
+    cutoff = (now if now is not None else time.time()) - ACT_KEEP_DAYS * 86400
+    gone = 0
+    for lg in ACT_DIR.glob("*.log"):
+        try:
+            if lg.stat().st_mtime < cutoff and lg.name.split(".")[0] not in live_acts:
+                lg.unlink()
+                gone += 1
+        except OSError:
+            pass
+    return gone
+
+# Имя раунда — ОДНО правило на сервер и на страницу (константа, а не
+# литерал в обработчике): вторая копия правила живёт в PAGE (RE_ROUND),
+# и когда правило меняют в одном месте, а во втором нет, окно начинает
+# ловить 400 уже ПОСЛЕ того, как Автор набрал вопрос и имя.
+ROUND_RE = r"[\w][\w.-]{0,59}"
+
+# Флаг-стоп идущего раунда. Каталог общий с choir.py (~/.cache/choir):
+# окно только ставит файл, читает его дирижёр между шагами такта.
+# Файл, а не сигнал: окно и такт — разные процессы и переживают друг
+# друга, а файл переживает и рестарт окна.
+STOP_DIR = Path.home() / ".cache" / "choir"
+
+
+def stop_file(name: str) -> Path:
+    """Путь флага-стопа. Имя обязано пройти ROUND_RE ДО вызова: в классе
+    нет `/`, а первым символом не может быть точка, поэтому `../` в путь
+    не пролезет — но проверять это надо на входе, а не надеяться на
+    «имя же пришло из нашего окна»: /stop открыт всем, кто дотянулся до
+    порта."""
+    return STOP_DIR / f"stop-{name}"
+
+
+def _log_tail(log_path: Path, limit: int = 400) -> str:
+    """Хвост объединённого stdout+stderr, до 400 символов — в act_status."""
+    try:
+        return log_path.read_bytes()[-4 * limit:].decode(
+            "utf-8", errors="replace")[-limit:].strip()
+    except OSError:
+        return ""
+
+
+
+
+# ── ХВОСТ ЛОГА АКТА ДЛЯ ВКЛАДОК «ДИРИЖЁР / ИСПОЛНИТЕЛЬ / БЫСТРЫЙ ОТВЕТ» ──
+# Наказ Автора 2026-09-06: видеть работу стола «как в терминале», не ждать.
+# Раунд вкладки-вывода-v1 (все шесть голосов): опрос со смещением по байтам,
+# не SSE; порция до 64 КиБ; при первом чтении большого файла — только хвост
+# с пометкой skipped; смещение больше размера — файл начат заново, reset.
+# Чистка на выдаче: ANSI, домашний каталог → ~, строки, похожие на ключи.
+_ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]")
+_LOG_SECRET_RE = re.compile(r"(?i)(bearer\s+\S+|sk-[A-Za-z0-9_-]{8,}|AIza[0-9A-Za-z_-]{10,}|"
+                            r"gh[pousr]_[A-Za-z0-9]{10,}|github_pat_[A-Za-z0-9_]{10,}|xai-[A-Za-z0-9_-]{10,}|"
+                            r"xox[abpsr]-[A-Za-z0-9-]{10,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}|"
+                            r"(?:\b[A-Za-z0-9_-]*(?:x-api-key|api[_-]?key|token|secret|authorization)|\bkey)"
+                            r"[\"']?\s*[:=]\s*[\"']?[^\"'&\s]{8,})")
+ACT_LOG_CHUNK = 64 * 1024
+ACT_LOG_FIRST = 256 * 1024
+
+
+def _scrub_log(text: str) -> str:
+    text = _ANSI_RE.sub("", text).replace("\r\n", "\n").replace("\r", "\n")
+    text = text.replace(str(Path.home()), "~")
+    return _LOG_SECRET_RE.sub("‹вырезано›", text)
+
+
+# СТЕНОГРАММЫ ПО ВРЕМЕНИ НЕ СТИРАЮТСЯ (решение Автора 2026-10-08: «не так
+# много и весят; перевалят за 1 ГБ — сообщи»). ACT_KEEP_DAYS остаётся
+# ручкой только для явного желания; умолчание 0 — навсегда. Сторож объёма:
+# раз в проход резерва считает rt-acts + архив и при переходе порога кладёт
+# заметку в ленту — один раз на пересечение (метка-файл), не каждый запуск.
+ACTS_SIZE_LIMIT = int(os.environ.get("CHOIR_RT_ACTS_SIZE_LIMIT") or 1024 ** 3)
+
+
+def _acts_size() -> int:
+    """Байты стенограмм по УНИКАЛЬНЫМ inode: архив 06.10 — жёсткие ссылки на
+    те же файлы, иначе порог срабатывал бы вдвое раньше (ревизия)."""
+    total = 0
+    seen: set[tuple] = set()
+    for d in (ACT_DIR, ACT_ARCHIVE_DIR):
+        try:
+            for p in d.iterdir():
+                try:
+                    st = p.stat()
+                except OSError:
+                    continue
+                k = (st.st_dev, st.st_ino)
+                if k in seen:
+                    continue
+                seen.add(k); total += st.st_size
+        except OSError:
+            pass
+    return total
+
+
+def _acts_size_watch() -> bool:
+    """True — порог пересечён и заметка положена в этот раз."""
+    size = _acts_size()
+    mark = ACT_DIR / ".size-notified"
+    over = size > ACTS_SIZE_LIMIT
+    if not over:
+        mark.unlink(missing_ok=True)       # опустилось — следующее пересечение снова скажет
+        return False
+    if mark.exists():
+        return False
+    feed_append("note", f"📦 стенограммы актов занимают {size / 1024 ** 3:.2f} ГБ — больше {ACTS_SIZE_LIMIT / 1024 ** 3:.0f} ГБ "
+                        f"(решение Автора 2026-10-08: не стирать по времени, сообщить). Каталоги: {ACT_DIR}, {ACT_ARCHIVE_DIR}; "
+                        f"что делать — решает Автор (архивировать старое, вынести на другой диск, поднять порог CHOIR_RT_ACTS_SIZE_LIMIT)")
+    try:
+        mark.write_text(str(size), encoding="utf-8")
+    except OSError:
+        pass
+    return True
+
+
+_FEED_ACT_CACHE: dict[str, tuple] = {}     # aid → (отпечаток ленты и комнаты, текст)
+
+
+def _act_from_feed_cached(aid: str) -> str:
+    """_act_from_feed с кэшем по (размер, mtime) ленты и комнаты: вкладка
+    опрашивает акт раз в секунду, а разбор ленты — секунды процессора."""
+    def _fp(p: Path):
+        try:
+            st = p.stat(); return (st.st_size, st.st_mtime_ns)
+        except OSError:
+            return None
+    room = Path(os.environ.get("CHOIR_ROOM") or (JOURNAL / "room.jsonl"))
+    key = (_fp(live.LIVE), _fp(room))
+    hit = _FEED_ACT_CACHE.get(aid)
+    if hit and hit[0] == key:
+        return hit[1]
+    text = _scrub_log(_act_from_feed(aid))    # та же чистка от строк-ключей, что у файла (deepseek)
+    if len(_FEED_ACT_CACHE) > 64:
+        _FEED_ACT_CACHE.clear()
+    _FEED_ACT_CACHE[aid] = (key, text)
+    return text
+
+
+def _act_from_feed(aid: str) -> str:
+    """Запасная «стенограмма» акта из ленты: события с act/act_id == aid
+    (вопрос, статусы, ответы, ревизии) и, для раунда, записи room.jsonl
+    этого раунда. Это НЕ стенограмма (потока CLI и мыслей тут нет) — шапка
+    так и говорит; лучше пустоты, которую Автор прочёл как потерю истории."""
+    try:
+        allev = live.read_events(all_projects=True)
+    except Exception:                                   # noqa: BLE001
+        allev = []
+    evs = [e for e in allev if str(e.get("act") or e.get("act_id") or "") == aid]
+    if not evs:
+        return ""
+    # СТАРЫЕ реплики комнаты поля act не несли (live.post штампует его с
+    # 2026-10-08): добираем события голосов и Автора между «принят» и
+    # «done/error» этого акта — по времени, с пометкой; параллельный акт
+    # тех же минут попал бы сюда же, потому это названо, а не спрятано
+    st = [e for e in evs if e.get("kind") == "act_status"]
+    acc = next((e for e in st if e.get("status") == "accepted"), None)
+    end = next((e for e in reversed(st) if e.get("status") in ("done", "error", "interrupted", "aborted")), None)
+    by_time = []
+    if acc and end and isinstance(acc.get("id"), int) and isinstance(end.get("id"), int):
+        # границы — по id ленты (монотонны), не по ts: секунда делит события
+        ids = {e.get("id") for e in evs}
+        by_time = [e for e in allev if e.get("id") not in ids and not (e.get("act") or e.get("act_id"))
+                   and isinstance(e.get("id"), int) and acc["id"] < e["id"] < end["id"]
+                   and e.get("kind") in ("say", "pass", "error", "topic", "verdict", "seed")]
+    merged = sorted(evs + by_time, key=lambda e: (str(e.get("ts") or ""), e.get("id") or 0))
+    out = [f"⚠ СТЕНОГРАММЫ АКТА {aid} НЕТ: файл стёрт прежней уборкой окна (срок 14 суток, снят 2026-10-06) "
+           f"или не писался. Ниже — события ленты этого акта ({len(evs)}"
+           + (f" + {len(by_time)} по времени между «принят» и концом акта: у старых реплик поля act не было, "
+              f"параллельный акт тех же минут попал бы сюда же" if by_time else "")
+           + "); потока CLI и мыслей модели здесь нет.", ""]
+    rname = ""
+    for e in merged:
+        head = f"[#{e.get('id')}] {str(e.get('ts') or '')[:19]} {e.get('author')} · {e.get('kind')}"
+        if e.get("status"):
+            head += f" · {e['status']}"
+        if e.get("voice") and e.get("author") != e.get("voice"):
+            head += f" · {e['voice']}"
+        if e in by_time:
+            head += " · (по времени)"
+        out.append(head)
+        body = str(e.get("full_text") or e.get("text") or "").rstrip()
+        if body:
+            out.append(body)
+        if e.get("detail"):
+            out.append(f"— {e['detail']}")
+        out.append("")
+        if not rname:
+            rname = str(e.get("round") or "")
+            if not rname:
+                m = re.search(r"\bround: (\S+)", str(e.get("text") or ""))
+                rname = m.group(1) if m else ""
+    if rname:
+        try:
+            room = Path(os.environ.get("CHOIR_ROOM") or (JOURNAL / "room.jsonl"))
+            recs = []
+            needle = json.dumps(rname, ensure_ascii=False)
+            with room.open(encoding="utf-8") as f:
+                for line in f:
+                    if needle not in line:
+                        continue
+                    try:
+                        r = json.loads(line)
+                    except ValueError:
+                        continue
+                    if r.get("round") == rname:
+                        recs.append(r)
+        except OSError:
+            recs = []
+        if recs:
+            out.append(f"═══ РАУНД «{rname}» — записи room.jsonl ({len(recs)}); ответы дословно, карточка раунда в ленте показывает то же ═══")
+            out.append("")
+            for r in recs:
+                out.append(f"[{r.get('id')}] {str(r.get('ts') or '')[:19]} {r.get('phase')} · {r.get('role')} · {r.get('voice')}"
+                           + (f" · {r['status']}" if r.get("status") else "")
+                           + (f" · {r['elapsed_s']} с" if r.get("elapsed_s") else ""))
+                body = str(r.get("text") or "").rstrip()
+                if body:
+                    out.append(body)
+                if r.get("detail"):
+                    out.append(f"— {r['detail']}")
+                out.append("")
+    return "\n".join(out)
+
+
+def _act_log_path(aid: str, kind: str, edit: str = "") -> tuple[Path | None, str]:
+    """Файл лога по роду вкладки: act — stdout+stderr процесса акта; raw —
+    стенограмма акта (вопрос, шапки ходов, поток CLI голосов, итоги —
+    пишут live.py/choir.py через transcript.py), иначе лог акта; chair —
+    долговечный стенограф кресла <акт>.chair.log в каталоге актов (пишет
+    executor_run, когда кресло выдано окном), иначе лог из каталога аренд
+    (edit-<акт правки>.<эпоха>.log, самая свежая эпоха; его стирает уборка),
+    иначе лог процесса-обёртки. Каждое имя ищется сначала в ACT_DIR, потом
+    в архиве (ACT_ARCHIVE_DIR): туда спасены логи, которые прежняя уборка
+    ещё не стёрла; род источника от каталога не меняется."""
+    def _find(name: str) -> Path | None:
+        for d in (ACT_DIR, ACT_ARCHIVE_DIR):
+            p = d / name
+            if p.exists():
+                return p
+        return None
+    if kind == "raw":
+        raw = _find(f"{aid}.raw.log")
+        if raw is not None:
+            return raw, "raw"
+    if kind == "chair":
+        durable = _find(f"{aid}.chair.log")
+        if durable is not None:      # executor_run пишет сюда, когда кресло выдано окном
+            return durable, "chair"
+        try:
+            cands = sorted(leases.LEASE_DIR.glob(f"edit-{edit or aid}.*.log"),
+                           key=lambda q: q.stat().st_mtime)
+        except OSError:              # файл аренды исчез между glob и stat (kimi)
+            cands = []
+        if cands:
+            return cands[-1], "chair"
+    act = _find(f"{aid}.log")
+    return (act, "act") if act is not None else (None, "")
+
+
+def _utf8_cut(b: bytes) -> bytes:
+    """Отрезать незавершённый хвост многобайтового символа (до 3 байт)."""
+    for k in range(1, min(4, len(b)) + 1):
+        c = b[-k]
+        if c & 0xC0 != 0x80:               # не байт продолжения — начало символа
+            need = 2 if c & 0xE0 == 0xC0 else 3 if c & 0xF0 == 0xE0 else 4 if c & 0xF8 == 0xF0 else 1
+            return b[:-k] if need > k else b
+    return b
+
+
+def _read_log_tail(path: Path, since: int, alive: bool = False,
+                   head: bool = False) -> dict:
+    """Порция лога от since. Пока акт жив, отдаются только ЦЕЛЫЕ строки:
+    ключ, JSON-событие или многобайтовый символ, разрезанные границей
+    опроса, ускользнули бы от чистки и разбора (ревизия: codex, gemini).
+    Строка длиннее порции режется по границе символа UTF-8.
+    head=True — читать большой файл С НАЧАЛА, без пропуска головы:
+    кнопка «показать с начала» во вкладке (Автор 2026-10-06: у раунда с
+    мыслями стенограмма ~900 КБ, и хвост в 256 КиБ показывал один свод)."""
+    size = path.stat().st_size
+    reset = skipped = False
+    start = since
+    if start > size:
+        start, reset = 0, True
+    if start == 0 and size > ACT_LOG_FIRST and not head:
+        start, skipped = size - ACT_LOG_FIRST, True
+    with path.open("rb") as f:
+        if skipped:
+            # от начала строки: обрывок первой строки — мусор. Перевод
+            # строки ищется по всему хвосту, а не в первой порции: у
+            # болтливого CLI одна строка бывает длиннее порции.
+            f.seek(start)
+            scanned = 0
+            while scanned < ACT_LOG_FIRST:
+                blk = f.read(ACT_LOG_CHUNK)
+                if not blk:
+                    break
+                nl = blk.find(b"\n")
+                if nl >= 0:
+                    start += scanned + nl + 1
+                    break
+                scanned += len(blk)
+        f.seek(start)
+        chunk = f.read(ACT_LOG_CHUNK + 1)
+    more = len(chunk) > ACT_LOG_CHUNK
+    if more:
+        chunk = chunk[:ACT_LOG_CHUNK]
+        nl = max(chunk.rfind(b"\n"), chunk.rfind(b"\r"))
+        chunk = chunk[:nl + 1] if nl >= 0 else _utf8_cut(chunk)
+    elif alive and chunk and not chunk.endswith((b"\n", b"\r")):
+        # \r — тоже граница: прогресс grok/kimi через pty идёт возвратами
+        # каретки без \n, и вкладка молчала бы до конца хода (ревьюер)
+        nl = max(chunk.rfind(b"\n"), chunk.rfind(b"\r"))
+        chunk = chunk[:nl + 1] if nl >= 0 else b""      # недописанную строку — потом
+    return {"text": _scrub_log(chunk.decode("utf-8", errors="replace")),
+            "next": start + len(chunk), "size": size,
+            "reset": reset, "skipped": skipped, "more": more and len(chunk) > 0}
+
+
+ACT_VIEW_DIFF_LIMIT = 200 * 1024
+_ACT_VIEW_CACHE: dict = {}          # act → (ключ, карточка)
+
+
+def _stage_of(st: dict, act: str) -> str:
+    if st.get("merge"):
+        return "merged"
+    if st.get("drop"):
+        return "dropped"
+    if st.get("crash"):
+        return "adopted" if st.get("adopt") else "crashed"
+    if st.get("close"):
+        return "closed"
+    return "working" if leases.is_held(act) else "opening"
+
+
+def act_view(act: str) -> dict:
+    """Всё об акте правки для карточки во вкладке «исполнитель»: интент,
+    закрытие, диф ветки (чищеный), ревизии с полными текстами, стадия и
+    счёт гейта — то, что Автор ждал увидеть, выбрав акт, вместо сухого
+    отчёта (2026-09-10). Кнопки гейта рисует страница по stage."""
+    # Карточку опрашивают каждые 6 с, пока она открыта: без кэша это
+    # полный скан ленты плюс два git-вызова на тик (ревизия: все пятеро).
+    # Ключ — лента (размер, mtime) и голова ветки (один rev-parse).
+    try:
+        f = edits.JOURNAL / "live.jsonl"
+        fst = f.stat()
+        fkey = (fst.st_size, fst.st_mtime_ns)
+    except OSError:
+        fkey = None
+    st = merge_gate.act_state(act)
+    if not st["open"]:
+        raise merge_gate.GateRefused(f"акт {act} неизвестен ленте")
+    op = st["open"]
+    head_now = main_now = None
+    if op.get("project"):
+        try:
+            head_now = merge_gate.branch_head(Path(op["project"]), act)
+        except merge_gate.GateRefused:
+            head_now = None
+        # сдвиг main руками Автора не двигает ни ленту, ни ветку акта —
+        # без него карточка показывала бы «база не уехала» (ревьюер)
+        main_now, _ = merge_gate._git(Path(op["project"]), "rev-parse",
+                                      f"refs/heads/{op.get('branch') or 'main'}")
+    key = (fkey, head_now, (main_now or "").strip(), leases.is_held(act))
+    cached = _ACT_VIEW_CACHE.get(act)
+    if fkey is not None and cached and cached[0] == key:
+        return cached[1]
+    out = {"act": act, "voice": op.get("voice"), "seat": op.get("seat"),
+           "task": op.get("task") or op.get("text"), "project": op.get("project"),
+           "base_sha": op.get("base_sha"), "worktree": op.get("worktree"),
+           "opened": op.get("ts"), "close": None, "crash": None,
+           "reviews": [], "diff": "", "diff_truncated": False, "head": None}
+    for k in ("close", "crash", "adopt", "merge", "rebase"):
+        e = st.get(k)
+        if e:
+            out[k] = {kk: e.get(kk) for kk in
+                      ("ts", "text", "status", "rc", "head", "dirty", "autocommit",
+                       "excluded", "elapsed_s", "result_sha", "by",
+                       "jail", "jail_sha", "jail_why") if kk in e}
+    for r in reversed(st.get("reviews_all") or st.get("reviews") or []):   # старые первыми; прежней жизни — тоже (карточке)
+        out["reviews"].append({kk: r.get(kk) for kk in
+                               ("ts", "voice", "verdict", "status", "sha",
+                                "elapsed_s", "eyes", "seat", "jail",
+                                "full_text", "text")})
+    try:
+        c = merge_gate.checks(act)
+        out["checks"] = {"ok": c.get("ok"), "reasons": c.get("reasons"),
+                         "approvals": c.get("approvals") or [],
+                         "refused": c.get("refuted_by") or c.get("refused") or [],
+                         "quorum": c.get("quorum", merge_gate.QUORUM),
+                         "stale_base": c.get("stale_base"), "scope": c.get("scope"),
+                         "canary": c.get("canary"),
+                         "canary_review_broken": c.get("canary_review_broken") or [],
+                         "jail": c.get("jail"),
+                         "reasons_soft": c.get("reasons_soft") or []}
+        out["head"] = c.get("head")
+    except Exception as e:                                  # noqa: BLE001
+        out["checks"] = {"ok": False, "reasons": [str(e)], "approvals": [], "refused": [],
+                         "quorum": merge_gate.QUORUM}
+    out["stage"] = _stage_of(st, act)
+    try:
+        if op.get("project"):
+            base = merge_gate._effective_base(st)
+            diff, head, _ = merge_gate.act_diff(Path(op["project"]), act, base)
+            out["head"] = out["head"] or head
+            if len(diff) > ACT_VIEW_DIFF_LIMIT:
+                diff, out["diff_truncated"] = diff[:ACT_VIEW_DIFF_LIMIT], True
+            out["diff"] = _scrub_log(diff)
+    except Exception as e:                                  # noqa: BLE001
+        out["diff_error"] = str(e)
+    if fkey is not None:
+        _ACT_VIEW_CACHE[act] = (key, out)
+        while len(_ACT_VIEW_CACHE) > 8:          # до 200 КБ дифа на акт — не копить
+            _ACT_VIEW_CACHE.pop(next(iter(_ACT_VIEW_CACHE)))
+    return out
+
+
+class ReviewNotStarted(RuntimeError):
+    """Веер не запущен по причине, названной в тексте (rebase не прошёл);
+    резерв веера уже снят. Отличается от «ревизия уже идёт» (None)."""
+
+
+_REBASING: set[str] = set()      # акты, чью ветку гейт сейчас переносит на main
+
+
+def _rebase_before_review(act: str) -> dict | None:
+    """Перенести ветку акта на уехавший main перед веером ревизии.
+    Механика гейта, не вердикт; конфликт — честная заметка в ленту и
+    None (ревизии не будет, разруливать — исполнителю или Автору).
+    Зовётся ПОД резервом веера (_spawn_review): иначе повторный запрос
+    переносил бы ветку под уже идущей ревизией и обесценивал её
+    (ревизия 2026-09-16: codex, deepseek, субагент)."""
+    with RUN_LOCK:
+        _REBASING.add(act)       # /edit continue и /edit_drop подождут
+    try:
+        rb = merge_gate.rebase_act(act)
+    except merge_gate.GateRefused as e:
+        try:
+            still = merge_gate.checks(act).get("stale_base")
+        except Exception:                                   # noqa: BLE001
+            still = True
+        if not still:
+            # перенёс кто-то другой (гонка двух запросов): база свежая,
+            # веер можно слать — заметка «не прошёл» была бы ложью
+            return {}
+        feed_append("note", f"правка {act}: main уехал, а rebase не "
+                    f"прошёл — {e}; ревизия не запущена", act=act)
+        return None
+    except Exception as e:                                  # noqa: BLE001
+        feed_append("note", f"правка {act}: rebase перед ревизией упал — "
+                    f"{e}", act=act)
+        return None
+    finally:
+        with RUN_LOCK:
+            _REBASING.discard(act)
+    feed_append("note", f"правка {act}: main уехал — ветка перенесена "
+                f"гейтом на {str(rb.get('base_sha') or '')[:12]} "
+                f"(голова {str(rb.get('head') or '')[:12]}); ревизия идёт "
+                f"на новой голове", act=act)
+    return rb
+
+
+def _spawn_review(act: str, *, auto: bool = False,
+                  queue_if_busy: bool = False) -> str | None:
+    """Ревизия дифа акта столом — один резерв на все формы (кнопка,
+    пачка, авто): акт не должен ревизоваться двумя веерами сразу.
+    Возвращает act_id; None — ревизия уже идёт (при queue_if_busy акт
+    поставлен в очередь ПОД ТЕМ ЖЕ замком: между проверкой занятости и
+    постановкой веер иначе мог освободиться, и очередь зависла бы —
+    ревизия второго круга, codex). Уехавший main переносится ЗДЕСЬ, уже
+    под резервом веера (спека п.7: сдвиг main → rebase → ревизия дельты);
+    не прошёл — ReviewNotStarted, резерв снят."""
+    with RUN_LOCK:
+        if _STOPPING:
+            return None          # finally окна уже забрал RUNNING себе (ревьюер дифа)
+        dup = ([t for t in RUNNING.values() if t.get("gate") == "review"]
+               or ("review" in _EDIT_RESERVED))
+        if dup and queue_if_busy and act not in _REVIEW_QUEUE:
+            _REVIEW_QUEUE.append(act)
+        if not dup:
+            _EDIT_RESERVED.add("review")
+    if dup:
+        return None
+    try:
+        try:
+            c0 = merge_gate.checks(act)
+            stale = c0.get("stale_base")
+        except Exception as e:                              # noqa: BLE001
+            c0, stale = {}, False
+            print(f"_spawn_review: checks {act}: {e}", file=sys.stderr)
+        if stale and _rebase_before_review(act) is None:
+            raise ReviewNotStarted("main уехал, а rebase не прошёл — "
+                                   "см. заметку в ленте")
+        # канарейки и ревизорам (обещание 2: рецензент ничего не пишет)
+        ckey = f"{act}.review.{uuid.uuid4().hex[:6]}"
+        if not _canary_lay(ckey, c0.get("project")):
+            ckey = ""
+        return spawn([sys.executable,
+                      str(Path(__file__).resolve().parent / "merge_gate.py"),
+                      "review", act],
+                     f"review: акт {act}" + (" (авто)" if auto else ""), VOICES,
+                     meta={"edit": act, "gate": "review",
+                           **({"canary": ckey} if ckey else {})},
+                     fields={"edit": act, "gate": "review",
+                             **({"auto": True} if auto else {})},
+                     note=("АВТОРЕВИЗИЯ: диф кресла ушёл столу сам. Правка "
+                           "без ревизии не принимается — наказ Автора "
+                           "2026-09-06 и устав («bypassV2 — пол, а не опция»)."
+                           if auto else ""))
+    finally:
+        with RUN_LOCK:
+            _EDIT_RESERVED.discard("review")
+
+
+_REVIEW_QUEUE: list[str] = []          # акты, ждущие свободного веера ревизии
+_STOPPING = False                       # окно закрывается: авторевизий больше не спавнить
+
+
+def _drain_review_queue() -> None:
+    """Веер освободился (акт ревизии закончился) — следующий из очереди.
+    Пропущенные (уже ревизованы кнопкой, диф пуст) не занимают веер:
+    идём дальше по очереди, пока кто-то не запустится."""
+    while True:
+        with RUN_LOCK:
+            nxt = _REVIEW_QUEUE.pop(0) if _REVIEW_QUEUE else None
+        if not nxt or _auto_review(nxt) != "skipped":
+            return
+
+
+def _pending_rows(pending: list[str], summary: list[dict]) -> list[dict]:
+    """Акты, ждущие ПРИЁМКИ (закрыты, не приняты, не сняты), с тем, что
+    нужно человеку для решения: голос, дата, задание, счёт ревизии.
+    Порядок — как в pending (свежие сверху). Акт без строки сводки
+    (старше её окна) всё равно в списке — с пустыми полями, не молча."""
+    by_act = {r.get("act"): r for r in summary or []}
+    out = []
+    for act in pending:
+        r = by_act.get(act) or {}
+        out.append({"act": act, "voice": r.get("voice"), "ts": r.get("ts"),
+                    "task": r.get("task"), "stage": r.get("stage"),
+                    "approvals": r.get("approvals") or [],
+                    "refused": r.get("refused") or [],
+                    "empty": r.get("empty"),
+                    "project": r.get("project")})
+    return out
+
+
+def _auto_review(act: str) -> str:
+    """После закрытия кресла ревизия запускается САМА — и после done, и
+    после error: работа закоммичена обёрткой в обоих случаях, а агентные
+    CLI нередко выходят с 1 после нормальных правок (grok).
+    Возвращает "spawned" | "queued" | "skipped".
+
+    Наказ Автора 2026-09-06: «любая правка, даже быстрая, должна
+    ревьюиться столом — спотыкались об это не раз». Кресло по быстрому
+    вопросу закрылось, правка легла в worktree, и следующим шагом была
+    кнопка, которую человек обязан был помнить. Теперь помнит окно.
+    Диф пуст — ревизии нет, и это сказано в ленте; ревизия уже идёт —
+    второй веер не запускается — акт встаёт в очередь и запускается,
+    когда веер освободится."""
+    if os.environ.get("CHOIR_RT_NO_AUTOREVIEW") == "1" or _STOPPING:
+        return "skipped"      # окно закрывается: очередь никто не разберёт (kimi)
+    try:
+        st = merge_gate.act_state(act)
+        if not st["open"] or st.get("merge"):
+            return "skipped"
+        if not st["close"]:
+            feed_append("note", f"правка {act}: авторевизия не запущена — "
+                        f"в ленте нет edit_close (маркер закрытия подберёт "
+                        f"recover, тогда ревизию запустит кнопка)", act=act)
+            return "skipped"
+        if st["close"].get("dirty"):
+            # автокоммит не удался (например, вложенный git): ветка
+            # неполна, и ревизия неполного дифа врала бы (deepseek)
+            feed_append("note", f"правка {act}: остатки в worktree без "
+                        f"коммита — ветка неполна, ревизия не запущена; "
+                        f"причина в логе кресла", act=act)
+            return "skipped"
+        c = merge_gate.checks(act)
+        # main уехал: rebase сделает _spawn_review под резервом веера
+        # (спека п.7). Прежде авторевизия тут откладывалась «до кнопки
+        # Принять», а кнопка без кворума не показывается — тупик (Автор
+        # 2026-09-16, правка 140adf4a5a91).
+        base = merge_gate._effective_base(st)
+        diff, head, _psha = merge_gate.act_diff(
+            Path(st["open"].get("project", "")), act, base)
+    except Exception as e:                                  # noqa: BLE001
+        feed_append("note", f"правка {act}: авторевизия не запущена — {e}",
+                    act=act)
+        return "skipped"
+    if not diff.strip():
+        # Пустой акт в ленте назван, но НЕ снимается сам: снятие удаляет
+        # ветку и закрывает «Продолжить» для акта, упавшего по квоте, и
+        # гонится с кнопкой Автора (аренда берётся уже после спавна) —
+        # ревизия 06.10. В списке приёмки такие акты стоят отдельной
+        # группой «упали без правок», счётчик их не считает.
+        feed_append("note", f"правка {act}: диф пуст — ревизовать нечего "
+                    f"(исполнитель ничего не изменил); продолжить или снять — "
+                    f"кнопками в карточке акта", act=act)
+        return "skipped"
+    if any(r.get("sha") == head or (_psha and r.get("patch_sha") == _psha)
+           for r in st.get("reviews") or []):
+        return "skipped"   # этот патч стол уже смотрел (та же голова или тот же patch_sha после переноса) — второй веер не нужен (kimi; ревизия 07.10)
+    try:
+        started = _spawn_review(act, auto=True, queue_if_busy=True)
+    except ReviewNotStarted:
+        return "skipped"          # заметка о rebase уже в ленте
+    if started is None:
+        with RUN_LOCK:
+            pos = (_REVIEW_QUEUE.index(act) + 1) if act in _REVIEW_QUEUE else 0
+        if not pos:
+            return "skipped"      # окно закрывается — в очередь не встал
+        feed_append("note", f"правка {act}: ревизия другого акта ещё идёт — "
+                    f"этот в очереди (№{pos}), запустится следом сам", act=act)
+        return "queued"
+    return "spawned"
+
+
+def _act_fields(rec: dict | None) -> dict:
+    """Поля события акта (round/step/auto/voices/project) для финалов —
+    без служебных ключей, которые финал ставит сам."""
+    f = dict((rec or {}).get("fields") or {})
+    for k in ("act_id", "status", "rc", "text",
+              "id", "ts", "author", "kind", "schema", "live"):
+        f.pop(k, None)
+    return f
+
+
+# ── cgroup НА АКТ (раунд стол-v3-изоляция, 2026-09-16: обещание 4 «акт
+# умирает целиком» первым в порядке стола). Каждое действие окна идёт в
+# своём transient scope systemd (--user): внуки CLI, пережившие обёртку,
+# остаются в его cgroup — их видно (cgroup.procs) и их снимает
+# `systemctl --user stop`, а не охота по pid. Нет systemd — прежний путь
+# (своя группа + killpg), об этом одна строка при старте.
+_SCOPE: dict = {"ok": None}
+
+
+def _scope_available() -> bool:
+    if _SCOPE["ok"] is None:
+        ok = False
+        if (os.environ.get("CHOIR_RT_NO_SYSTEMD") != "1"
+                and shutil.which("systemd-run") and shutil.which("systemctl")):
+            try:
+                r = subprocess.run(["systemd-run", "--user", "--scope", "--quiet",
+                                    "--collect", "--", "true"],
+                                   capture_output=True, text=True, timeout=15)
+                ok = r.returncode == 0
+                if not ok:
+                    print(f"systemd-run недоступен ({r.stderr.strip()[:120]}) — "
+                          f"акты без cgroup, снимаются по группе процессов",
+                          file=sys.stderr)
+            except (OSError, subprocess.SubprocessError) as e:
+                print(f"systemd-run недоступен ({e}) — акты без cgroup",
+                      file=sys.stderr)
+        _SCOPE["ok"] = ok
+    return _SCOPE["ok"]
+
+
+def _scope_unit(act_id: str) -> str:
+    return f"rt-act-{act_id}-{os.getpid()}"
+
+
+def _scope_procs(unit: str) -> list[int] | None:
+    """pid, оставшиеся в cgroup акта: [] — scope пуст или уже собран;
+    None — не удалось прочитать (systemctl/cgroup): «не знаю», а не
+    «никого» (ревизия: codex, deepseek, grok)."""
+    try:
+        r = subprocess.run(["systemctl", "--user", "show", "-p", "ControlGroup",
+                            "--value", f"{unit}.scope"],
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode != 0:
+            return None
+        cg = r.stdout.strip()
+        if not cg:
+            return []
+        try:
+            txt = Path("/sys/fs/cgroup" + cg, "cgroup.procs").read_text()
+        except FileNotFoundError:
+            # systemd уже снёс каталог, а show ещё отдавал путь — гонка в
+            # момент выхода акта (второй круг: 16 из 30 прогонов); снесён
+            # значит пуст, а не «не знаю»
+            return []
+        return [int(x) for x in txt.split() if x.isdigit()]
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def _scope_kill(unit: str, sig: str = "SIGTERM") -> bool:
+    """Сигнал всему cgroup акта. Именно `kill --signal`, не `stop`: stop —
+    это SIGTERM и ожидание TimeoutStopSec (90 с у user-manager), а не
+    SIGKILL (субагент замерил: stop висел >30 с, kill -9 — 10 мс)."""
+    try:
+        r = subprocess.run(["systemctl", "--user", "kill", f"--signal={sig}",
+                            f"{unit}.scope"], capture_output=True, text=True,
+                           timeout=10)
+        return r.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _scope_reap(act_id: str, unit: str, label: str,
+                grace: float = 2.0) -> None:
+    """Акт закончился — в его cgroup никого не должно остаться (идея голоса
+    claude на витке раунда: cgroup.procs при закрытии — измеримое
+    обещание 4). Остались — SIGTERM, grace, SIGKILL, и заметка в ленту
+    только про то, что проверено: «сняты» лишь когда cgroup пуст."""
+    left = _scope_procs(unit)
+    if left is None:
+        feed_append("note", f"акт {act_id}: cgroup не прочитан — не знаю, "
+                    f"умер ли акт целиком ({label})", act=act_id)
+        return
+    if not left:
+        return
+    _scope_kill(unit, "SIGTERM")
+    time.sleep(grace)
+    still = _scope_procs(unit)
+    how = "SIGTERM"
+    if still:
+        _scope_kill(unit, "SIGKILL")
+        time.sleep(0.5)
+        still = _scope_procs(unit)
+        how = "SIGKILL"
+    outcome = ("сняты через cgroup (" + how + ")" if not still
+               else f"НЕ сняты: {len(still)} процесс(ов) ещё живы после {how}")
+    feed_append("note", f"акт {act_id} не умер целиком: {len(left)} процесс(ов) "
+                f"пережили обёртку (pid {', '.join(map(str, left[:6]))}) — "
+                f"{outcome}: {label}",
+                act=act_id, cgroup_left=left[:20], cgroup_still=(still or [])[:20])
+
+
+def _canary_lay(key: str, project: str | Path | None) -> bool:
+    """Разложить приманки перед актом с записью на диск (кресло) или
+    чтением чужого кода (ревизия): корень проекта, HOME, каталог
+    worktree'ов, кэш стола. Пломбы — в каталоге актов под ключом."""
+    try:
+        rec = canary.lay(key, canary.default_spots(Path(project) if project else None,
+                                                   edits.WT_DIR),
+                         ACT_DIR, project=Path(project) if project else None,
+                         owner={"pid": os.getpid(), "start_tick": _proc_start(os.getpid())})
+        return bool(rec.get("files"))
+    except Exception as e:                                  # noqa: BLE001
+        print(f"канарейки для {key} не разложены: {e}", file=sys.stderr)
+        return False
+
+
+def _canary_check(key: str, edit_act: str, label: str) -> dict | None:
+    """Сверить пломбы по закрытии акта; итог — событием canary в ленту
+    (act — акт правки: его читает гейт; of — чья канарейка: кресла или
+    ревизии, эпоха у кресла — чтобы гейт отличал жизни акта)."""
+    of = "review" if ".review." in key else "chair"
+    epoch = None
+    if of == "chair":
+        try:
+            epoch = int(key.rsplit(".", 1)[1])
+        except (ValueError, IndexError):
+            epoch = None
+    try:
+        r = canary.check(key, ACT_DIR)
+    except Exception as e:                                  # noqa: BLE001
+        print(f"канарейки {key} не сверены: {e}", file=sys.stderr)
+        return None
+    if r is None:
+        return None
+    who = "кресло" if of == "chair" else "ревизия"
+    if r.get("unreadable"):
+        feed_append("note", f"канарейка прав ({who}) акта {edit_act}: пломбы не "
+                    f"прочитаны — сверки нет ({label})", act=edit_act, key=key)
+        return r
+    if r["clean"]:
+        text = (f"канарейка прав ({who}) акта {edit_act}: цело {r['laid']}/{r['laid']}"
+                + (f" (не разложено: {len(r['skipped'])})" if r.get("skipped") else "")
+                + f" — {label}")
+    else:
+        text = (f"канарейка прав ({who}) акта {edit_act} НАРУШЕНА: "
+                + "; ".join(r["broken"][:4]) + f" — {label}")
+    feed_append("canary", text, act=edit_act, status="clean" if r["clean"] else "broken",
+                broken=r["broken"], laid=r["laid"], key=key, of=of,
+                **({"epoch": epoch} if epoch is not None else {}))
+    return r
+
+
+def _canary_sweep(live_keys: set[str]) -> int:
+    """Приманки актов, у которых не случилось reap (окно закрыто, spawn
+    не удался): сверить и убрать, итог — заметкой; иначе .rt-canary-*
+    копились бы в HOME навсегда (ревизия: все пятеро)."""
+    n = 0
+    try:
+        for f in sorted(ACT_DIR.glob("*.canary.json")):
+            key = f.name[:-len(".canary.json")]
+            if key in live_keys or key in _CANARY_BUSY:
+                continue
+            own = canary.owner_of(key, ACT_DIR) or {}
+            opid = own.get("pid")
+            if (opid and opid != os.getpid() and _is_window_pid(opid)
+                    and own.get("start_tick") == _proc_start(opid)):
+                continue            # живой акт ДРУГОГО окна — его reap сверит
+            # настоящее событие canary (act из ключа), чтобы гейт его видел
+            edit_act = key.split(".", 1)[0]
+            _canary_check(key, edit_act, "без reap (окно закрыто или spawn не удался)")
+            n += 1
+    except Exception as e:                                  # noqa: BLE001
+        print(f"уборка канареек: {e}", file=sys.stderr)
+    return n
+
+
+_CANARY_BUSY: set[str] = set()      # ключи, которые reap сверяет прямо сейчас
+
+
+def _scope_orphans() -> list[str]:
+    """Scope прежних окон (rt-act-*), ещё живые: акты пережили окно —
+    автопрогон по замыслу, остальное — сироты, о которых надо сказать."""
+    try:
+        r = subprocess.run(["systemctl", "--user", "list-units", "--no-legend",
+                            "--plain", "rt-act-*.scope"],
+                           capture_output=True, text=True, timeout=10)
+        mine = f"-{os.getpid()}.scope"
+        return [ln.split()[0] for ln in r.stdout.splitlines()
+                if ln.strip() and not ln.split()[0].endswith(mine)]
+    except (OSError, subprocess.SubprocessError):
+        return []
+
+
+def spawn(cmd: list[str], label: str, voices: list[str],
+          cwd: Path | None = None, meta: dict | None = None,
+          note: str = "", fields: dict | None = None,
+          env_extra: dict | None = None) -> str:
+    """Запустить действие фоном; лента обновится сама — мы следим, когда
+    ход закончился, чтобы погасить индикатор.
+
+    Каждому действию — act_id и события act_status в ленте (просили
+    codex, kimi и grok): «принят» при приёме, «done»/«error» по
+    завершении. Статус пишется в ленту, а не только в RUNNING: рестарт
+    окна не должен терять судьбу действия.
+
+    `meta` кладётся в запись RUNNING (например, имя раунда — чтобы
+    кнопка «Стоп» знала, что именно останавливать, а не выковыривала
+    имя из подписи). `note` и `fields` дописываются в событие
+    `accepted`: режим запуска обязан быть виден В ЛЕНТЕ, иначе через
+    месяц «раунд вёл человек по шагам» и «прокрутил автомат» выглядят
+    одинаково — а это разные вещи по правилу 10 (то, что оркестрация
+    сделала молча, читается как решение стола)."""
+    act_id = uuid.uuid4().hex[:8]
+    ACT_DIR.mkdir(parents=True, exist_ok=True)
+    log_path = ACT_DIR / f"{act_id}.log"
+    feed_append("act_status",
+                f"act {act_id} принят: {label}" + (f"\n{note}" if note else ""),
+                act_id=act_id, status="accepted", **(fields or {}))
+    log = open(log_path, "wb")
+    try:
+        # start_new_session: подпроцесс в СВОЕЙ группе. Окно знает pid
+        # только live.py, а тот запускает CLI голосов — при остановке
+        # окна внуки оставались сиротами и жгли квоту дальше (нашёл
+        # codex как «то, что упустили все», раунд переезд-v1). Своя
+        # группа позволяет снять всё дерево одним killpg при выходе.
+        # env — для ВСЕХ голосов, не только отмеченных галочками:
+        # live.py после первого хода продолжает разговор сам, по всему
+        # ростеру (pick_voices), и голос, снятый галочкой, всё равно может
+        # заговорить. Сужение списка не давало изоляции (переменные и так
+        # именованы по голосу), зато панель показывала одну модель, а голос
+        # шёл другой — поле врало (нашёл ревьюер 2026-08-26).
+        unit = _scope_unit(act_id) if _scope_available() else ""
+        run_cmd = (["systemd-run", "--user", "--scope", "--quiet", "--collect",
+                    f"--unit={unit}", "--", *cmd] if unit else cmd)
+        proc = subprocess.Popen(
+            run_cmd, cwd=str(cwd or CHOIR), stdin=subprocess.DEVNULL,
+            stdout=log, stderr=subprocess.STDOUT,
+            start_new_session=True,
+            # RT_ACT_ID — чтобы заметки live.py («слово → …») несли
+            # идентификатор акта: без него два параллельных действия
+            # склеивались в один глобальный список «кто думает»
+            # (нашли codex и grok).
+            # ОКРУЖЕНИЕ ПЕРЕДАЁТСЯ ЯВНО: os.environ плюс модель и усилие,
+            # заданные через POST /voices. Без этой строки настройка окна
+            # была бы декорацией — значение лежит в памяти сервера, а
+            # подпроцесс берёт умолчания и отвечает не той моделью,
+            # которая показана в панели (правило 8.5: поле, не
+            # обеспеченное механикой, врёт).
+            # env_extra — переключатели ОДНОГО акта (например
+            # CHOIR_BRIEF): в VOICE_CFG им не место, они не про голос и
+            # не должны переживать такт.
+            env={**_spawn_env(VOICES), "RT_ACT_ID": act_id,
+                 **(env_extra or {})})
+    except OSError as e:
+        log.close()
+        feed_append("act_status",
+                    f"act {act_id} error: {label} — запуск не удался: {e}",
+                    **_act_fields({"fields": fields}),
+                    act_id=act_id, status="error", rc=-1)
+        return act_id
+    # pgid берём СЕЙЧАС, пока процесс заведомо жив. Позже os.getpgid(pid)
+    # опасен: после wait() ядро освобождает pid и может отдать его чужому
+    # процессу — сигнал уйдёт постороннему дереву, вплоть до оболочки
+    # Автора (нашёл ревьюер дифа 2026-08-25).
+    with RUN_LOCK:
+        if _STOPPING:
+            # finally окна уже забрал RUNNING себе: акт, зарегистрированный
+            # сейчас, никто бы не завершил — платный веер без итога
+            # (ревизия второго круга: codex, deepseek). Гасим сразу и
+            # пишем итог сами, под тем же замком.
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+            if unit:
+                _scope_kill(unit, "SIGTERM")
+            log.close()
+            feed_append("act_status",
+                        f"act {act_id} прерван: {label} — окно закрывается",
+                        act_id=act_id, status="interrupted", rc=-15,
+                        **_act_fields({"fields": fields}))
+            return act_id
+        # meta первым: свои поля должны ПЕРЕКРЫВАТЬ переданные, иначе
+        # случайный ключ "proc" в meta подменит объект процесса, и
+        # killpg при закрытии окна пойдёт мимо.
+        RUNNING[act_id] = {**(meta or {}),
+                           "label": label, "voices": voices,
+                           "since": time.time(), "pid": proc.pid,
+                           "proc": proc, "pgid": os.getpgid(proc.pid),
+                           "unit": unit,
+                           # Поля события (round, step, auto…) — И В
+                           # ФИНАЛ: карточка раунда вешается на done/error,
+                           # а они шли без round (нашли codex, grok, claude).
+                           "fields": dict(fields or {})}
+
+    def reap():
+        rc = proc.wait()
+        log.close()
+        # Итог пишет ТОТ, КТО ВЫНУЛ запись из RUNNING. Иначе при закрытии
+        # окна main пишет `interrupted`, а проснувшаяся reap — второй,
+        # противоречивый `error(rc=-15)`: в append-only истине у одного
+        # действия два разных финала (нашёл ревьюер дифа).
+        with RUN_LOCK:
+            mine = RUNNING.pop(act_id, None)
+            if mine and mine.get("canary"):
+                _CANARY_BUSY.add(mine["canary"])
+        if mine is None:
+            return
+        try:
+            if mine.get("canary"):
+                # ДО scope_reap (там до 2,5 с сна — уборка успевала первой,
+                # второй круг) и до авторевизии: гейт читает событие canary
+                with RUN_LOCK:
+                    _CANARY_BUSY.add(mine["canary"])
+                try:
+                    _canary_check(mine["canary"], mine.get("edit") or "", label)
+                finally:
+                    with RUN_LOCK:
+                        _CANARY_BUSY.discard(mine["canary"])
+            if mine.get("unit"):
+                _scope_reap(act_id, mine["unit"], label)
+            if rc == 0:
+                feed_append("act_status", f"act {act_id} done: {label}",
+                            act_id=act_id, status="done",
+                            **_act_fields(mine))
+            else:
+                tail = _log_tail(log_path)
+                feed_append(
+                    "act_status",
+                    f"act {act_id} error (rc={rc}): {label}"
+                    + (f"\n{tail}" if tail else ""),
+                    act_id=act_id, status="error", rc=rc,
+                    **_act_fields(mine))
+            # Кресло закрылось (done ИЛИ error) — диф столу сам; веер
+            # ревизии закончился — следующий акт из очереди.
+            if (mine.get("edit") and mine["edit"] != "batch"
+                    and not mine.get("gate")):
+                _auto_review(mine["edit"])
+            elif mine.get("gate") == "review":
+                _drain_review_queue()
+        except Exception as e:              # noqa: BLE001
+            # статус не записался — хотя бы след в терминале, не молча
+            print(f"act {act_id}: статус не записан: {e}", file=sys.stderr)
+    threading.Thread(target=reap, daemon=True).start()
+    return act_id
+
+
+def _line_in_project(line: str) -> bool:
+    """Строка ленты принадлежит проекту окна (см. live.belongs)."""
+    try:
+        e = json.loads(line)
+    except Exception:                                   # noqa: BLE001
+        return False
+    return isinstance(e, dict) and live.belongs(e, live.PROJECT)
+
+
+def _line_id(line: str) -> int:
+    """Числовой id события ленты; кривая строка — -1 (без "id:" в SSE,
+    и при resume не отдаётся: сравнивать её id не с чем).
+
+    Ловим ЛЮБОЕ исключение, а не только JSONDecodeError: строки `null`,
+    `123`, `"abc"`, `[1,2]` — валидный json, но `.get` на них бросает
+    AttributeError, а _stream ловит лишь ошибки сокета. Такое исключение
+    рвало соединение, браузер переподключался с тем же Last-Event-ID,
+    снова доходил до той же строки — и лента в окне умирала навсегда
+    (нашёл ревьюер дифа 2026-08-25; до появления "id:" такую строку
+    молча глотал catch в JS).
+    """
+    try:
+        o = json.loads(line)
+        v = o.get("id") if isinstance(o, dict) else None
+        return v if isinstance(v, int) else -1
+    except Exception:                       # noqa: BLE001 — см. выше
+        return -1
+
+
+# ── модель, усилие и лимиты голосов ──────────────────────────────────
+# Зачем это в окне. Правило 1 требует одинаковых условий у всех, правило
+# 8.5 — чтобы объявленное поле было обеспечено механикой. Голос,
+# отвечающий не той моделью, которой подписан, ломает оба разом: ровно
+# за это Джемини увели с CLI на прямой HTTP (CLI молча откатывал 3.7 на
+# 3.5, и увидеть подмену можно было только в json-статистике). Окно
+# поэтому обязано ПОКАЗЫВАТЬ действующие модель и усилие — и менять их
+# там, где смена реально доедет до CLI.
+#
+# Чего тут нет намеренно: выдуманных чисел. Провайдеры сообщают об
+# остатке очень по-разному, и «неизвестно» — отдельное состояние, а не
+# ноль и не сто процентов. Пустое поле, прочитанное как «всё хорошо», —
+# та же ошибка, что «ПАС читается как согласие».
+
+CODEX_CFG = Path.home() / ".codex" / "config.toml"
+KIMI_CFG = Path.home() / ".kimi-code" / "config.toml"
+DS_BASE = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+DS_KEY = Path.home() / ".deepseek" / "key"
+
+# Списки моделей и лестницы усилий живут в catalog.py: РАЗВЕДКА по
+# самим каналам (API по токену CLI, кэши CLI, --models адаптеров) плюс
+# кэш на диске и кнопка ⟳ в окне (наказ Автора 2026-09-02: «появилась
+# новая модель — предусмотрим кнопочку обновить список»). Прежние
+# списки буквами в VOICE_CTL устаревали в день написания: у Клода не
+# было Fable 5.1. choir импортируется ради УМОЛЧАНИЙ РАУНДОВ —
+# CLAUDE_MODEL/EFFORT и eff() — того, чем choir.py пойдёт без настройки;
+# окно эти значения показывает, а не переписывает.
+try:
+    import choir                                    # noqa: E402
+    CHOIR_OK = True
+except Exception as _choir_err:                     # noqa: BLE001
+    choir = None                                    # type: ignore
+    CHOIR_OK = False
+    print(f"⚠ choir.py не импортировался ({_choir_err}): умолчания раундов "
+          f"показаны по памяти", file=sys.stderr)
+
+
+def _efforts(name: str, model: str | None = None) -> list[str]:
+    """Допустимые ступени — по модели, где канал их различает."""
+    return catalog.efforts(name, model)
+
+
+def _bin_path(name: str) -> Path | None:
+    """Где лежит адаптер. PATH окна может не содержать ~/.local/bin
+    (окно запускают из systemd/nohup), поэтому явный запасной путь."""
+    p = shutil.which(name)
+    if p:
+        return Path(p)
+    guess = Path.home() / ".local" / "bin" / name
+    return guess if guess.exists() else None
+
+
+def _src_default(binname: str, pattern: str) -> str | None:
+    """Достать умолчание ИЗ ИСХОДНИКА адаптера регэкспом.
+
+    Не «мы знаем, что там max», а «в файле написано max»: адаптеры —
+    stdlib-скрипты рядом, и это дешевле копии значения в окне, которая
+    молча протухнет. Не нашли — возвращаем None и говорим «неизвестно»,
+    а не подставляем правдоподобное."""
+    p = _bin_path(binname)
+    if not p:
+        return None
+    try:
+        m = re.search(pattern, p.read_text(encoding="utf-8", errors="replace"),
+                      re.DOTALL)
+    except OSError:
+        return None
+    return m.group(1) if m else None
+
+
+def _toml_get(path: Path, key: str) -> str | None:
+    try:
+        import tomllib
+        with path.open("rb") as f:
+            v = tomllib.load(f).get(key)
+        return v if isinstance(v, str) else None
+    except Exception:                               # noqa: BLE001
+        return None
+
+
+# ЧТО РЕАЛЬНО МОЖНО ПОМЕНЯТЬ НА ЛЕТУ (разведка по коду, 2026-08-25).
+# Переменные окружения во всей цепочке читают ровно два места:
+#   live.py:176–177      CHOIR_CLAUDE_MODEL / CHOIR_CLAUDE_EFFORT
+#   deepseek-http:87,94  DEEPSEEK_MODEL / DEEPSEEK_EFFORT
+# У остальных рычага нет: codex берёт модель и усилие из
+# ~/.codex/config.toml (глобально, на все инструменты машины), у grok
+# усилие захардкожено в live.py (GROK_EFFORT), а модель не задаётся
+# вовсе — отвечает серверный дефолт xAI; у kimi флага усилия нет в
+# самом CLI; у gemini модель — литерал в live.py, а thinkingLevel зашит
+# в gemini-http. Поэтому POST /voices на них отвечает 400 с
+# объяснением, а не «принято»: ручка, которая молча ни на что не
+# влияет, — ровно то враньё поля, которое запрещает правило 8.5.
+# Отказ честнее зелёной галочки ни о чём.
+VOICE_CTL: dict[str, dict] = {
+    "claude": {
+        "rounds_default": "умолчание choir.py: fable/max (наказ arr 24.08)",
+        "model_env": "CHOIR_CLAUDE_MODEL",
+        "effort_env": "CHOIR_CLAUDE_EFFORT",
+        # Список — у catalog (алиасы CLI + api.anthropic.com/v1/models);
+        # имя вне списка принимается по форме model_re.
+        "model_re": r"claude-[\w.-]{1,48}",
+        # ПОСЛЕ закрытия утечки (07aaa42) эта пара правит ТОЛЬКО
+        # комнату: наследный фолбэк в choir.py снят, раундами Клода
+        # правит CHOIR_ROUND_CLAUDE_*. Подпись «и комната, и раунды»
+        # осталась от прошлой редакции и врала ровно про то, ради чего
+        # заводились две области.
+        "applies_to": ["live.py"],
+        "scope": "живая комната (live.py). Раунды — отдельная пара, "
+                 "вкладка 🎼; их умолчание fable/max (наказ arr 24.08)",
+    },
+    "deepseek": {
+        "rounds_default": "умолчание адаптера: deepseek-v4-pro/max",
+        "model_env": "DEEPSEEK_MODEL",
+        "effort_env": "DEEPSEEK_EFFORT",
+        "model_re": r"deepseek-[\w.-]{1,48}",
+        # Раундам deepseek-http теперь получает ЯВНЫЕ флаги (choir.py),
+        # и они сильнее env — комнатная пара в раунды не утекает.
+        "applies_to": ["live.py"],
+        "scope": "живая комната (live.py → env адаптера deepseek-http). "
+                 "Раунды берут свою пару флагами, вкладка 🎼",
+    },
+    # ЗАПЕРТЫХ ГОЛОСОВ БОЛЬШЕ НЕТ (наказ Автора 2026-08-25: «выбор
+    # модели и усилия должен быть для всех вендоров»). live.py читает
+    # CHOIR_<ГОЛОС>_MODEL/_EFFORT и передаёт флагами CLI; исключение —
+    # усилие Кими: у kimi-code такого флага физически нет (в CLI только
+    # -m/--model), и рычаг, за которым ничего не стоит, был бы полем,
+    # которое врёт (правило 8.5).
+    "codex": {
+        "rounds_default": "умолчание: модель из ~/.codex/config.toml, усилие high (ступень ниже потолка)",
+        "model_env": "CHOIR_CODEX_MODEL",
+        "effort_env": "CHOIR_CODEX_EFFORT",
+        "model_re": r"gpt-[\w.-]{1,48}",
+        "applies_to": ["live.py"],
+        "scope": "живая комната (live.py: -m и -c model_reasoning_effort "
+                 "у exec и resume). Без настройки — ~/.codex/config.toml, "
+                 "как раньше; choir.py в раундах зовёт codex сам",
+    },
+    "grok": {
+        "rounds_default": "умолчание: модель — серверный дефолт xAI, усилие medium",
+        "model_env": "CHOIR_GROK_MODEL",
+        "effort_env": "CHOIR_GROK_EFFORT",
+        "model_re": r"grok-[\w.-]{1,48}",
+        "applies_to": ["live.py"],
+        "scope": "живая комната (live.py: --model и --effort). Пустая "
+                 "модель — серверный дефолт xAI, как раньше. xhigh есть "
+                 "только у grok-4.6 (reasoning_efforts в models_cache); "
+                 "grok-4.5 на xhigh падает с 'unknown effort level'",
+    },
+    "kimi": {
+        "rounds_default": "умолчание: модель линии из ~/.kimi-code/config.toml",
+        "model_env": "CHOIR_KIMI_MODEL",
+        "model_re": r"(?:kimi-[\w.-]{1,40}|k\d[\w.-]{0,30})",   # kimi-k3 · k3 · k3-256k (подписка)
+        "applies_to": ["live.py"],
+        "scope": "живая комната; имя БЕЗ провайдера (kimi-k3, не "
+                 "moonshotai/kimi-k3): провайдер выбирает КЛЮЧ линии, и "
+                 "live.py подставляет его сам каждой из двух линий. "
+                 "Усилия у kimi-code нет вовсе — этот рычаг не показан "
+                 "честно, а не по забывчивости",
+    },
+    "gemini": {
+        "rounds_default": "умолчание choir.py: gemini-3.6-flash/high",
+        "model_env": "CHOIR_GEMINI_MODEL",
+        "effort_env": "CHOIR_GEMINI_EFFORT",
+        "model_re": r"gemini-[\w.-]{1,48}",
+        "applies_to": ["live.py"],
+        "scope": "живая комната (live.py → gemini-http "
+                 "--model/--thinking). Усилие — thinkingLevel API",
+    },
+}
+
+# Имя модели уходит в env, оттуда — аргументом CLI. Оболочки в этом
+# пути нет (subprocess со списком), но у Грока команда собирается
+# строкой для `script -qec`, и привычка пропускать в argv что попало
+# однажды встретится с ней. Пускаем только безобидный класс символов.
+MODEL_RE = catalog.MODEL_RE          # одна копия на окно, кресло и каталог
+
+# Настройка ПЕРЕЖИВАЕТ перезапуск окна (наказ Автора 2026-08-27:
+# «последнее установленное — по умолчанию»). Прежний довод «файл был бы
+# второй истиной» остаётся в силе и решается так: в файл попадают ТОЛЬКО
+# значения, прошедшие через POST /voices, а каждый такой POST пишет
+# voice_config в ленту — значит восстановленное значение всегда равно
+# последнему событию ленты, и вопрос «какой моделью сказано» по-прежнему
+# решается её чтением. Файл — кэш последних событий, не второй канон.
+#
+# Структура: {голос: {"room": {model,effort}, "rounds": {model,effort}}}.
+# room — живая комната (live.py), rounds — раунды choir.py («модель
+# дирижёра» в терминах Автора).
+VOICE_CFG: dict[str, dict] = {}
+
+
+def _sync_exec_overrides() -> None:
+    """VOICE_CFG[…]["exec"] → edits.EXEC_OVERRIDES (модель/усилие/пул
+    кресел). Одна истина у окна — VOICE_CFG; edits просто читает свой
+    словарь при сборке argv.
+
+    ПОДМЕНА ССЫЛКИ, не clear+refill: читатели (random_pool, лямбды
+    argv) ходят без замка, и в окно между clear и заполнением /edit
+    видел ПУСТОЙ пул — 409 «все сняты» или argv без модели (нашли grok
+    и deepseek; kimi поставил на этом ОТКАЗ). Присваивание атрибута
+    модуля атомарно под GIL."""
+    fresh: dict = {}
+    with CFG_LOCK:
+        for n, v in VOICE_CFG.items():
+            ex = (v or {}).get("exec")
+            if isinstance(ex, dict) and ex:
+                fresh[n] = dict(ex)
+    edits.EXEC_OVERRIDES = fresh
+    # Умолчания grok, РАЗРЕШЁННЫЕ из кэша его CLI: модель — первая в
+    # кэше, усилие — reasoning_effort ДЕЙСТВУЮЩЕЙ модели (заданной в
+    # окне или той же первой). Кресло шлёт их флагами — панель и argv
+    # совпадают буква в букву (нашли codex, claude, субагент).
+    resolved: dict = {}
+    gm = (fresh.get("grok") or {}).get("model") or catalog.default_model("grok")
+    if gm:
+        resolved["grok"] = {"model": gm,
+                            "effort": catalog.default_effort("grok", gm) or ""}
+    edits.EXEC_RESOLVED = resolved
+CFG_LOCK = threading.Lock()
+# env-переопределение — ДЛЯ ТЕСТОВ: изоляция комнатой (ROUNDTABLE_CHOIR)
+# не покрывала кэш настроек, и тестовый сервер писал в живой файл
+# Автора (поймано живой проверкой вкладки coder, 2026-09-01).
+CFG_FILE = Path(os.environ.get("CHOIR_RT_VOICES")
+                or Path.home() / ".cache" / "choir" / "rt-voices.json")
+# exec — вкладка 🔧 coder: пара модель+усилие КРЕСЛА исполнителя и
+# галочка пула random (наказ Автора 2026-09-01: «те же агенты со своими
+# моделями и усилиями — чтобы можно было выбирать»).
+SCOPES = ("room", "rounds", "exec")
+# Голоса без сессии CLI: память нити им собирает комната из ленты
+# (live.memory_on); галочка «память» в строке голоса, область room.
+MEMORY_VOICES = frozenset(n for n, v in live.VOICES.items() if v.get("no_session"))
+# Голоса с резервной линией по ключам API (галочка «резерв API»): Кими —
+# подписка Kimi Code первой линией, ключи moonshotai* резервом
+# (channels.py, 2026-09-23).
+RESERVE_VOICES = frozenset({"kimi"})
+
+
+def _kimi_plan_declared() -> bool:
+    """Объявлен ли в ~/.kimi-code/config.toml алиас подписки (вход сделан)."""
+    try:
+        from channels import _models_from_config, KIMI_CONFIG, PLAN_MODEL
+        return PLAN_MODEL in (_models_from_config(KIMI_CONFIG) or {})
+    except Exception:                               # noqa: BLE001
+        return False
+
+
+
+def _load_voice_cfg() -> None:
+    """Восстановить настройки, НЕ доверяя файлу больше, чем POST-запросу.
+
+    Файл правят руками — это названо штатным, значит валидация обязана
+    быть той же строгости, что у /voices. Ревизия сняла с первой
+    редакции три шкуры: `str(m)` проверялся, а хранился ОРИГИНАЛ — int
+    из файла ронял Popen ЛЮБОГО акта TypeError'ом (субагент, замером);
+    effort не проверялся вовсе — кавычка в нём была TOML-инъекцией в
+    -c Кодекса (kimi); пара Грока не сверялась (grok). Кривое значение
+    отбрасывается с объяснением в stderr — молча терять то, что человек
+    писал руками, тоже нельзя.
+    """
+    try:
+        raw = json.loads(CFG_FILE.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return
+    except (OSError, ValueError) as e:
+        print(f"⚠ {CFG_FILE.name} не прочитался ({e}) — настройки "
+              f"голосов начинаются с умолчаний", file=sys.stderr)
+        return
+    if not isinstance(raw, dict):
+        print(f"⚠ {CFG_FILE.name}: не словарь — пропущен", file=sys.stderr)
+        return
+
+    def drop(name: str, sc: str, what: str, why: str) -> None:
+        print(f"⚠ {CFG_FILE.name}: {name}/{sc}/{what} отброшен ({why})",
+              file=sys.stderr)
+
+    for name, v in raw.items():
+        if name not in VOICES or not isinstance(v, dict):
+            continue
+        if any(sc in v for sc in SCOPES):
+            ent = {sc: dict(v[sc]) for sc in SCOPES
+                   if isinstance(v.get(sc), dict)}
+        else:
+            # Файл первой редакции был плоским — читаем как комнату.
+            ent = {"room": dict(v)}
+        ctl = VOICE_CTL.get(name) or {}
+        for sc in list(ent):
+            keys = ("model", "effort", "pool") if sc == "exec" \
+                else ("model", "effort", "memory", "reserve") if sc == "room" \
+                else ("model", "effort")
+            pair = {k: ent[sc][k] for k in keys
+                    if k in ent[sc]}          # белый список ключей
+            if "pool" in pair and not isinstance(pair["pool"], bool):
+                drop(name, sc, "pool", "не bool")
+                pair.pop("pool", None)
+            if "memory" in pair and (not isinstance(pair["memory"], bool)
+                                     or name not in MEMORY_VOICES):
+                drop(name, sc, "memory", "не bool или у голоса есть сессия")
+                pair.pop("memory", None)
+            if "reserve" in pair and (not isinstance(pair["reserve"], bool)
+                                      or name not in RESERVE_VOICES):
+                drop(name, sc, "reserve", "не bool или у голоса нет резервной линии")
+                pair.pop("reserve", None)
+            for what, why in _pair_problems(name, sc, pair):
+                drop(name, sc, what, why)
+                pair.pop(what, None)
+            if pair:
+                ent[sc] = pair
+            else:
+                ent.pop(sc, None)
+        if ent:
+            VOICE_CFG[name] = ent
+
+
+def _pair_problems(name: str, sc: str, pair: dict) -> list[tuple[str, str]]:
+    """Что в паре {model, effort} области sc НЕ прошло бы POST /voices —
+    ОДНА проверка на чтение файла и на запрос (ревизия 2026-09-02:
+    файл проверялся мягче запроса, и пара, которую окно не даст
+    выставить, переживала перезапуск и уходила CLI на платном ходу).
+
+    Ступень сверяется с лестницей ДЕЙСТВУЮЩЕЙ модели: заданной в паре,
+    иначе умолчания области. Пока каталог сидит на запасе (разведки не
+    было), лестница неполна — тогда ступень по форме принимается с
+    предупреждением, а не выбрасывается: сохранённый xhigh у grok-4.6
+    иначе исчезал до первого ⟳ (нашли claude, субагент)."""
+    out: list[tuple[str, str]] = []
+    ctl = VOICE_CTL.get(name) or {}
+    m, e = pair.get("model"), pair.get("effort")
+    if sc == "exec":
+        levers = edits.EXEC_LEVERS.get(name, ())
+        if name not in edits.EDIT_VOICES:
+            return [(k, "кресла нет — только ревьюер") for k in
+                    ("model", "effort", "pool") if k in pair]
+        if m is not None and "model" not in levers:
+            out.append(("model", "у кресла нет рычага модели"))
+            m = None
+        if e is not None and "effort" not in levers:
+            out.append(("effort", "у кресла нет рычага усилия"))
+            e = None
+    else:
+        if m is not None and not ctl.get("model_env"):
+            out.append(("model", "модель из окна не меняется"))
+            m = None
+        if e is not None and not ctl.get("effort_env"):
+            out.append(("effort", "усилие из окна не меняется"))
+            e = None
+    if m is not None and (not isinstance(m, str) or not MODEL_RE.match(m)
+                          or not (m in catalog.models(name)
+                                  or (ctl.get("model_re") and re.fullmatch(
+                                      ctl["model_re"], m)))):
+        out.append(("model", "не строка, кривая форма или не той семьи"))
+        m = None
+    if e is not None:
+        if not isinstance(e, str) or not catalog.EFFORT_RE.match(e):
+            out.append(("effort", "не строка или кривая форма"))
+        else:
+            try:
+                dm = (_defaults_for(name, sc) or {}).get("model")
+            except Exception:                       # noqa: BLE001
+                dm = None
+            pm = m or dm
+            allowed = _efforts(name, pm)
+            if e not in allowed:
+                if catalog.entry(name).get("fetched_at") or not allowed:
+                    out.append(("effort", f"не из списка "
+                                          f"{allowed or '(рычага нет)'}"
+                                          + (f" модели {pm}" if pm else "")))
+                else:
+                    print(f"⚠ {name}/{sc}/effort={e}: каталог без разведки "
+                          f"(запасная лестница {allowed}) — принято по "
+                          f"форме, проверьте после ⟳", file=sys.stderr)
+    return out
+
+
+def _save_voice_cfg(name: str, vscope: str) -> None:
+    """Записать В ФАЙЛ одну изменённую пару, слив с тем, что там лежит.
+
+    Не «сериализовать всю память»: два окна на одном HOME так затирали
+    правки друг друга — A ставил gemini, B через минуту codex, и gemini
+    исчезал (замерил субагент двумя окнами). flock + перечитка + правка
+    ровно одного голоса/области; свой снимок памяти файлом не считаем.
+    Не смогли — окно живёт дальше: файл лишь кэш, истина в ленте.
+    """
+    try:
+        CFG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        lock = CFG_FILE.with_name(CFG_FILE.name + ".lock")
+        with lock.open("a+") as lk:
+            try:
+                fcntl.flock(lk.fileno(), fcntl.LOCK_EX)
+            except OSError:
+                pass
+            try:
+                disk = json.loads(CFG_FILE.read_text(encoding="utf-8"))
+                if not isinstance(disk, dict):
+                    disk = {}
+            except (OSError, ValueError):
+                disk = {}
+            ent = disk.setdefault(name, {})
+            # Плоский файл первой редакции — тот, где нет НИ ОДНОЙ
+            # области. Проверка «нет room и rounds» считала плоской и
+            # запись с одним exec — и стирала настройку кресла при
+            # первом же сохранении комнаты (поймано тестом 2026-09-02).
+            if not isinstance(ent, dict) or (
+                    ent and not any(sc in ent for sc in SCOPES)):
+                ent = {}
+                disk[name] = ent
+            pair = (VOICE_CFG.get(name) or {}).get(vscope) or {}
+            if pair:
+                ent[vscope] = dict(pair)
+            else:
+                ent.pop(vscope, None)
+            tmp = CFG_FILE.with_name(CFG_FILE.name + f".{os.getpid()}.tmp")
+            tmp.write_text(json.dumps(disk, ensure_ascii=False, indent=1),
+                           encoding="utf-8")
+            tmp.replace(CFG_FILE)
+    except OSError as e:
+        print(f"настройки голосов не сохранились: {e}", file=sys.stderr)
+
+
+def _spawn_env(voices: list[str]) -> dict:
+    """os.environ плюс переопределения окна для этих голосов.
+    (См. также CHOIR_NO_DING ниже: звонит окно, а не подпроцесс.)
+
+    Без этого POST /voices был бы декорацией: значение лежит в памяти
+    сервера, а подпроцесс запускается с чистым окружением родителя и
+    берёт умолчания. live.py читает CHOIR_CLAUDE_* на импорте, а он
+    импортируется заново на каждый ход — значит переменная доезжает.
+    Для deepseek переменную читает уже внук (адаптер), и это работает
+    ровно потому, что live.py зовёт subprocess.run без env= и наследует
+    окружение целиком."""
+    env = dict(os.environ)
+    # PYTHONUNBUFFERED: stdout ребёнка идёт в файл акта, а файловый stdout
+    # у Python блочный — без этого лог акта пуст до самого конца хода
+    # (замер grok, раунд вкладки-вывода-v1: 0 байт до закрытия fd), и
+    # вкладки «дирижёр»/«исполнитель» показывали бы тишину. RT_ACT_DIR —
+    # чтобы комната и дирижёр знали, куда класть стенограмму акта
+    # (chamber/transcript.py).
+    env["PYTHONUNBUFFERED"] = "1"
+    env["RT_ACT_DIR"] = str(ACT_DIR)
+    # Метка проекта для событий детей (live.py при пустом поле «проект»,
+    # executor_run, merge_gate): без неё их события шли без поля и
+    # пропадали из ленты окна проекта (ревьюер дифа 2026-09-10).
+    env["CHOIR_EVENT_PROJECT"] = PROJECT or ""
+    # Стенограмма акта (<акт>.raw.log) пишется комнатой и дирижёром сами
+    # по RT_ACT_DIR/RT_ACT_ID: слепой ход они держат в памяти до закрытия
+    # (правило 8.5), выключатель RT_RAW снят 2026-09-14 (см. transcript.py).
+    # Такт, запущенный окном, НЕ звонит paplay сам: сокет звука он
+    # наследует (окружение передаётся целиком), и без этой строки
+    # каждый такт звонил дважды — paplay изнутри плюс WebAudio окна
+    # по act_status (нашёл субагент, ревьюя звонок).
+    env["CHOIR_NO_DING"] = "1"
+    with CFG_LOCK:
+        for name in voices:
+            cfg = VOICE_CFG.get(name) or {}
+            ctl = VOICE_CTL.get(name) or {}
+            room = cfg.get("room") or {}
+            if name in MEMORY_VOICES:
+                env[f"CHOIR_{name.upper()}_MEMORY"] = "0" if room.get("memory") is False else "1"
+            if name in RESERVE_VOICES:
+                # резерв по ключам API у Кими: одна галочка на комнату,
+                # раунды и кресло — читает channels.py при импорте
+                env[f"CHOIR_{name.upper()}_RESERVE"] = "0" if room.get("reserve") is False else "1"
+            if room.get("model") and ctl.get("model_env"):
+                env[ctl["model_env"]] = room["model"]
+            if room.get("effort") and ctl.get("effort_env"):
+                env[ctl["effort_env"]] = room["effort"]
+            # Раунды — своя семья переменных, читает её choir.py
+            # («модель дирижёра», наказ 2026-08-27). У deepseek комнатой
+            # правит env самого адаптера, раундами — эти же ROUND-флаги.
+            rounds = cfg.get("rounds") or {}
+            up = name.upper()
+            if rounds.get("model"):
+                env[f"CHOIR_ROUND_{up}_MODEL"] = rounds["model"]
+            if rounds.get("effort"):
+                env[f"CHOIR_ROUND_{up}_EFFORT"] = rounds["effort"]
+    return env
+
+
+def _arm_edit_watch(act: str, epoch: int, wt: Path, voice: str) -> None:
+    """Взвести наблюдателя кресла. Вердикт — В ОТДЕЛЬНОЙ НИТИ.
+
+    Контракт leases.watch велит колбэку быть коротким: чтение ленты
+    целиком и пост под её flock — не короткое (нашёл kimi). Колбэк
+    только передаёт эстафету нити; гонки эпох тут нет — вердикт ищет
+    close СВОЕЙ эпохи, а новое кресло того же акта получит новую.
+
+    Грация 180 с, не 30: executor до аренды делает несколько git-проб
+    с таймаутом 60 с каждая, и на медленном диске наблюдатель успевал
+    крикнуть «кресло не занято» ЖИВОМУ исполнителю (нашли grok и
+    gemini). Если no_start всё же случился, а замок уже держится —
+    verdict_on_drop смолчит, и мы перевзводим наблюдателя.
+    """
+    def _verdict(why):
+        ev = edits.verdict_on_drop(act, epoch, wt, voice, why)
+        if why and ev is None and leases.is_held(act):
+            # Рукопожатие всё же состоялось — сторожим дальше. Ретраи
+            # обязательны: старый наблюдатель снимается из _WATCHED в
+            # finally СВОЕЙ нити, и мгновенный перевзвод мог поймать
+            # ValueError и молча оставить живой акт без сторожа
+            # (нашёл codex).
+            for _ in range(20):
+                try:
+                    _arm_edit_watch(act, epoch, wt, voice)
+                    return
+                except ValueError:
+                    time.sleep(0.1)
+            print(f"перевзвод наблюдателя {act} не удался: слот занят",
+                  file=sys.stderr)
+    leases.watch(act,
+                 lambda why: threading.Thread(
+                     target=_verdict, args=(why,), daemon=True,
+                     name=f"edit-verdict-{act}").start(),
+                 grace=180)
+
+
+def _argv_probe(name: str) -> list[str]:
+    """Настоящая командная строка голоса — из самих лямбд live.VOICES.
+
+    Не вторая таблица моделей в окне: копия однажды разойдётся с живым
+    кодом молча, и панель начнёт врать (та же причина, по которой
+    VOICES берутся у live.py, а не переписываются). Здесь argv собирает
+    ровно тот код, который потом и запустит голос, а мы лишь читаем из
+    него --model и --effort. У Грока команда — `script -qec "<строка>"
+    /dev/null`: строку разбираем shlex'ом, иначе флаги внутри неё не
+    видны вовсе."""
+    v = live.VOICES.get(name) or {}
+    start = v.get("start")
+    if not callable(start):
+        return []
+    args = ("PROBE", Path("/dev/null"), Path("/dev/null"), "probe", None)
+    try:
+        argv = [str(t) for t in start(*args)]
+    except TypeError:
+        # У kimi лямбда с шестым параметром (канал): зонд на пять
+        # аргументов молча давал пустой argv (нашёл claude).
+        try:
+            argv = [str(t) for t in start(*args, None)]
+        except Exception:                           # noqa: BLE001
+            return []
+    except Exception:                               # noqa: BLE001
+        return []
+    out: list[str] = []
+    for tok in argv:
+        if " -" in tok:                 # склеенная командная строка
+            try:
+                out.extend(shlex.split(tok))
+                continue
+            except ValueError:
+                pass
+        out.append(tok)
+    return out
+
+
+def _flag(argv: list[str], *flags: str) -> str | None:
+    for i, t in enumerate(argv):
+        for fl in flags:
+            if t == fl and i + 1 < len(argv):
+                return argv[i + 1]
+            if t.startswith(fl + "="):
+                return t.split("=", 1)[1]
+    return None
+
+
+def _codex_cfg_pair() -> tuple[str | None, str | None]:
+    return (_toml_get(CODEX_CFG, "model"),
+            _toml_get(CODEX_CFG, "model_reasoning_effort"))
+
+
+_CHOIR_SRC: str | None = None
+
+
+def _choir_literal(voice: str, kind: str) -> str | None:
+    """Умолчание раунда, записанное литералом в лямбде choir.py —
+    `_renv("deepseek", "MODEL", "deepseek-v4-pro")`. Читается из
+    ИСХОДНИКА, а не переписывается: копия в окне протухла бы молча
+    (тот же довод, по которому VOICES берутся у live.py)."""
+    global _CHOIR_SRC
+    if _CHOIR_SRC is None:
+        try:
+            _CHOIR_SRC = (CHOIR / "choir.py").read_text(encoding="utf-8")
+        except OSError:
+            _CHOIR_SRC = ""
+    m = re.search(r'_renv\("%s",\s*"%s",\s*"([^"]+)"\)' % (voice, kind),
+                  _CHOIR_SRC)
+    return m.group(1) if m else None
+
+
+# ЯВНЫЕ УМОЛЧАНИЯ ПО ВКЛАДКАМ (наказ Автора 2026-09-02: «умолчание —
+# не понятно какая модель и какое усилие — давай прописывать явно»).
+# Три функции ниже отвечают на один вопрос — ЧЕМ голос пойдёт, если в
+# окне ничего не трогать, — для трёх разных запускающих кодов: live.py
+# (комната), choir.py (раунды), edits.py (кресло). Каждое значение
+# подписано хранителем; «неизвестно» остаётся только там, где его и
+# правда никто не хранит.
+def _room_defaults(name: str) -> dict:
+    argv = _argv_probe(name)
+    model = _flag(argv, "--model", "-m")
+    effort = _flag(argv, "--effort", "--reasoning-effort", "--thinking")
+    msrc = esrc = "флаг в командной строке live.py"
+    if name == "codex":
+        cm, ce = _codex_cfg_pair()
+        if not model:
+            model, msrc = cm, f"{CODEX_CFG} (live.py флага не шлёт)"
+        if not effort:
+            effort, esrc = ce, f"{CODEX_CFG} (live.py флага не шлёт)"
+    elif name == "kimi":
+        # -m в argv несёт модель ЛИНИИ = default_model конфига (с
+        # провайдером); окно показывает имя без провайдера.
+        model = (model or catalog.default_model("kimi")
+                 or _toml_get(KIMI_CFG, "default_model")
+                 or "").split("/")[-1] or None
+        msrc = (f"флаг -m live.py = default_model из {KIMI_CFG} (модель "
+                f"линии)" if model else f"{KIMI_CFG} не прочитался")
+        effort, esrc = None, "у kimi CLI нет флага усилия"
+    elif name == "deepseek":
+        if not model:
+            model = _src_default("deepseek-http",
+                                 r'DEFAULT_MODEL\s*=\s*"([^"]+)"')
+            msrc = "deepseek-http: DEFAULT_MODEL адаптера"
+        if not effort:
+            effort = _src_default("deepseek-http",
+                                  r'"DEEPSEEK_EFFORT",\s*"(\w+)"')
+            esrc = "deepseek-http: умолчание --effort адаптера"
+    elif name == "grok":
+        if not model:
+            model = catalog.default_model("grok")
+            msrc = ("серверный дефолт xAI — первая модель кэша CLI "
+                    "(сверено по сессии стола 2026-09-02)")
+    elif name == "gemini":
+        esrc = "live.py → gemini-http --thinking"
+        if model and "," in model:
+            # --model несёт КАСКАД «основная,запасные» (gemini-http
+            # перебирает их при лежащем шлюзе): значение — основная,
+            # запасные названы в подписи, а не склеены в имя.
+            first, _, rest = model.partition(",")
+            model = first.strip()
+            msrc += f"; запасные при 5xx: {rest.strip()}"
+    # Флага в argv нет и хранитель не назван — говорим это, а не «флаг
+    # в командной строке» над пустым значением (нашёл kimi).
+    if model is None and msrc.startswith("флаг в командной строке"):
+        msrc = "флага нет — умолчание хранит сам CLI"
+    if effort is None and esrc.startswith("флаг в командной строке"):
+        esrc = "флага нет — умолчание хранит сам CLI"
+    return {"model": model, "effort": effort,
+            "src": f"модель: {msrc}; усилие: {esrc}",
+            "can_model": bool((VOICE_CTL.get(name) or {}).get("model_env")),
+            "can_effort": bool((VOICE_CTL.get(name) or {}).get("effort_env")),
+            "why_effort": ("" if (VOICE_CTL.get(name) or {}).get("effort_env")
+                           else f"у {name} CLI нет флага усилия — рычага "
+                                "нет ни в одной вкладке")}
+
+
+def _rounds_defaults(name: str) -> dict:
+    ctl = VOICE_CTL.get(name) or {}
+    base = {"can_model": bool(ctl.get("model_env")),
+            "can_effort": bool(ctl.get("effort_env")),
+            "why_effort": ("" if ctl.get("effort_env")
+                           else f"у {name} CLI нет флага усилия")}
+    if not CHOIR_OK:
+        by_mem = {"claude": ("fable", "max"), "codex": (None, "high"),
+                  "grok": (None, "medium"), "kimi": (None, None),
+                  "deepseek": ("deepseek-v4-pro", "max"),
+                  "gemini": ("gemini-3.6-flash", "high")}
+        m, e = by_mem.get(name, (None, None))
+        return dict(base, model=m, effort=e,
+                    src="choir.py не импортировался — по памяти окна")
+    rv = choir._renv
+    if name == "claude":
+        m, e = choir.CLAUDE_MODEL, choir.CLAUDE_EFFORT
+        src = "choir.py: CLAUDE_MODEL/CLAUDE_EFFORT (наказ arr 24.08: fable/max)"
+    elif name == "codex":
+        cm, ce = _codex_cfg_pair()
+        m = rv("codex", "MODEL") or cm
+        e = rv("codex", "EFFORT") or choir.eff("codex")
+        src = (f"модель: {CODEX_CFG} (choir.py -m не шлёт); усилие: "
+               "choir.eff() — ступень ниже потолка лестницы choir.py")
+    elif name == "grok":
+        m = rv("grok", "MODEL") or catalog.default_model("grok")
+        e = rv("grok", "EFFORT") or choir.eff("grok")
+        src = ("модель: серверный дефолт xAI (первая в кэше CLI); усилие: "
+               "choir.eff() — ступень ниже потолка")
+    elif name == "kimi":
+        m = (rv("kimi", "MODEL") or catalog.default_model("kimi")
+             or _toml_get(KIMI_CFG, "default_model") or "").split("/")[-1] or None
+        e = None
+        src = f"default_model из {KIMI_CFG} (модель линии); усилия у CLI нет"
+    elif name in ("deepseek", "gemini"):
+        # Литерал читается из ИСХОДНИКА choir.py; не нашёлся — так и
+        # подписываем, а не выдаём копию за прочитанное (нашёл kimi).
+        mem = {"deepseek": ("deepseek-v4-pro", "max"),
+               "gemini": ("gemini-3.6-flash", "high")}[name]
+        lm, le = _choir_literal(name, "MODEL"), _choir_literal(name, "EFFORT")
+        m = rv(name, "MODEL", lm or mem[0])
+        e = rv(name, "EFFORT", le or mem[1])
+        src = (f"литералы choir.py: _renv(\"{name}\", …)" if lm and le
+               else "литерал в choir.py НЕ НАЙДЕН — показано по памяти окна")
+    else:
+        m, e, src = None, None, "голос choir.py неизвестен"
+    return dict(base, model=m, effort=e, src=src)
+
+
+def _exec_defaults(name: str) -> dict | None:
+    if name not in edits.EDIT_VOICES:
+        return None
+    levers = edits.EXEC_LEVERS.get(name, ())
+    model = edits.exec_default(name, "model") or None
+    effort = edits.exec_default(name, "effort") or None
+    if name == "codex":
+        cm, ce = _codex_cfg_pair()
+        model, effort = model or cm, effort or ce
+    elif name == "grok":
+        model = model or catalog.default_model("grok")
+        effort = effort or catalog.default_effort("grok", model)
+    elif name == "kimi":
+        model = (model or "").split("/")[-1] or None
+    why_e = ""
+    if "effort" not in levers:
+        why_e = ("у kimi CLI нет флага усилия" if name == "kimi"
+                 else "у dsh нет ручки усилия (в комнате и раундах она "
+                      "есть — у адаптера deepseek-http)")
+    return {"model": model, "effort": effort,
+            "src": edits.EXEC_DEFAULT_SRC.get(name, "edits.EXEC_DEFAULTS"),
+            "can_model": "model" in levers, "can_effort": "effort" in levers,
+            "why_effort": why_e}
+
+
+def _defaults_for(name: str, scope: str) -> dict | None:
+    if scope == "room":
+        return _room_defaults(name)
+    if scope == "rounds":
+        return _rounds_defaults(name)
+    return _exec_defaults(name)
+
+
+def voice_report(name: str, limit: dict) -> dict:
+    """Карточка голоса: чем он отвечает сейчас и что о его лимите
+    известно. Источник каждого значения называется рядом — «opus»
+    без подписи «откуда» через месяц неотличимо от догадки.
+
+    tabs — ТРИ ВКЛАДКИ с одинаковым наполнением (наказ Автора
+    2026-09-02): у каждой свои действующее значение, заданное в окне,
+    явное умолчание с хранителем, и рычаги — где за ними механика.
+    exec=None — кресла нет (gemini файлов не видит)."""
+    ctl = VOICE_CTL.get(name) or {}
+    with CFG_LOCK:
+        cfg = {sc: dict((VOICE_CFG.get(name) or {}).get(sc) or {})
+               for sc in SCOPES}
+    tabs: dict[str, dict | None] = {}
+    for sc in SCOPES:
+        try:
+            d = _defaults_for(name, sc)
+        except Exception as e:                  # noqa: BLE001
+            # Одна кривая карточка не роняет /voices целиком: окно
+            # покажет причину в ячейке, остальные голоса живут.
+            print(f"/voices {name}/{sc}: {e}", file=sys.stderr)
+            tabs[sc] = {"error": f"карточка не собралась: "
+                                 f"{type(e).__name__}: {e}"[:200]}
+            continue
+        if d is None:
+            tabs[sc] = None
+            continue
+        set_ = cfg[sc]
+        model = set_.get("model") or d["model"]
+        if sc == "exec" and name == "grok" and not set_.get("effort"):
+            # Усилие кэша — у ДЕЙСТВУЮЩЕЙ модели, не у умолчания: у
+            # заданной в окне grok-4.5 своё reasoning_effort (субагент).
+            d = dict(d, effort=catalog.default_effort("grok", model)
+                     or d["effort"])
+        effort = set_.get("effort") or d["effort"]
+        ladder = _efforts(name, model)
+        t = {"model": model, "effort": effort,
+             "set_model": set_.get("model"), "set_effort": set_.get("effort"),
+             "default_model": d["model"], "default_effort": d["effort"],
+             "default_src": d["src"],
+             "can_model": bool(d["can_model"]),
+             # can_effort при пустой лестнице ручкой не является: POST
+             # сверит значение со списком и отклонит любое.
+             "can_effort": bool(d["can_effort"]) and bool(ladder),
+             "why_model": "" if d["can_model"] else "из окна не меняется",
+             "why_effort": (d.get("why_effort") or ""
+                            if not (d["can_effort"] and not ladder)
+                            else "ступени не объявлены — рычаг есть, "
+                                 "списка нет"),
+             "efforts": ladder}
+        if sc == "room" and name in MEMORY_VOICES:
+            t.update(memory=set_.get("memory", True) is not False, can_memory=True,
+                     memory_cap=live.MEMORY_CAP)
+        if sc in ("room", "rounds") and name in RESERVE_VOICES:
+            # галочка «резерв API» хранится в паре room, показывается на
+            # обеих вкладках: резерв один на комнату и раунды
+            rpair = (cfg.get("room") or {}) if isinstance(cfg, dict) else {}
+            t.update(reserve=rpair.get("reserve", True) is not False, can_reserve=True,
+                     plan_line=bool(_kimi_plan_declared()))
+        if sc == "exec":
+            t.update(pool=set_.get("pool", name not in edits.EDIT_COSTLY),
+                     costly=name in edits.EDIT_COSTLY,
+                     seat={"deepseek": "dsh"}.get(name, name))
+        tabs[sc] = t
+    room, rd, ex = tabs["room"], tabs["rounds"], tabs["exec"]
+    for k in ("room", "rounds"):
+        if "error" in (tabs[k] or {}):
+            tabs[k] = None
+    room = tabs["room"] or {"model": None, "effort": None, "set_model": None,
+                            "set_effort": None, "default_src": "карточка не "
+                            "собралась"}
+    rd = tabs["rounds"] or dict(room)
+    if ex is not None and "error" in ex:
+        ex = None
+    ent = catalog.entry(name)
+    card = {
+        "name": name,
+        # Плоские поля — КОМНАТА (старые читатели карточки); None, а не
+        # «неизвестно» строкой: пустое значение обязано быть отличимо
+        # от значения по имени «неизвестно».
+        "model": room["model"],
+        "model_source": (f"задано в окне: {ctl.get('model_env')}="
+                         f"{room['set_model']}" if room["set_model"]
+                         else room["default_src"]),
+        "effort": room["effort"],
+        "effort_source": (f"задано в окне: {ctl.get('effort_env')}="
+                          f"{room['set_effort']}" if room["set_effort"]
+                          else room["default_src"]),
+        "efforts": _efforts(name),
+        "efforts_by_model": ent.get("efforts_by_model") or None,
+        "efforts_source": catalog.source(name),
+        "models": catalog.models(name),
+        "models_source": catalog.source(name),
+        "models_fetched_at": ent.get("fetched_at"),
+        "models_error": ent.get("error"),
+        "unaliased": ent.get("unaliased") or [],
+        "can_set_model": bool(ctl.get("model_env")),
+        "can_set_effort": bool(ctl.get("effort_env")),
+        "set_in_window": (cfg if any(cfg.get(sc) for sc in SCOPES)
+                          else None),
+        "rounds": {"model": rd["set_model"], "effort": rd["set_effort"],
+                   "source": ("задано в окне (CHOIR_ROUND_*)"
+                              if (rd["set_model"] or rd["set_effort"])
+                              else rd["default_src"])},
+        "exec": ({"model": ex["set_model"], "effort": ex["set_effort"],
+                  "pool": ex["pool"], "costly": ex["costly"],
+                  "can_model": ex["can_model"],
+                  "can_effort": ex["can_effort"], "seat": ex["seat"]}
+                 if ex else None),
+        "tabs": tabs,
+        "applies_to": ctl.get("applies_to", []),
+        "scope": ctl.get("scope", ""),
+        "locked_why": ctl.get("locked", ""),
+        "limit": limit,
+    }
+    # Шкал у голоса может быть НЕСКОЛЬКО (у claude их три). Список
+    # кладём отдельным полем и ТОЛЬКО когда он непуст: пустой массив
+    # читается как «сервер шкал не прислал», а это другое утверждение,
+    # чем «этот канал остатка не сообщает» — и второе живёт в `limit`.
+    gauges = limit.get("limits") if isinstance(limit, dict) else None
+    if isinstance(gauges, list) and gauges:
+        card["limits"] = gauges
+    return card
+
+# ── лимиты: только то, что провайдер сказал сам ──────────────────────
+# Четыре состояния, и они РАЗНЫЕ:
+#   number  — есть живое число (сколько израсходовано / сколько
+#             осталось) и время замера;
+#   refusal — числа нет, но есть последний отказ по квоте: когда и
+#             какими словами. Иногда провайдер приложил цифры прямо к
+#             отказу (kimi: current/limit) — тогда они здесь же, но со
+#             stale: true, потому что это снимок момента отказа, а не
+#             остаток сейчас;
+#   none    — провайдер не сообщает ничего;
+#   unknown — замер ещё не сделан этим окном (не путать с none).
+# Оговорка, без которой индикатор врёт: ОТСУТСТВИЕ ЗАПИСИ ОБ ОТКАЗЕ НЕ
+# ЗНАЧИТ, ЧТО КВОТА ЦЕЛА. Пустое поле, прочитанное как зелёный свет, —
+# та же ошибка, что «ПАС читается как согласие», поэтому в каждом none
+# стоит эта оговорка текстом.
+#
+# ЧТО ИЗМЕНИЛОСЬ 2026-08-25 (разведка по всем шести каналам, проверено
+# живыми запросами, а не предположено). Раньше окно читало только диск,
+# и половина стола висела в «none». Оказалось, четыре провайдера отдают
+# состояние БЕСПЛАТНЫМ GET'ом, без единого модельного вызова:
+#   claude    api.anthropic.com/api/oauth/usage       — ТРИ окна сразу
+#   codex     chatgpt.com/backend-api/codex/usage     — used_percent + сброс
+#   kimi      api.moonshot.ai/v1/users/me{,/balance}  — баланс + потолки
+#   deepseek  api.deepseek.com/user/balance           — баланс (было и раньше)
+# А два не отдают, и это тоже ИЗМЕРЕНО:
+#   grok      шкала существует, но живёт за веб-сессией grok.com: POST
+#             /rest/rate-limits токену CLI отвечает 403 «Action cannot be
+#             performed by OAuth2 token users [WKE=unauthorized:
+#             oauth2-auth-forbidden]» — отказ адресный и намеренный.
+#             Показываем тариф и конец оплаченного периода; шкалу — нет.
+#   gemini    /v1beta/quota и /v1beta/usage → 404, заголовков
+#             x-ratelimit-* на успешном ответе нет вовсе. Известно
+#             только, сколько ключей в ротации и какой активен.
+#
+# ШКАЛ У ГОЛОСА МОЖЕТ БЫТЬ НЕСКОЛЬКО, И СЛИВАТЬ ИХ НЕЛЬЗЯ. У Клода их
+# три одновременно: 5-часовое окно, недельное по всем моделям и
+# отдельное недельное по модели Fable (замер 2026-08-25: 92 %, 84 % и
+# 100 %). Среднее между ними не значит ничего, «худшее из» скрывает,
+# какое именно окно кончилось, а решение «звать ли голос» принимают по
+# конкретному окну. Поэтому наружу идёт СПИСОК шкал, у каждой своё имя,
+# своё окно и своё время сброса.
+#
+# ЧЕГО ТУТ НЕТ НАМЕРЕННО: выдуманных чисел. Ни одна цифра ниже не
+# вычисляется окном — все приходят от провайдера или лежат на диске, и
+# у каждой рядом стоит source.
+#
+# Источник отказов — room.jsonl, где choir.py пишет status="quota" с
+# цифрами провайдера. live.jsonl намеренно НЕ читается: там отказ по
+# квоте записан как kind="error", detail="код 1" — механики различения
+# в live.py нет, и индикатор, гадающий по тексту, был бы полем,
+# необеспеченным механикой (правило 8.5).
+# 180 с, а не 30: эндпоинт расхода Клода сам ограничивает частоту
+# опроса и на 30-секундном шаге отвечает 429 — то есть частый замер не
+# уточнял шкалу, а ГАСИЛ её (нашёл grok, я поймал 429 живьём). Диску
+# и логам чаще тоже незачем.
+LIMITS_TTL = 180.0
+FIRST_WAIT = 1.5            # сколько ждёт САМЫЙ ПЕРВЫЙ запрос, потом ноль
+NET_TIMEOUT = 6.0           # короткий: шкала не стоит того, чтобы ждать
+ROOM = JOURNAL / "room.jsonl"
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+# Где лежат ключи и токены. ЧИТАЮТСЯ НА КАЖДОМ ЗАМЕРЕ, а не один раз при
+# старте: токен Клода живёт ~8 часов и обновляется самим Claude Code,
+# кэш в памяти окна протух бы молча и показал бы «токен не принят» при
+# живом токене.
+CLAUDE_CREDS = Path.home() / ".claude" / ".credentials.json"
+CLAUDE_USAGE = "https://api.anthropic.com/api/oauth/usage"
+CODEX_AUTH = Path.home() / ".codex" / "auth.json"
+CODEX_USAGE = "https://chatgpt.com/backend-api/codex/usage"
+KIMI_API = "https://api.moonshot.ai/v1"
+GROK_AUTH = Path.home() / ".grok" / "auth.json"
+GROK_SETTINGS = "https://cli-chat-proxy.grok.com/v1/settings"
+GROK_SUBS = "https://grok.com/rest/subscriptions"
+GEMINI_KEYS = Path.home() / ".gemini" / "keys.txt"
+GEMINI_ROT = Path.home() / ".gemini" / ".rot_last_http"
+
+_LIM = {"ts": 0.0, "data": {}, "busy": False, "error": False,
+        "retry_at": 0.0, "waited": False}
+_LIM_LOCK = threading.Lock()
+_LIM_READY = threading.Event()  # первый сбор завершён (в том числе ошибкой); не сбрасываем
+
+
+def _iso(unix: float) -> str:
+    return datetime.fromtimestamp(unix, timezone.utc).isoformat(
+        timespec="seconds")
+
+
+_SECRET_RE = re.compile(
+    r"(Bearer\s+\S+|sk-[A-Za-z0-9_\-]{8,}|ak-[A-Za-z0-9_\-]{8,}|"
+    r"xai-[A-Za-z0-9_\-]{8,}|AIza[A-Za-z0-9_\-]{8,})")
+
+
+def _no_secrets(text: str) -> str:
+    """Вырезать похожее на ключ из ЧУЖОГО текста, прежде чем показывать.
+
+    Тело ответа эндпоинта уходит в `note` карточки, то есть в /voices и
+    в подсказку панели. Ревьюер дифа поднял локальный эндпоинт,
+    отражающий заголовок запроса, и получил в карточке
+    `HTTP 401: {"a": "Bearer sk-FAKE-SECRET-…"}`. Достижимо не только в
+    лаборатории: адрес DeepSeek берётся из DEEPSEEK_BASE_URL.
+    """
+    return _SECRET_RE.sub("‹вырезано›", text or "")
+
+
+class _SameHostRedirect(urllib.request.HTTPRedirectHandler):
+    """Редирект только в пределах того же хоста.
+
+    В заголовках здесь ездят oauth-токен Клода и ключи Кими; urllib по
+    умолчанию идёт за 301/302 и УНОСИТ Authorization на новый хост.
+    Тогда сохранность секретов Автора зависела бы от честности чужого
+    эндпоинта — а она не наша (нашёл kimi).
+    """
+
+    def redirect_request(self, req, fp, code, msg, hdrs, newurl):
+        from urllib.parse import urlparse
+        if urlparse(newurl).netloc != urlparse(req.full_url).netloc:
+            raise urllib.error.HTTPError(
+                req.full_url, code,
+                f"редирект на другой хост ({urlparse(newurl).netloc}) — "
+                f"не иду, там заголовок с секретом", hdrs, fp)
+        return super().redirect_request(req, fp, code, msg, hdrs, newurl)
+
+
+_SAFE_OPENER = urllib.request.build_opener(_SameHostRedirect)
+
+
+def _get_json(url: str, headers: dict, timeout: float = NET_TIMEOUT
+              ) -> tuple[int, object, str]:
+    """GET → (код, тело, короткая причина отказа).
+
+    Ошибку возвращаем, а не бросаем: «эндпоинт ответил 401» и «сети нет»
+    — разные факты, и оба обязаны доехать до карточки. Молчаливый
+    except превратил бы их в одинаковое «none», то есть в поле, которое
+    врёт (правило 8.5).
+    """
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with _SAFE_OPENER.open(req, timeout=timeout) as r:
+            return r.status, json.load(r), ""
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read()[:200].decode("utf-8", errors="replace")
+        except Exception:                           # noqa: BLE001
+            body = ""
+        return e.code, None, f"HTTP {e.code}: {_no_secrets(body)[:160]}"
+    except Exception as e:                          # noqa: BLE001
+        return 0, None, f"{type(e).__name__}: {e}"
+
+
+def _tail(path: Path, nbytes: int) -> str:
+    """Хвост файла. Именно хвост: логи CLI растут десятками мегабайт, а
+    индикатор не имеет права стоить секунду чтения на каждый опрос."""
+    try:
+        with path.open("rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - nbytes))
+            return f.read().decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def _newest(paths, n: int) -> list[Path]:
+    got = []
+    for p in paths:
+        try:
+            got.append((p.stat().st_mtime, p))
+        except OSError:
+            continue
+    got.sort(reverse=True)
+    return [p for _, p in got[:n]]
+
+
+NO_DATA_CAVEAT = ("отсутствие записи об отказе НЕ значит, что квота "
+                  "цела: у части голосов отказ так просто не выглядит")
+
+
+def _no_data(why: str) -> dict:
+    return {"kind": "none", "note": why, "caveat": NO_DATA_CAVEAT}
+
+
+def _gauge(name: str, **kw) -> dict:
+    """Одна шкала. `name` — короткая подпись (страница режет до 20
+    символов), дальше числа провайдера как есть.
+
+    Обязательное поле — `source`: «86 %» без подписи «откуда» через
+    месяц неотличимо от догадки. Ключи оставлены плоскими (known /
+    meaning / total / unit / window_minutes / resets_at) — ровно те,
+    что уже читает страница; переименование ради красоты стоило бы
+    молчаливой потери показаний.
+    """
+    g = {"name": name, "kind": "number"}
+    g.update(kw)
+    return g
+
+
+def _pack(gauges: list[dict], **extra) -> dict:
+    """Карточка лимита голоса из списка шкал.
+
+    Наружу уходит И список (`limits`), И плоская главная шкала — второе
+    для читателя, знающего только старую одиночную форму. Список
+    пустым в ответ не кладём вовсе: пустой массив читается как «шкал
+    нет, потому что сервер их не прислал», а это другое утверждение,
+    чем «этот канал остатка не сообщает».
+    """
+    gauges = [g for g in gauges if g]
+    if not gauges:
+        return {"kind": "none", "caveat": NO_DATA_CAVEAT, **extra}
+    head = gauges[0]
+    out = {k: v for k, v in head.items() if k != "name"}
+    out["limits"] = gauges
+    out.update(extra)
+    # note главной шкалы не должен затирать общее пояснение канала
+    if "note" in extra:
+        out["note"] = extra["note"]
+    return out
+
+
+def _room_quota() -> dict[str, dict]:
+    """Последний отказ по квоте на голос — из room.jsonl. Файл в
+    единицах мегабайт и читается целиком: он и есть журнал отказов,
+    а хвост потерял бы старые отказы тех голосов, кто давно не падал."""
+    out: dict[str, dict] = {}
+    try:
+        with ROOM.open("r", encoding="utf-8") as f:
+            for line in f:
+                if '"quota"' not in line:
+                    continue
+                try:
+                    o = json.loads(line)
+                except Exception:               # noqa: BLE001
+                    continue
+                if o.get("status") != "quota":
+                    continue
+                v = o.get("voice")
+                if not isinstance(v, str):
+                    continue
+                out[v] = {"at": o.get("ts"),
+                          "text": ANSI_RE.sub("", (o.get("detail") or ""))[:300],
+                          "round": o.get("round")}
+    except OSError:
+        pass
+    # Комната (live.jsonl) — с 2026-09-06 её отказы типизированы
+    # (status у kind=error, см. live._status_of), поэтому читается и она:
+    # прежде отказ по квоте лежал там как «error, код N», и окно его не
+    # видело намеренно — гадать по тексту нельзя (правило 8.5).
+    try:
+        with FEED.open("r", encoding="utf-8") as f:
+            for line in f:
+                if '"quota"' not in line or '"error"' not in line:
+                    continue
+                try:
+                    o = json.loads(line)
+                except Exception:               # noqa: BLE001
+                    continue
+                if o.get("kind") != "error" or o.get("status") != "quota":
+                    continue
+                v = o.get("author")
+                if not isinstance(v, str) or v not in VOICES:
+                    continue
+                prev = out.get(v)
+                if not prev or str(o.get("ts") or "") > str(prev.get("at") or ""):
+                    out[v] = {"at": o.get("ts"),
+                              "text": ANSI_RE.sub("", (o.get("detail") or ""))[:300],
+                              "round": "комната"}
+    except OSError:
+        pass
+    return out
+
+
+# ── claude: три окна одним бесплатным GET'ом ─────────────────────────
+# Эндпоинт тот же, который CLI дёргает сам, чтобы нарисовать /usage
+# (найден в бандле 2.1.243: `fetchUtilization: GET /api/oauth/usage`).
+# Модель при этом не вызывается — платы нет.
+#
+# ТОКЕН ПЕРЕЧИТЫВАЕМ С ДИСКА КАЖДЫЙ РАЗ и НИКОГДА не обновляем сами:
+# accessToken живёт ~8 часов, ротацию ведёт сам Claude Code, и вторая
+# ротация наперегонки с ним разлогинит Автора. На 401 честно пишем
+# «токен не принят», а не молчим.
+#
+# Отдельно: файлу ~/.claude/daemon-auth-status.json верить нельзя — там
+# лежало {"status":"auth_required"} при заведомо живом токене (замер
+# 2026-08-25). Спрашиваем эндпоинт, а не чужой кэш.
+#
+# ЧЕРЕЗ CLI НЕ ХОДИМ И НЕ ПОЙДЁМ. `claude auth status --json` отдаёт
+# subscriptionType (тариф, а не остаток), но стоит 5.8 секунды на запуск
+# и с stdin=DEVNULL — как его и надо звать из сервера — падает с SIGSEGV
+# (rc=-11, замер 2026-08-25 на claude 2.1.233). Весь сбор лимитов
+# остался без единого запуска CLI: чтение диска плюс бесплатные GET'ы.
+# Подписи РАЗНЫЕ намеренно. Две строки «неделя 84 %» и «неделя 100 %»
+# рядом — это потеря ровно того, ради чего список и заведён: какое
+# именно окно кончилось. У Автора три лимита (5 часов, неделя общая,
+# неделя отдельно на Fable), и «Fable» видно только в scoped-строке
+# (нашёл ревьюер дифа, воспроизвёл на ответе без display_name).
+_CL_NAMES = {"session": "5 часов", "weekly_all": "неделя (всё)",
+             "weekly_scoped": "неделя (модель)"}
+# Длину окна берём по ПРЕФИКСУ вида: раньше искали по полю `group`, а
+# там приходит weekly_all / weekly_scoped, и словарь с ключом `weekly`
+# не находил ничего — window_minutes уходил None, страница теряла
+# длину окна. Комментарий при этом описывал не тот механизм.
+_CL_WINDOW = {"session": 300, "weekly": 10080}
+
+
+def _cl_window(kind: str, group: str) -> int | None:
+    for key in (group, kind):
+        if key in _CL_WINDOW:
+            return _CL_WINDOW[key]
+    if str(kind).startswith("weekly") or str(group).startswith("weekly"):
+        return _CL_WINDOW["weekly"]
+    return None
+
+
+def _lim_claude_api() -> tuple[list[dict], dict] | None:
+    try:
+        creds = json.loads(CLAUDE_CREDS.read_text(encoding="utf-8"))
+        oauth = creds.get("claudeAiOauth") or {}
+        token = oauth.get("accessToken")
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return None
+    if not token:
+        return None
+    # Заголовки как у самого CLI. Без User-Agent и anthropic-beta
+    # эндпоинт отвечает стойким 429, и панель показывала «отказ по
+    # квоте» там, где квота ни при чём: это был отказ МОНИТОРА, а не
+    # голоса — то есть поле врало ровно про то, ради чего заведено
+    # (нашёл grok; 429 я и сам поймал живьём).
+    code, d, err = _get_json(CLAUDE_USAGE,
+                             {"Authorization": f"Bearer {token}",
+                              "Content-Type": "application/json",
+                              "anthropic-beta": "oauth-2025-04-20",
+                              "User-Agent": "claude-cli/roundtable"})
+    if not isinstance(d, dict):
+        why = ("токен не принят (401): его обновляет сам Claude Code, "
+               "окно в ротацию не лезет" if code == 401 else
+               "429 от эндпоинта расхода: это ограничение НА ОПРОС "
+               "монитора, а не квота голоса — шкала просто не измерена"
+               if code == 429 else
+               f"эндпоинт расхода не ответил — {err}")
+        return [], {"kind": "none", "note": why, "caveat": NO_DATA_CAVEAT,
+                    # Отказ ОПРОСА, не квоты голоса: по этому флагу
+                    # collect_limits вправе показать последний удачный
+                    # замер вместо пустоты («Клод не видит опять»).
+                    "monitor_refusal": True,
+                    "source": CLAUDE_USAGE,
+                    "plan": oauth.get("subscriptionType") or ""}
+    now = _iso(time.time())
+    gauges: list[dict] = []
+    for row in (d.get("limits") or []):
+        if not isinstance(row, dict):
+            continue
+        pct = row.get("percent")
+        if not isinstance(pct, (int, float)):
+            continue
+        kind = str(row.get("kind") or "")
+        name = _CL_NAMES.get(kind, kind or "окно")
+        model = (((row.get("scope") or {}).get("model") or {})
+                 .get("display_name"))
+        if model:
+            name = f"{name} · {model}"
+        g = _gauge(name, meaning="used", known=float(pct), total=100.0,
+                   unit="percent", measured_at=now, source=CLAUDE_USAGE,
+                   note="процент израсходованного окна, как его считает "
+                        "провайдер: сюда входит вся работа Автора этим "
+                        "аккаунтом, не только стол")
+        win = _cl_window(str(kind), str(row.get("group") or ""))
+        if win:
+            g["window_minutes"] = win
+        if isinstance(row.get("resets_at"), str):
+            g["resets_at"] = row["resets_at"]
+        if row.get("severity"):
+            g["severity"] = row["severity"]
+        g["active"] = bool(row.get("is_active"))
+        gauges.append(g)
+    if not gauges:
+        # limits[] не пришёл — берём то же самое из именованных полей.
+        for key, name, win in (("five_hour", "5 часов", 300),
+                               ("seven_day", "неделя", 10080)):
+            w = d.get(key)
+            if isinstance(w, dict) and isinstance(
+                    w.get("utilization"), (int, float)):
+                g = _gauge(name, meaning="used",
+                           known=float(w["utilization"]), total=100.0,
+                           unit="percent", window_minutes=win,
+                           measured_at=now, source=CLAUDE_USAGE)
+                if isinstance(w.get("resets_at"), str):
+                    g["resets_at"] = w["resets_at"]
+                gauges.append(g)
+    extra = {"plan": oauth.get("subscriptionType") or "",
+             "note": f"источник — {CLAUDE_USAGE}, тот же запрос, которым "
+                     f"CLI рисует /usage; модель не вызывается, платы нет"}
+    exp = oauth.get("expiresAt")
+    if isinstance(exp, (int, float)):
+        extra["token_expires_at"] = _iso(exp / 1000.0)
+    return gauges, extra
+
+
+def _find_key(obj, key: str):
+    """Первое вхождение ключа в дереве json. Транскрипты Клода меняют
+    форму между версиями CLI, и жёсткий путь к полю ломается тихо."""
+    if isinstance(obj, dict):
+        if key in obj:
+            return obj[key]
+        for v in obj.values():
+            got = _find_key(v, key)
+            if got is not None:
+                return got
+    elif isinstance(obj, list):
+        for v in obj:
+            got = _find_key(v, key)
+            if got is not None:
+                return got
+    return None
+
+
+def _lim_claude_disk(room: dict) -> dict | None:
+    """Запасной путь, когда эндпоинт не ответил: наш собственный журнал
+    room.jsonl (там отказ записан как status=quota со словами
+    провайдера) плюс resetsAt из транскрипта CLI, если найдётся.
+
+    Оставлен намеренно: сеть падает, токен протухает, а «когда сбросится»
+    из последнего отказа — единственное, что остаётся. Порядок такой,
+    потому что room.jsonl — про НАШ вызов, транскрипт — про любой,
+    включая ручную работу Автора в другом окне."""
+    reset = kind_of = at = src = None
+    base = Path.home() / ".claude" / "projects"
+    for pth in _newest(base.rglob("*.jsonl"), 12):
+        txt = _tail(pth, 256 * 1024)
+        if '"quotaLimits"' not in txt:
+            continue
+        for line in reversed(txt.splitlines()):
+            if '"quotaLimits"' not in line or '"rejected"' not in line:
+                continue
+            try:
+                o = json.loads(line)
+            except Exception:                   # noqa: BLE001
+                continue
+            q = _find_key(o, "quotaLimits")
+            if not isinstance(q, dict) or q.get("status") != "rejected":
+                continue
+            ts = o.get("timestamp") or ""
+            if at and ts <= at:
+                break
+            at, src, reset, kind_of = (ts, str(pth), q.get("resetsAt"),
+                                       q.get("rateLimitType"))
+            break
+    r = room.get("claude")
+    if not at and not r:
+        return None
+    lim = {"kind": "refusal",
+           "at": (r or {}).get("at") or at,
+           "text": (r or {}).get("text")
+                   or f"отказ по лимиту ({kind_of or 'тип не назван'})",
+           "source": str(ROOM) if r else src,
+           "note": "живой расход не запросился; это последний отказ, а не "
+                   "остаток сейчас"}
+    if isinstance(reset, (int, float)):
+        # Сброс — из транскрипта CLI, и это МОЖЕТ БЫТЬ другой отказ, не
+        # тот, что в room.jsonl. Поэтому у него своё время рядом.
+        lim["resets_at"] = _iso(reset)
+        lim["rate_limit_type"] = kind_of
+        lim["reset_from"] = {"at": at, "source": src}
+    return lim
+
+
+def _lim_claude(room: dict) -> dict:
+    got = _lim_claude_api()
+    if got is None:
+        return (_lim_claude_disk(room)
+                or _no_data(f"нет {CLAUDE_CREDS} — окно не знает, чьим "
+                            f"токеном спрашивать расход"))
+    gauges, extra = got
+    if gauges:
+        return _pack(gauges, **extra)
+    # Эндпоинт не дал чисел — падаем на диск, но причину называем.
+    disk = _lim_claude_disk(room)
+    if disk:
+        # Причину дописываем ОТДЕЛЬНЫМ ключом, а не поверх пояснения
+        # диска. Раньше note диска затирался — вместе с его главной
+        # оговоркой «это ПОСЛЕДНИЙ отказ, а не остаток сейчас», — и в
+        # карточке оставалось утверждение про эндпоинт, который чисел не
+        # дал: два противоречащих источника подряд (нашёл ревьюер дифа;
+        # так же уже сделано у codex).
+        out = {**extra, **disk}
+        api_note = f"{extra.get('note') or ''}".strip()
+        if api_note:
+            out["api_note"] = api_note
+        return out
+    return {**extra, "caveat": NO_DATA_CAVEAT,
+            "kind": extra.get("kind", "none")}
+
+
+# ── codex: одно окно, живой эндпоинт вместо ковыряния в логах ────────
+# ЗАГОЛОВКИ `originator` И `User-Agent` ОБЯЗАТЕЛЬНЫ: без любого из них
+# Cloudflare перед chatgpt.com отдаёт 403 с html-заглушкой (проверено
+# порознь 2026-08-25). Точность версии в UA не важна — с заведомо
+# несуществующей 9.9.9 ответ тот же 200; важен сам вид строки.
+def _codex_ua_version() -> str:
+    """Версия для User-Agent. Берём из ~/.codex/version.json, если он
+    есть; иначе — последняя проверенная. Это строка для Cloudflare, а не
+    утверждение о том, какой CLI установлен, поэтому запускать `codex
+    --version` ради неё (полсекунды на каждый замер) не стоит."""
+    try:
+        v = json.loads(CODEX_AUTH.with_name("version.json").read_text(
+            encoding="utf-8")).get("latest_version")
+        if isinstance(v, str) and re.fullmatch(r"[\d.]{1,16}", v):
+            return v
+    except Exception:                               # noqa: BLE001
+        pass
+    return "0.147.0"
+
+
+def _lim_codex_api() -> dict | None:
+    try:
+        tk = json.loads(CODEX_AUTH.read_text(encoding="utf-8"))["tokens"]
+        token, acc = tk["access_token"], tk["account_id"]
+    except Exception:                               # noqa: BLE001
+        return None
+    ver = _codex_ua_version()
+    code, d, err = _get_json(CODEX_USAGE, {
+        "Authorization": f"Bearer {token}",
+        "chatgpt-account-id": acc,
+        "originator": "codex_cli_rs",
+        "version": ver,
+        "User-Agent": f"codex_cli_rs/{ver} (RoundTable; limits probe)"})
+    if not isinstance(d, dict):
+        return {"kind": "none", "source": CODEX_USAGE,
+                "note": f"живой расход не запросился — {err}",
+                "caveat": NO_DATA_CAVEAT}
+    rl = d.get("rate_limit") or {}
+    now = _iso(time.time())
+    gauges: list[dict] = []
+    # Окон может быть два (primary/secondary). На тарифе plus secondary
+    # приходит null — но КОД ЭТОГО НЕ ПРЕДПОЛАГАЕТ: появится второе
+    # окно, оно просто станет второй шкалой, а не потеряется молча.
+    for key, label in (("primary_window", "окно"),
+                       ("secondary_window", "второе окно")):
+        w = rl.get(key)
+        if not isinstance(w, dict):
+            continue
+        pct = w.get("used_percent")
+        if not isinstance(pct, (int, float)):
+            continue
+        secs = w.get("limit_window_seconds")
+        name = label
+        if isinstance(secs, (int, float)) and secs >= 60:
+            mins = int(secs // 60)
+            name = (f"{mins // 1440} сут" if mins % 1440 == 0 else
+                    f"{mins // 60} ч" if mins % 60 == 0 else f"{mins} мин")
+        g = _gauge(name, meaning="used", known=float(pct), total=100.0,
+                   unit="percent", measured_at=now, source=CODEX_USAGE,
+                   note="процент израсходованного окна по данным "
+                        "провайдера — вся работа этим аккаунтом, не "
+                        "только стол")
+        if isinstance(secs, (int, float)) and secs >= 60:
+            g["window_minutes"] = int(secs // 60)
+        if isinstance(w.get("reset_at"), (int, float)):
+            g["resets_at"] = _iso(w["reset_at"])
+        gauges.append(g)
+    extra: dict = {"plan": d.get("plan_type") or "", "source": CODEX_USAGE}
+    cr = d.get("credits") or {}
+    bal = cr.get("balance")
+    if bal not in (None, ""):
+        extra["credits"] = str(bal)
+    if rl.get("limit_reached"):
+        extra["reached"] = True
+    if not gauges:
+        extra.update({"kind": "none", "caveat": NO_DATA_CAVEAT,
+                      "note": "эндпоинт ответил, но окна расхода в ответе "
+                              "не оказалось"})
+        return extra
+    extra["note"] = (f"источник — {CODEX_USAGE} (бесплатный GET, модель не "
+                     f"вызывается)")
+    return _pack(gauges, **extra)
+
+
+def _lim_codex_disk() -> dict | None:
+    """Запасной путь: на каждый ход Кодекс пишет в свой rollout событие
+    token_count с rate_limits. Это СНИМОК последнего вызова, а не
+    состояние сейчас, — так и подписан.
+
+    Свежесть файла (mtime) и свежесть ЗАПИСИ — разные вещи: сессию можно
+    возобновить, и тогда самый новый по mtime файл содержит запись
+    позавчерашнюю. Поэтому смотрим пять новейших файлов и выбираем
+    запись с максимальным timestamp."""
+    base = Path.home() / ".codex" / "sessions"
+    best: dict | None = None
+    for pth in _newest(base.rglob("rollout-*.jsonl"), 5):
+        for line in reversed(_tail(pth, 512 * 1024).splitlines()):
+            if '"rate_limits"' not in line:
+                continue
+            try:
+                o = json.loads(line)
+            except Exception:                   # noqa: BLE001
+                continue                        # обрезанная первая строка
+            pr = (((o.get("payload") or {}).get("rate_limits")
+                   or {}).get("primary") or {})
+            if not isinstance(pr.get("used_percent"), (int, float)):
+                continue
+            g = _gauge("окно", meaning="used",
+                       known=float(pr["used_percent"]), total=100.0,
+                       unit="percent", stale=True,
+                       measured_at=o.get("timestamp") or "",
+                       source=str(pth),
+                       note="снимок НА МОМЕНТ последнего вызова codex, а "
+                            "не расход сейчас: живой эндпоинт не ответил")
+            if isinstance(pr.get("window_minutes"), int):
+                g["window_minutes"] = pr["window_minutes"]
+                g["name"] = (f"{pr['window_minutes'] // 1440} сут"
+                             if pr["window_minutes"] % 1440 == 0
+                             else g["name"])
+            if isinstance(pr.get("resets_at"), (int, float)):
+                g["resets_at"] = _iso(pr["resets_at"])
+            if best is None or g["measured_at"] > best["measured_at"]:
+                best = g
+            break
+    return _pack([best]) if best else None
+
+
+def _lim_codex() -> dict:
+    api = _lim_codex_api()
+    if api and api.get("limits"):
+        return api
+    disk = _lim_codex_disk()
+    if disk:
+        if api:
+            disk["api_note"] = api.get("note", "")
+        return disk
+    return api or _no_data(
+        "codex пишет rate_limits на каждый ход, но ни живой эндпоинт, ни "
+        "записи на диске сейчас недоступны")
+
+
+# ── deepseek: предоплаченный баланс ──────────────────────────────────
+def _lim_deepseek() -> dict | None:
+    """Живое число: предоплаченный баланс. Запрос бесплатный (не
+    модельный вызов). Связь с отказом прямая и измеренная: адаптер
+    `deepseek-http` ставит `exit 3` ровно на HTTP 402/429 — то есть
+    обнуление этого баланса и есть будущий `quota` в журнале. Поэтому
+    предупредить можно заранее, а не по факту отказа."""
+    try:
+        key = DS_KEY.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not key:
+        return None
+    code, d, err = _get_json(f"{DS_BASE}/user/balance",
+                             {"Authorization": f"Bearer {key}"})
+    if not isinstance(d, dict):
+        return {"kind": "none", "source": f"{DS_BASE}/user/balance",
+                "note": f"баланс не запросился — {err}",
+                "caveat": NO_DATA_CAVEAT}
+    infos = d.get("balance_infos") or []
+    usd = next((i for i in infos if i.get("currency") == "USD"),
+               infos[0] if infos else None)
+    if not usd:
+        return None
+    try:
+        left = float(usd.get("total_balance"))
+    except (TypeError, ValueError):
+        return None
+    g = _gauge("баланс", meaning="left", known=left,
+               unit=usd.get("currency", "USD").lower(),
+               measured_at=_iso(time.time()),
+               source=f"{DS_BASE}/user/balance",
+               note="предоплаченный баланс; общего потолка нет, поэтому "
+                    "и поля total здесь нет — шкалу не из чего строить")
+    return _pack([g], available=bool(d.get("is_available")),
+                 note="обнуление баланса даст 402 → adapter exit 3 → "
+                      "статус quota в журнале")
+
+
+# ── kimi: баланс живой, расход провайдер не отдаёт ───────────────────
+_KIMI_429 = re.compile(
+    r"^(\d{4}-\d\d-\d\dT[\d:.]+Z).*?current: (\d+), limit: (\d+)")
+
+
+def _kimi_key() -> str | None:
+    """Ключ первой ПО АЛФАВИТУ линии из ~/.kimi-code/config.toml.
+
+    Именно по алфавиту, а не «первой в файле»: сейчас это совпадает
+    (`moonshotai` < `moonshotai2`), но провайдер с именем `alt` или
+    `backup` сместил бы выбор молча (ревьюер дифа поправил докстроку —
+    подпись обязана описывать механику, а не намерение).
+
+    Спрашиваем ровно одну линию намеренно. У Кими в конфиге два
+    провайдера (`moonshotai`, `moonshotai2`) с РАЗНЫМИ ключами, но
+    /v1/users/me по обоим возвращает один и тот же org/project/user и
+    один и тот же баланс (сверено 2026-08-25). Вторая линия даёт вторую
+    параллельную сессию — но не второй кошелёк и не второй лимит.
+    Показать два баланса значило бы показать один и тот же дважды:
+    поле, которое врёт (правило 8.5)."""
+    try:
+        import tomllib
+        with KIMI_CFG.open("rb") as f:
+            provs = tomllib.load(f).get("providers") or {}
+    except Exception:                               # noqa: BLE001
+        return None
+    for pname, p in sorted(provs.items()):
+        # управляемый провайдер подписки (managed:kimi-code, type kimi)
+        # держит в api_key пустую строку/заглушку — это не ключ линии
+        if not isinstance(p, dict) or str(pname).startswith("managed:"):
+            continue      # тип не критерий: ключ «Kimi For Coding» тоже type=kimi (deepseek)
+        if isinstance(p.get("api_key"), str) and p["api_key"].strip():
+            return p["api_key"]
+    return None
+
+
+def _lim_kimi_log() -> dict | None:
+    """Расход у Кими виден только в момент 429 — и лежит в его же логе
+    сессии. Это снимок момента отказа, а не остаток сейчас, и подписан
+    он именно так: stale. Тот же счётчик, из-за которого Кими трое суток
+    числился «медленным», хотя упирался в лимит организации.
+
+    Не «двадцать пять новейших»: последний 429 лежал в логе с 28-м
+    местом по mtime — сессия отказала и больше не трогалась, пока рядом
+    дописывались живые."""
+    base = Path.home() / ".kimi-code" / "sessions"
+    best: tuple[str, str, int, int] | None = None
+    for pth in _newest(base.glob("*/*/logs/kimi-code.log"), 200):
+        for line in reversed(_tail(pth, 128 * 1024).splitlines()):
+            m = _KIMI_429.match(line)
+            if m:
+                cand = (m.group(1), str(pth), int(m.group(2)),
+                        int(m.group(3)))
+                if best is None or cand[0] > best[0]:
+                    best = cand
+                break
+    if best is None:
+        return None
+    at, src, cur, tot = best
+    return _gauge("последний 429", kind="refusal", meaning="used",
+                  known=cur, total=tot, unit="tokens", at=at,
+                  measured_at=at, stale=True, source=src,
+                  text=f"429: израсходовано {cur} из {tot} токенов",
+                  note="число известно НА МОМЕНТ ОТКАЗА, не сейчас: на "
+                       "успешном вызове Кими счётчика не сообщает")
+
+
+# ── kimi: ПОДПИСКА Kimi Code (2026-09-23, «Кими пересел на CLI») ─────
+# Расход плана и уровень аккаунта CLI отдаёт только через свой локальный
+# сервер (`kimi web`, документированный REST: /api/v1/oauth/usage —
+# «plan quota and booster wallet», /api/v1/oauth/userinfo, /api/v1/auth);
+# прямого адреса account-service в бинаре нет, а токен OAuth живёт 900 с
+# и обновляется самим CLI. Поэтому окно поднимает `kimi web --no-open`
+# на свободном порту НА ВРЕМЯ ЗАПРОСА (2–3 с, три GET) и гасит его;
+# bearer — `~/.kimi-code/server.token` (постоянный, пишет сам CLI).
+# Снимок кэшируется KIMI_PLAN_TTL: спавнить 180-мегабайтный процесс
+# каждый проход лимитов (180 с) незачем.
+KIMI_WEB_BIN = Path.home() / ".kimi-code" / "bin" / "kimi"
+KIMI_WEB_TOKEN = Path.home() / ".kimi-code" / "server.token"
+KIMI_PLAN_TTL = 300.0
+_KIMI_PLAN_CACHE: dict = {"ts": 0.0, "data": None}
+_KIMI_PLAN_LOCK = threading.Lock()
+KIMI_PLAN_WINDOWS = (   # ключ ответа → подпись, окно в минутах (None — календарное)
+    ("limit5h", "5 часов", 300),
+    ("limit7d", "неделя", 10080),
+    ("monthTotal", "месяц (всё)", None),
+    ("monthCode", "месяц (код)", None),
+)
+
+
+def _free_port() -> int:
+    with socket.socket() as sk:
+        sk.bind(("127.0.0.1", 0))
+        return int(sk.getsockname()[1])
+
+
+def kimi_web_query(paths: tuple[str, ...] = ("/api/v1/auth", "/api/v1/oauth/usage",
+                                              "/api/v1/oauth/userinfo"),
+                   timeout: float = 25.0) -> dict:
+    """{путь: data | {"error": …}} — через временный `kimi web`.
+    Ничего не пишет и не звонит модели: только служебные GET."""
+    out: dict = {}
+    if os.environ.get("CHOIR_RT_NO_KIMI_WEB"):
+        # тесты и стенды: 180-мегабайтный процесс CLI не поднимать
+        return {p: {"error": "kimi web выключен (CHOIR_RT_NO_KIMI_WEB)"} for p in paths}
+    if not KIMI_WEB_BIN.exists():
+        return {p: {"error": f"нет {KIMI_WEB_BIN}"} for p in paths}
+    port = _free_port()
+    try:
+        proc = subprocess.Popen([str(KIMI_WEB_BIN), "web", "--no-open", "--port", str(port)],
+                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, start_new_session=True,
+                                cwd=str(Path.home()))
+    except OSError as e:
+        return {p: {"error": f"kimi web не запустился: {e}"} for p in paths}
+    try:
+        base = f"http://127.0.0.1:{port}"
+        t0 = time.monotonic()
+        up = False
+        while time.monotonic() - t0 < 20:
+            if proc.poll() is not None:
+                break
+            code, d, _ = _get_json(f"{base}/api/v1/healthz", {}, timeout=2)
+            if code == 200 and isinstance(d, dict) and (d.get("data") or {}).get("ok"):
+                up = True
+                break
+            time.sleep(0.4)
+        if not up:
+            return {p: {"error": "kimi web не поднялся за 20 с"} for p in paths}
+        try:
+            token = KIMI_WEB_TOKEN.read_text(encoding="utf-8").strip()
+        except OSError as e:
+            return {p: {"error": f"нет {KIMI_WEB_TOKEN}: {e}"} for p in paths}
+        hdr = {"Authorization": f"Bearer {token}"}
+        for pth in paths:
+            code, d, err = _get_json(base + pth, hdr, timeout=timeout)
+            if isinstance(d, dict) and d.get("code") == 0:
+                out[pth] = d.get("data")
+            else:
+                out[pth] = {"error": err or f"HTTP {code}: {str(d)[:200]}"}
+    finally:
+        # всю группу процессов (start_new_session): terminate лидера
+        # оставлял бы детей `kimi web` на порту (ревизия 23.09: все четверо)
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+                os.killpg(proc.pid, sig)
+            try:
+                proc.wait(timeout=5)
+                break
+            except subprocess.TimeoutExpired:
+                continue
+    return out
+
+
+def kimi_plan_snapshot(force: bool = False) -> dict:
+    """Снимок подписки Kimi Code: auth, usage, userinfo, at (кэш KIMI_PLAN_TTL)."""
+    with _KIMI_PLAN_LOCK:
+        if not force and _KIMI_PLAN_CACHE["data"] and time.time() - _KIMI_PLAN_CACHE["ts"] < KIMI_PLAN_TTL:
+            return dict(_KIMI_PLAN_CACHE["data"])
+        if not _kimi_plan_declared():
+            # входа нет — kimi web ради заведомого «не подключено» не
+            # поднимать каждые 5 минут (kimi, ревизия 23.09)
+            q = {"/api/v1/auth": {"managed_provider": None, "models_ready": None},
+                 "/api/v1/oauth/usage": {"error": "подписка Kimi Code не подключена (kimi login)"},
+                 "/api/v1/oauth/userinfo": {"error": "подписка Kimi Code не подключена (kimi login)"}}
+        else:
+            q = kimi_web_query()
+        snap = {"auth": q.get("/api/v1/auth"), "usage": q.get("/api/v1/oauth/usage"),
+                "userinfo": q.get("/api/v1/oauth/userinfo"), "at": _iso(time.time())}
+        _KIMI_PLAN_CACHE.update(ts=time.time(), data=dict(snap))
+        return snap
+
+
+def kimi_plan_gauges(usage: dict | None, at: str) -> tuple[list[dict], str]:
+    """Шкалы из ответа /api/v1/oauth/usage: окна плана (проценты, момент
+    сброса) и кошелёк доп. расхода. Второе значение — заметка/ошибка."""
+    src = "kimi web → /api/v1/oauth/usage (account service Kimi Code)"
+    if not isinstance(usage, dict):
+        return [], "расход плана не запросился: kimi web не ответил"
+    if usage.get("error"):
+        return [], f"расход плана не запросился: {usage['error']}"
+    if usage.get("kind") != "ok":
+        return [], f"account service Kimi Code: {usage.get('message') or usage.get('kind')}"
+    quota = usage.get("quota") or {}
+    usages = quota.get("usages") or {}
+    gauges: list[dict] = []
+    for key, label, win in KIMI_PLAN_WINDOWS:
+        w = usages.get(key)
+        if not isinstance(w, dict) or not isinstance(w.get("usedRatio"), (int, float)):
+            continue
+        g = _gauge(label, meaning="used", known=round(float(w["usedRatio"]) * 100, 1),
+                   total=100.0, unit="percent", measured_at=at, source=src,
+                   note="процент израсходованного окна ПОДПИСКИ Kimi Code, как его "
+                        "считает провайдер: сюда входит вся работа Автора этим "
+                        "аккаунтом (CLI, web, VS Code), не только стол")
+        if win:
+            g["window_minutes"] = win
+        if isinstance(w.get("resetAt"), str):
+            g["resets_at"] = w["resetAt"]
+        gauges.append(g)
+    ex = quota.get("extraUsage")
+    if isinstance(ex, dict) and isinstance(ex.get("balanceCents"), (int, float)):
+        cur = str(ex.get("currency") or "").lower() or "cny"
+        gauges.append(_gauge("доп. расход", meaning="left", known=float(ex["balanceCents"]) / 100,
+                             unit=cur, measured_at=at, source=src,
+                             note="кошелёк Extra Usage: списывается ПОСЛЕ квот подписки; "
+                                  + (f"за месяц потрачено {float(ex.get('monthlyUsedCents') or 0) / 100:.2f}"
+                                     if isinstance(ex.get("monthlyUsedCents"), (int, float)) else "")))
+    note = "" if gauges else "план без окон в ответе (usages пуст)"
+    return gauges, note
+
+
+def _lim_kimi(room: dict) -> dict:
+    gauges: list[dict] = []
+    extra: dict = {}
+    # 1. Подписка Kimi Code — основная линия
+    snap = kimi_plan_snapshot()
+    pg, pnote = kimi_plan_gauges(snap.get("usage"), snap.get("at") or _iso(time.time()))
+    gauges.extend(pg)
+    if pnote:
+        extra["plan_note"] = pnote
+    ui = snap.get("userinfo")
+    if isinstance(ui, dict) and ui.get("kind") == "ok":
+        extra["plan"] = str((ui.get("userInfo") or {}).get("userLevelName") or "")
+    # 2. Резерв по ключу API (галочка «резерв API»): баланс кошелька
+    key = _kimi_key()
+    if key:
+        hdr = {"Authorization": f"Bearer {key}"}
+        code, d, err = _get_json(f"{KIMI_API}/users/me/balance", hdr)
+        data = (d or {}).get("data") if isinstance(d, dict) else None
+        bal = (data or {}).get("available_balance")
+        if isinstance(bal, (int, float)):
+            gauges.append(_gauge(
+                "резерв: баланс", meaning="left", known=float(bal), unit="usd",
+                measured_at=_iso(time.time()),
+                source=f"{KIMI_API}/users/me/balance",
+                note="кошелёк ключевой линии (резерв на случай исчерпания "
+                     "квоты подписки; галочка «резерв API»); один на все "
+                     "ключевые линии одной организации; потолка у баланса "
+                     "нет, поэтому нет и шкалы"))
+        else:
+            extra["note"] = f"баланс резерва не запросился — {err}"
+        code, d, err = _get_json(f"{KIMI_API}/users/me", hdr)
+        org = (((d or {}).get("data") or {}).get("organization")
+               if isinstance(d, dict) else None)
+        if isinstance(org, dict):
+            # Потолки — НЕ шкала: израсходованное сервер не отдаёт
+            # (organization_usage приходит пустым объектом). Кладём их
+            # как справку, чтобы никто не построил из потолка процент.
+            extra["ceilings"] = {
+                "max_concurrency": org.get("max_concurrency"),
+                "max_request_per_minute": org.get("max_request_per_minute"),
+                "max_token_per_minute": org.get("max_token_per_minute"),
+                "max_token_quota": org.get("max_token_quota")}
+            extra["ceilings_source"] = f"{KIMI_API}/users/me"
+            # Расхождение с каноном называем вслух, а НЕ чиним молча:
+            # в chamber/CLAUDE.md и в шапке serial_gate.py записано
+            # «concurrency = 1», сервер сейчас отвечает другое. Проверить
+            # это может только живой параллельный вызов, а не наш GET, —
+            # поэтому очередь трогать нельзя, а промолчать нельзя тем
+            # более (правило 4).
+            if org.get("max_concurrency") not in (None, 1):
+                extra["canon_mismatch"] = (
+                    f"сервер отвечает max_concurrency="
+                    f"{org.get('max_concurrency')}, а в chamber/CLAUDE.md и "
+                    f"serial_gate.py записано 1. Не проверено живым "
+                    f"параллельным вызовом — очередь оставлена как есть")
+    else:
+        extra["note"] = f"ключевой линии (резерва) в {KIMI_CFG} нет"
+    snap = _lim_kimi_log()
+    if snap:
+        gauges.append(snap)
+    r = room.get("kimi")
+    if r:
+        extra["room_at"], extra["room_text"] = r.get("at"), r.get("text")
+    if not gauges and not r:
+        return {**extra, **_no_data(
+            extra.get("note") or "Кими сообщает расход только в момент "
+                                 "429; отказов в логах нет")}
+    if not gauges:
+        # `**extra` ПЕРВЫМ: иначе его note («баланс не запросился —
+        # HTTP 401…») затирал пояснение к отказу из room.jsonl, и
+        # карточка показывала одно, а поясняла другое (ревьюер дифа).
+        return {**extra, "kind": "refusal", **r, "source": str(ROOM),
+                "note": "цифр провайдера в логах не нашлось"}
+    return _pack(gauges, **extra)
+
+
+# ── grok: шкалы у CLI-учётки нет, и это ПРОВЕРЕНО ────────────────────
+def _grok_spent() -> list[dict]:
+    """Расход канала Грока за 5 часов и за сутки — из его же логов.
+
+    Читаем хвост unified.jsonl (он растёт десятками мегабайт, поэтому
+    именно хвост) и считаем ответы модели. Величина честная, но чужая
+    квоте: это работа ЭТОЙ машины через CLI, а не всё, что Автор
+    потратил аккаунтом. Так и подписано.
+    """
+    log = Path.home() / ".grok" / "logs" / "unified.jsonl"
+    now = time.time()
+    win = {"за 5 ч": 5 * 3600, "за сутки": 24 * 3600}
+    steps = {k: 0 for k in win}
+    toks = {k: 0 for k in win}
+    sess: dict[str, set] = {k: set() for k in win}
+    try:
+        tail = _tail(log, 4_000_000)
+    except OSError:
+        return []
+    oldest = None
+    for line in tail.splitlines():
+        if '"shell.turn.inference_done"' not in line:
+            continue
+        try:
+            d = json.loads(line)
+            ts = datetime.fromisoformat(
+                str(d.get("ts", "")).replace("Z", "+00:00")).timestamp()
+        except (ValueError, TypeError, AttributeError):
+            continue
+        if oldest is None or ts < oldest:
+            oldest = ts
+        c = d.get("ctx") if isinstance(d.get("ctx"), dict) else {}
+        for name, span in win.items():
+            if now - ts <= span:
+                steps[name] += 1
+                sess[name].add(str(d.get("sid") or ""))
+                for k in ("prompt_tokens", "completion_tokens"):
+                    try:
+                        toks[name] += int(c.get(k) or 0)
+                    except (TypeError, ValueError):
+                        pass        # мусор в поле не должен ронять замер
+    if not any(steps.values()):
+        return []
+    at = _iso(now)
+    out = []
+    for name, span in win.items():
+        # ПОЛНОТА ОКНА: хвост 4 МБ может не покрыть сутки, а ротация
+        # лога — тем более. Тогда число — «не менее», и так подписано
+        # (нашли kimi и codex независимо).
+        full = oldest is not None and now - oldest >= span
+        out.append(_gauge(
+            name + ("" if full else " (не менее)"),
+            meaning="used", known=float(steps[name]),
+            # Это ШАГИ МОДЕЛИ, а не вопросы: один ход Грока даёт
+            # несколько inference_done по loop_index, и назвать их
+            # «вызовами» значило соврать в поле (посчитал codex:
+            # 1083 события на 126 сессий).
+            unit="шагов модели", measured_at=at, source=str(log),
+            note=f"шагов модели за окно; сессий {len(sess[name])}, "
+                 f"токенов {toks[name]:,}".replace(",", " ")
+                 + ". Считано по логам ЭТОЙ машины — включая работу "
+                   "Грока вне стола. Это РАСХОД, а не доля квоты: "
+                   "потолка провайдер не сообщает"
+                 + ("" if full else ". ОКНО НЕПОЛНОЕ: прочитан хвост "
+                    "лога, более старое не учтено")))
+    return out
+
+
+def _lim_grok() -> dict:
+    """Тариф и конец оплаченного периода — есть. Шкалы — нет.
+
+    Автор видит проценты в настройках grok.com, и они там правда есть:
+    маршрут POST https://grok.com/rest/rate-limits живой. Но токену CLI
+    (OIDC из ~/.grok/auth.json) сервер отвечает
+    403 «Action cannot be performed by OAuth2 token users
+    [WKE=unauthorized:oauth2-auth-forbidden]» — отказ адресный и
+    намеренный; подстановка того же токена в куку sso даёт 401. Нужна
+    браузерная сессия grok.com, то есть чужой секрет с полными правами
+    на аккаунт. Поэтому здесь честное «шкалы нет», а не выдуманный
+    процент.
+
+    В самом CLI шкалы тоже нет: единственная проверка подписки —
+    булево `x.ai/auth/check_subscription`, про лимит у Грока только
+    тексты ошибок постфактум (usage_limit_reached, usage_pool_exhausted).
+
+    Перепроверено 2026-08-25 по просьбе Автора («у остальных должны
+    быть»), третьим способом: рабочий эндпоинт cli-chat-proxy.grok.com
+    отвечает 200 БЕЗ каких-либо x-ratelimit-заголовков, на диске
+    (~/.grok: логи, кэши, auth) остатка нет. ЧЕТЫРЕ независимых прохода
+    (последний — 2026-08-31, со свежим токеном сразу после перелогина
+    Автора, плюс разбор строк самого бинаря) — итог один: остаток живёт
+    только за браузерной сессией. В бинаре есть лишь маркеры отказов
+    (`usage_limit_reached`, `usage_pool_exhausted`, `rate_limited`) и
+    hook-событие `rate_limit` — то есть момент, КОГДА кончилось, узнать
+    можно, а «сколько осталось» — нет.
+
+    Зато на диске есть РАСХОД (см. _grok_spent): его и показываем.
+    """
+    try:
+        auth = json.loads(GROK_AUTH.read_text(encoding="utf-8"))
+        ent = next(iter(auth.values()))
+        token = ent["key"]
+    except Exception:                               # noqa: BLE001
+        # Расход из ЛОГОВ токену не нужен: без auth.json он всё равно
+        # известен, и терять его вместе с тарифом незачем (нашёл grok).
+        spent = _grok_spent()
+        if spent:
+            return _pack(spent, note="тариф не спрошен: файла "
+                         "авторизации нет. Ниже — расход по логам CLI, "
+                         "он от токена не зависит",
+                         caveat=NO_DATA_CAVEAT)
+        return _no_data("grok: файла авторизации нет — ни тарифа, ни "
+                        "расхода спросить нечем")
+    # РАСХОД ИЗ СОБСТВЕННЫХ ЛОГОВ CLI. Остатка провайдер не отдаёт, но
+    # «сколько потрачено» лежит на диске: каждый ответ Грок пишет в
+    # ~/.grok/logs/unified.jsonl событием shell.turn.inference_done с
+    # prompt_tokens/completion_tokens. Это НЕ доля квоты — потолка мы не
+    # знаем и выдумывать его нельзя (правило 8.5), — но это живое число
+    # того же канала, растущее с работой стола, вместо пустого места.
+    # Наказ Автора 2026-08-31: «посмотри ооочень внимательно на лимиты
+    # Грока — в вебинтерфейсе я их вижу».
+    gauges = _grok_spent()
+    out: dict = {"kind": "number" if gauges else "none",
+                 "caveat": NO_DATA_CAVEAT,
+                 "source": GROK_SETTINGS}
+    if gauges:
+        out["limits"] = gauges
+        out.update({k: gauges[0][k] for k in
+                    ("known", "meaning", "unit", "measured_at")
+                    if k in gauges[0]})
+    code, d, err = _get_json(GROK_SETTINGS, {"Authorization": f"Bearer {token}"})
+    if isinstance(d, dict):
+        out["plan"] = d.get("subscription_tier_display") or ""
+        out["available"] = bool(d.get("allow_access", True))
+        out["measured_at"] = _iso(time.time())
+    else:
+        out["settings_error"] = err
+    # Конец оплаченного периода — не шкала, но единственная величина со
+    # временем, которую этот канал вообще отдаёт. UA обязателен: без него
+    # Cloudflare отвечает 403 «error code: 1010» (проверено).
+    code, d, err = _get_json(GROK_SUBS, {
+        "Authorization": f"Bearer {token}", "Accept": "application/json",
+        "User-Agent": "grok-cli/1.0.3"})
+    if isinstance(d, dict):
+        act = [s for s in (d.get("subscriptions") or [])
+               if isinstance(s, dict)
+               and s.get("status") == "SUBSCRIPTION_STATUS_ACTIVE"]
+        if act:
+            pe = act[0].get("billingPeriodEnd")
+            # Число (epoch) — к ISO: чип-таймер на странице молча гас
+            # на сыром числе (нашёл субагент прогоном fmtLeft).
+            out["period_end"] = (_iso(pe / (1000 if pe > 2e10 else 1))
+                                 if isinstance(pe, (int, float)) else pe)
+            out["tier"] = act[0].get("tier")
+    out["note"] = (
+        ("расход посчитан по СОБСТВЕННЫМ логам CLI (~/.grok/logs): "
+         "шаги модели и токены этой машины, включая работу Грока вне "
+         "стола. Доли квоты здесь нет — потолка провайдер не сообщает. "
+         if gauges else "")
+        + "остатка нет: проценты у Грока живут за веб-сессией grok.com, а "
+        "токену CLI сервер отказывает адресно (403 oauth2-auth-forbidden, "
+        "проверено 2026-08-25). Известны тариф"
+        + (f" «{out.get('plan')}»" if out.get("plan") else "")
+        + (f" и конец периода {out['period_end']}" if out.get("period_end")
+           else "") + ".")
+    return out
+
+
+# ── gemini: остатка не отдают вовсе; считаем ключи в ротации ─────────
+def _lim_gemini(room: dict) -> dict:
+    """Единственное, что можно показать честно: сколько ключей в
+    ротации и какой сейчас активен.
+
+    Проверено 2026-08-25: /v1beta/quota и /v1beta/usage → 404,
+    serviceusage.googleapis.com API-ключом не читается в принципе
+    («API keys are not supported by this API»), а на успешном ответе
+    /v1beta/models нет ни одного заголовка x-ratelimit-*. В истории
+    ~/.gemini/choir-http/ нет ни quotaMetric, ни quotaValue — то есть
+    даже из прошлых 429 остаток не восстановить.
+
+    `exit 3` у адаптера означает «все ключи получили 429», так что
+    шкала здесь может быть только дискретной и только постфактум."""
+    # Правило отбора ключей копируем у самого адаптера (gemini-http:
+    # load_keys) — и минимальную длину читаем ИЗ ЕГО ИСХОДНИКА, чтобы
+    # единственное число, которое может разойтись, бралось из файла, а
+    # не из памяти этого окна.
+    try:
+        minlen = int(_src_default("gemini-http", r"len\(s\)\s*>=\s*(\d+)")
+                     or 30)
+    except (TypeError, ValueError):
+        minlen = 30
+    keys = 0
+    try:
+        for line in GEMINI_KEYS.read_text(encoding="utf-8").splitlines():
+            s = line.strip().strip('"').replace(" ", "")
+            if s and not s.startswith("#") and len(s) >= minlen:
+                keys += 1
+    except OSError:
+        keys = 0
+    out: dict = {"kind": "none", "caveat": NO_DATA_CAVEAT,
+                 "source": str(GEMINI_KEYS)}
+    if keys:
+        try:
+            idx = int(GEMINI_ROT.read_text(encoding="utf-8").strip()) % keys
+        except (OSError, ValueError, ZeroDivisionError):
+            idx = None
+        out["keys"] = keys
+        out["key_index"] = idx
+        out["note"] = (
+            f"остатка Generative Language API не отдаёт вовсе (проверено: "
+            f"/v1beta/quota и /v1beta/usage → 404, x-ratelimit-* нет). "
+            f"Известно только: ключей в ротации {keys}"
+            + (f", активен №{idx + 1}" if idx is not None else "")
+            + f"; exit 3 у gemini-http = все {keys} получили 429.")
+    else:
+        out["note"] = (f"остатка провайдер не сообщает, а ключей в "
+                       f"{GEMINI_KEYS} не нашлось")
+    if "gemini" in room:
+        out["room_at"] = room["gemini"].get("at")
+        out["room_text"] = room["gemini"].get("text")
+    return out
+
+
+# Последний УДАЧНЫЙ замер по голосу. Отказ эндпоинта (429 на опрос,
+# сеть, протухший токен) больше не стирает показания с экрана: Автор
+# видел «Клод не видит опять», хотя час назад числа были — показываем
+# их со СТАРЫМ временем замера (возраст и так подписан) и причиной,
+# почему свежих нет. Наказ 2026-08-27.
+_LAST_GOOD: dict[str, dict] = {}
+
+
+def _has_numbers(res: dict) -> bool:
+    """Есть ли в замере ЖИВОЕ число. Ревизия сняла две дыры: пустой
+    kind=number («объявлено, не прислано») затирал настоящий последний
+    удачный (kimi), а любой непустой limits — даже сплошные отказы —
+    считался успехом (codex)."""
+    if not res or res.get("kind") != "number" or res.get("stale_reason"):
+        return False
+    rows = res.get("limits") if isinstance(res.get("limits"), list) else [res]
+    return any(isinstance(r, dict)
+               and any(isinstance(r.get(k), (int, float))
+                       for k in ("known", "used", "left"))
+               for r in rows)
+
+
+# ── подписки CLI: дата окончания и статус (наказ Автора 2026-09-23) ──
+# Повод: у Codex 15.09 кончилась подписка, стол это проморгал — панель
+# показывала расход, а не срок. Здесь ТОЛЬКО то, что провайдер отдаёт
+# бесплатно и что уже лежит на диске: JWT Codex (план и
+# chatgpt_subscription_active_until), профиль Claude (has_claude_max /
+# subscription_status — даты продления Anthropic не отдаёт),
+# /rest/subscriptions Грока (status, billingPeriodEnd). Kimi и DeepSeek
+# живут на балансе — подписки у них нет, и это названо, а не молчит.
+CLAUDE_PROFILE = "https://api.anthropic.com/api/oauth/profile"
+_SUB_STATE: dict[str, str] = {}      # прошлое состояние на процесс — для заметки о переходе
+SUB_NONE_BALANCE = "оплата по балансу — подписки нет, срок не применим"
+
+
+def _jwt_payload(token: str) -> dict:
+    """Тело JWT без проверки подписи: нам нужна только дата, которую
+    провайдер сам вписал в токен CLI."""
+    try:
+        part = token.split(".")[1]
+        part += "=" * (-len(part) % 4)
+        d = json.loads(base64.urlsafe_b64decode(part))
+        return d if isinstance(d, dict) else {}
+    except Exception:                                   # noqa: BLE001
+        return {}
+
+
+def _sub_state(until_iso: str | None, active: bool | None, soft: bool = False) -> str:
+    """active / ending (меньше 7 дней) / expired / unknown.
+
+    soft=True — дата СПРАВОЧНАЯ (оценка у Claude, сброс месячной квоты
+    у Kimi), а не срок подписки: из неё не выводятся ни ending, ни
+    expired — иначе «⚠ подписка до…» вспыхивало бы неделю каждый месяц
+    у автопродляемого плана (ревизия 23.09: kimi, deepseek, grok, субагент).
+
+    Флаг провайдера СИЛЬНЕЕ даты: план free с датой в будущем или
+    неактивная подписка Грока с недавним billingPeriodEnd иначе
+    показывались бы «активна» (grok, kimi). Дата лишь уточняет живую:
+    меньше недели — ending."""
+    if active is False:
+        return "expired"
+    if soft:
+        return "active" if active is True else "unknown"
+    if until_iso:
+        try:
+            dt = datetime.fromisoformat(str(until_iso).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)   # naive — UTC, не локаль (kimi)
+            left = dt.timestamp() - time.time()
+            if left < 0:
+                # флаг «жива» при прошедшей дате — не «истекла», а снимок
+                # устарел (граница биллинга у Грока, старый JWT Codex):
+                # stale с датой в подсказке (субагент)
+                return "stale" if active is True else "expired"
+            if left < 7 * 86400:
+                return "ending"
+            return "active"
+        except ValueError:
+            pass
+    if active is True:
+        return "active"
+    return "unknown"
+
+
+def _sub_codex() -> dict:
+    try:
+        tk = json.loads(CODEX_AUTH.read_text(encoding="utf-8"))["tokens"]
+    except Exception as e:                              # noqa: BLE001
+        return {"state": "unknown", "note": f"нет {CODEX_AUTH}: {type(e).__name__}"}
+    j = _jwt_payload(tk.get("id_token") or tk.get("access_token") or "")
+    auth = j.get("https://api.openai.com/auth") or {}
+    plan = auth.get("chatgpt_plan_type") or ""
+    until = auth.get("chatgpt_subscription_active_until")
+    checked = auth.get("chatgpt_subscription_last_checked")
+    if plan == "free":
+        # free: была подписка (дата в прошлом) — истекла; не было — нет
+        # подписки. Первая редакция гасила это флагом до разбора даты, и
+        # ветка «none» была мёртвой (kimi, субагент).
+        st = "expired" if _sub_state(until, None) == "expired" else "none"
+    else:
+        st = _sub_state(until, True if plan else None)
+    return {"state": st, "plan": plan, "until": until,
+            "checked_at": checked,
+            "source": "JWT из ~/.codex/auth.json (chatgpt_subscription_active_until)",
+            "note": ("план free: подписки нет, платные модели CLI отвергает"
+                     if plan == "free" else "")}
+
+
+def _sub_claude() -> dict:
+    try:
+        oauth = json.loads(CLAUDE_CREDS.read_text(encoding="utf-8")).get("claudeAiOauth") or {}
+        token = oauth["accessToken"]
+    except Exception as e:                              # noqa: BLE001
+        return {"state": "unknown", "note": f"нет {CLAUDE_CREDS}: {type(e).__name__}"}
+    plan = oauth.get("subscriptionType") or ""
+    code, d, err = _get_json(CLAUDE_PROFILE, {
+        "Authorization": f"Bearer {token}", "anthropic-beta": "oauth-2025-04-20",
+        "User-Agent": "claude-cli/roundtable"})
+    if not isinstance(d, dict):
+        return {"state": "unknown", "plan": plan, "source": CLAUDE_PROFILE,
+                "note": f"профиль не ответил — {err}"}
+    org = d.get("organization") or {}
+    acc = d.get("account") or {}
+    status = org.get("subscription_status")
+    # trialing / past_due — жива с оговоркой, не «истекла» (kimi);
+    # незнакомый статус — unknown, а не догадка
+    if status in ("active", "trialing", "past_due"):
+        active: bool | None = True
+    elif status in ("canceled", "cancelled", "incomplete_expired", "unpaid", "expired"):
+        active = False
+    elif status:
+        active = None
+    else:
+        hm = acc.get("has_claude_max") or acc.get("has_claude_pro")
+        active = bool(hm) if hm is not None else None
+    since = org.get("subscription_created_at")
+    est = _monthly_anniversary(since) if active else None
+    return {"state": _sub_state(est, active, soft=True),
+            "plan": (plan or org.get("organization_type") or "")
+                    + (f" ({status})" if status in ("trialing", "past_due") else ""),
+            "status": status, "since": since,
+            "until": est, "estimated": bool(est),
+            "until_kind": "оценка: следующее списание по месячному циклу от даты подключения",
+            "source": CLAUDE_PROFILE,
+            "note": "дату продления Anthropic не отдаёт: известен статус и дата "
+                    "подключения; «до» — ОЦЕНКА по месячному циклу от неё (наказ "
+                    "Автора 2026-09-23: срок показывать), не факт провайдера"}
+
+
+def _monthly_anniversary(since_iso: str | None, now: float | None = None) -> str | None:
+    """Ближайшая (после now) месячная годовщина даты since — как оценка
+    следующего списания; день переносится на последний день короткого
+    месяца. None — даты нет или она кривая."""
+    if not since_iso:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(since_iso).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    now_dt = datetime.fromtimestamp(now if now is not None else time.time(), timezone.utc)
+    import calendar
+    y, m = now_dt.year, now_dt.month
+    for _ in range(3):
+        day = min(dt.day, calendar.monthrange(y, m)[1])
+        cand = dt.replace(year=y, month=m, day=day)
+        if cand > now_dt:
+            return cand.isoformat().replace("+00:00", "Z")
+        m += 1
+        if m > 12:
+            m, y = 1, y + 1
+    return None
+
+
+def _sub_kimi() -> dict:
+    """Подписка Kimi Code через временный `kimi web`: состояние входа
+    (/api/v1/auth: authenticated / expired / revoked / unauthenticated),
+    уровень (/oauth/userinfo: userLevelName — Plus, Pro, …), дата —
+    сброс МЕСЯЧНОЙ квоты (/oauth/usage: monthTotal.resetAt): дату
+    окончания самой подписки Kimi через CLI не отдаёт, и подписывать
+    сброс квоты как «до» без оговорки нельзя (правило 8.5)."""
+    snap = kimi_plan_snapshot()
+    auth = snap.get("auth")
+    if not isinstance(auth, dict) or auth.get("error"):
+        return {"state": "unknown", "source": "kimi web → /api/v1/auth",
+                "note": f"вход не проверился: {(auth or {}).get('error') if isinstance(auth, dict) else 'kimi web не ответил'}"}
+    mp = auth.get("managed_provider")
+    if not isinstance(mp, dict):
+        return {"state": "none", "source": "kimi web → /api/v1/auth",
+                "note": "подписка Kimi Code не подключена: провайдера managed:kimi-code "
+                        "в конфиге нет — вход командой `kimi login`"}
+    status = str(mp.get("status") or "")
+    active = {"authenticated": True, "expired": False, "revoked": False,
+              "unauthenticated": False}.get(status)
+    ui = snap.get("userinfo")
+    plan = ""
+    if isinstance(ui, dict) and ui.get("kind") == "ok":
+        plan = str((ui.get("userInfo") or {}).get("userLevelName") or "")
+    until = None
+    us = snap.get("usage")
+    if isinstance(us, dict) and us.get("kind") == "ok":
+        mt = ((us.get("quota") or {}).get("usages") or {}).get("monthTotal") or {}
+        if isinstance(mt.get("resetAt"), str):
+            until = mt["resetAt"]
+    st = _sub_state(until, active, soft=True) if status == "authenticated" else (
+        "expired" if status in ("expired", "revoked") else "none")
+    return {"state": st, "plan": plan, "until": until, "status": status,
+            "until_kind": "сброс месячной квоты",
+            "source": "kimi web → /api/v1/auth, /oauth/userinfo, /oauth/usage",
+            "note": ("дата — сброс месячной квоты плана (дату окончания подписки "
+                     "Kimi через CLI не отдаёт); вход: " + status)
+                    if status == "authenticated" else
+                    f"вход в Kimi Code: {status or '?'} — `kimi login`"}
+
+
+def _sub_grok() -> dict:
+    try:
+        auth = json.loads(GROK_AUTH.read_text(encoding="utf-8"))
+        token = next(v.get("key") for v in auth.values()
+                     if isinstance(v, dict) and v.get("key"))
+    except Exception as e:                              # noqa: BLE001
+        return {"state": "unknown", "note": f"нет токена в {GROK_AUTH}: {type(e).__name__}"}
+    code, d, err = _get_json(GROK_SUBS, {
+        "Authorization": f"Bearer {token}", "Accept": "application/json",
+        "User-Agent": "grok-cli/1.0.3"})
+    if not isinstance(d, dict):
+        return {"state": "unknown", "source": GROK_SUBS, "note": f"не ответил — {err}"}
+    subs = [x for x in (d.get("subscriptions") or []) if isinstance(x, dict)]
+    if not subs:
+        return {"state": "none", "source": GROK_SUBS, "note": "подписок у аккаунта нет"}
+    act = [x for x in subs if x.get("status") == "SUBSCRIPTION_STATUS_ACTIVE"]
+    x = act[0] if act else max(subs, key=lambda y: str(y.get("modTime") or ""))
+    pe = x.get("billingPeriodEnd") or (x.get("stripe") or {}).get("currentPeriodEnd")
+    if isinstance(pe, str) and pe.isdigit():
+        pe = float(pe)                                   # epoch строкой (субагент)
+    if isinstance(pe, (int, float)):
+        pe = _iso(pe / (1000 if pe > 2e10 else 1))
+    tier = str(x.get("tier") or "").replace("SUBSCRIPTION_TIER_", "").lower()
+    return {"state": _sub_state(pe, bool(act)), "plan": tier, "until": pe,
+            "status": str(x.get("status") or "").replace("SUBSCRIPTION_STATUS_", "").lower(),
+            "source": GROK_SUBS}
+
+
+_SUB_CACHE: dict = {"ts": 0.0, "data": {}}
+SUB_TTL = 3600           # профиль и подписки — раз в час, не каждый проход лимитов (kimi)
+
+
+def collect_subscriptions(force: bool = False) -> dict[str, dict]:
+    if not force and _SUB_CACHE["data"] and time.time() - _SUB_CACHE["ts"] < SUB_TTL:
+        return dict(_SUB_CACHE["data"])
+    jobs = {"claude": _sub_claude, "codex": _sub_codex, "grok": _sub_grok,
+            "kimi": _sub_kimi}
+    out: dict[str, dict] = {}
+    with ThreadPoolExecutor(max_workers=len(jobs)) as ex:
+        futs = {ex.submit(fn): n for n, fn in jobs.items()}
+        for f in as_completed(futs):
+            n = futs[f]
+            try:
+                out[n] = f.result()
+            except Exception as e:                      # noqa: BLE001
+                out[n] = {"state": "unknown", "note": f"сборщик упал: {type(e).__name__}: {e}"}
+    for n in ("deepseek", "gemini"):
+        out[n] = {"state": "none", "note": SUB_NONE_BALANCE if n != "gemini"
+                  else "ключи API без подписки — срок не применим"}
+    out["typesafe"] = {"state": "none", "note": "предоплата кредитами — подписки нет, срок не применим"}
+    for v in out.values():
+        v["checked_by_window_at"] = _iso(time.time())
+    _SUB_CACHE.update(ts=time.time(), data=dict(out))
+    return out
+
+
+def _sub_transitions(subs: dict[str, dict]) -> list[dict]:
+    """Заметки о переходе в expired — один раз на переход; в память
+    состояний только определённые (unknown после сбоя сети — не
+    переход: иначе «истекла» повторялось бы после каждого сбоя — kimi)."""
+    notes = []
+    for name, sub in subs.items():
+        cur = sub.get("state")
+        if cur not in ("active", "ending", "expired", "none", "stale"):
+            continue
+        prev = _SUB_STATE.get(name)
+        if prev is not None and prev != cur and cur == "expired":
+            until = str(sub.get("until") or "")[:10]
+            notes.append({"voice": name, "text": f"⛔ подписка CLI {name} истекла"
+                          + (f" ({until})" if until else "")
+                          + (f" · план {sub.get('plan')}" if sub.get("plan") else ""),
+                          "subscription": sub})
+        _SUB_STATE[name] = cur
+    return notes
+
+
+# ── TypeSafe (Jev): не голос, но счёт (решение Автора 2026-10-08) ─────
+# У API TypeSafe НЕТ ручки баланса: /v1/usage, /v1/balance, /v1/account —
+# 404, в ответах нет заголовков лимита (замер jev.py, 2026-09-19). Поэтому
+# остаток — РАСЧЁТ: снимок с консоли (`jev config set credits <usd>`,
+# ~/.config/typesafe/config.json) минус расход, записанный с момента
+# снимка: журнал jev.py (usage.jsonl — вызовы с этой машины напрямую) плюс
+# события `jev` ленты (вызовы голосов через прокси стола: их jev.py в
+# клетке пишет в tmpfs, и в журнал они не попадают). Вызовы с других
+# машин и ключей не видны — об этом подпись шкалы.
+TS_DIR = Path.home() / ".config" / "typesafe"
+TS_PRICE = 0.042            # USD за миллион входных токенов (jev-1.13); выход бесплатен
+
+
+def _lim_typesafe() -> dict:
+    try:
+        has_key = bool(jevproxy.KEY_FILE.read_text(encoding="utf-8").strip())
+    except OSError:
+        has_key = False
+    if not has_key:
+        return _no_data("ключа TypeSafe нет (~/.config/typesafe/api_key): `jev auth set`")
+    try:
+        cfg = json.loads((TS_DIR / "config.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        cfg = {}
+    price = float(cfg.get("price_per_mtok_in") or TS_PRICE)
+    credits = cfg.get("credits_usd")
+    as_of = str(cfg.get("credits_as_of") or "")
+    now = time.time()
+
+    def _ts(x: str) -> float:
+        try:
+            return datetime.fromisoformat(x.replace("Z", "+00:00")).timestamp()
+        except (ValueError, AttributeError):
+            return 0.0
+    since = _ts(as_of) if as_of else 0.0
+    tok_since = tok_30d = 0
+    rows = calls_since = 0
+    try:
+        for ln in (TS_DIR / "usage.jsonl").read_text(encoding="utf-8").splitlines():
+            try:
+                r = json.loads(ln)
+            except ValueError:
+                continue
+            t = _ts(str(r.get("ts") or ""))
+            n = int(r.get("in") or 0)
+            if t >= now - 30 * 86400:
+                tok_30d += n
+            if t >= since:
+                tok_since += n; calls_since += 1
+            rows += 1
+    except OSError:
+        pass
+    proxy_calls = 0
+    try:
+        for e in live.read_events(all_projects=True):
+            if e.get("kind") != "jev":
+                continue
+            t = _ts(str(e.get("ts") or ""))
+            try:
+                n = int(e.get("input_tokens") or 0)
+            except (TypeError, ValueError):
+                n = 0
+            if t >= now - 30 * 86400:
+                tok_30d += n
+            if t >= since:
+                tok_since += n; proxy_calls += 1
+    except Exception:                                   # noqa: BLE001
+        pass
+    src = "~/.config/typesafe/config.json (снимок консоли) − usage.jsonl − события jev ленты"
+    gauges = [_gauge("расход 30 дн", meaning="used", known=round(tok_30d / 1e6 * price, 6), unit="usd",
+                     measured_at=_iso(now), source=src,
+                     note=f"{tok_30d} входных токенов за 30 дней по {price} USD/Mtok; выход бесплатен")]
+    if credits is not None:
+        try:
+            left = float(credits) - tok_since / 1e6 * price
+        except (TypeError, ValueError):
+            left = None
+        if left is not None:
+            gauges.insert(0, _gauge("кредиты", meaning="left", known=round(left, 6), total=float(credits), unit="usd",
+                                    measured_at=_iso(now), source=src,
+                                    note=f"снимок {credits} USD от {as_of[:16] or '?'}; с тех пор {calls_since} вызовов "
+                                         f"напрямую и {proxy_calls} через прокси стола ({tok_since} токенов). "
+                                         f"Вызовы с других машин и ключей не учтены — пересними снимок, когда "
+                                         f"смотришь консоль: jev config set credits <usd>"))
+    return _pack(gauges, available=True,
+                 note=("API остатка не отдаёт (jev.py: /v1/balance и подобные — 404); "
+                       + ("остаток — расчёт от снимка консоли" if credits is not None else
+                          "снимка баланса нет: `jev config set credits <usd>` с консоли console.typesafe.ai — "
+                          "тогда появится шкала остатка")))
+
+
+def typesafe_report(limit: dict) -> dict:
+    """Карточка TypeSafe для панели: не голос (кресла и вкладок нет),
+    галочка серая; есть только счёт."""
+    return {"name": "typesafe", "label": "TypeSafe (Jev)", "not_voice": True,
+            "why": "не голос стола: в кресло не сажается, в комнату и раунды не зовётся — голоса зовут "
+                   "его сами через прокси стола (chamber/jevproxy.py). Здесь — остаток кредитов.",
+            "tabs": {"room": None, "rounds": None, "exec": None},
+            "limit": limit or _no_data("замер ещё не сделан этим окном"),
+            "subscription": {"state": "none", "note": "предоплата кредитами — подписки нет, срок не применим"}}
+
+
+def collect_limits() -> dict[str, dict]:
+    """Один проход по всем источникам.
+
+    Сетевые запросы идут ПАРАЛЛЕЛЬНО и с коротким таймаутом: их шесть,
+    последовательно они складывались бы в полминуты на одном тормозящем
+    провайдере. Вызывается только из фоновой нити (см. limits_now) —
+    в обработчике запроса этого нет никогда, чтобы /voices отвечал
+    быстро и при мёртвой сети.
+
+    Платных вызовов здесь нет ни одного: всё либо чтение диска, либо
+    бесплатный информационный GET."""
+    room = _room_quota()
+    jobs = {
+        "claude": lambda: _lim_claude(room),
+        "codex": _lim_codex,
+        "deepseek": lambda: _lim_deepseek() or (
+            {"kind": "refusal", **room["deepseek"], "source": str(ROOM),
+             "note": "баланс сейчас не запросился; показан последний отказ"}
+            if "deepseek" in room else
+            _no_data("баланс не запросился (нет ключа или сети)")),
+        "kimi": lambda: _lim_kimi(room),
+        "grok": _lim_grok,
+        "gemini": lambda: _lim_gemini(room),
+        "typesafe": _lim_typesafe,        # не голос — счёт (решение Автора 2026-10-08)
+    }
+    out: dict[str, dict] = {}
+    with ThreadPoolExecutor(max_workers=len(jobs)) as ex:
+        futs = {ex.submit(fn): name for name, fn in jobs.items()}
+        for f in as_completed(futs):
+            name = futs[f]
+            try:
+                out[name] = f.result() or _no_data(
+                    "источник этого голоса ничего не вернул")
+            except Exception as e:                  # noqa: BLE001
+                # Падение сборщика — свойство ОКНА, а не квоты голоса, и
+                # называется оно именно так.
+                out[name] = _no_data(f"сборщик лимита упал: "
+                                     f"{type(e).__name__}: {e}")
+    for name in VOICES:
+        out.setdefault(name, _no_data("источник для этого голоса неизвестен"))
+    # Память последнего удачного: свежий отказ не стирает показания.
+    # У голосов, где чисел не бывает в принципе (grok, gemini), памяти
+    # не заводится — их карточки честны сами по себе.
+    for name, res in out.items():
+        if _has_numbers(res):
+            _LAST_GOOD[name] = res
+        elif name in _LAST_GOOD and res.get("monitor_refusal"):
+            # Маскируется ТОЛЬКО отказ САМОГО МОНИТОРА (429 на опрос,
+            # сеть): настоящий отказ квоты голоса — факт о канале, и
+            # прятать его за старыми шкалами значило бы врать ровно в
+            # том месте, ради которого шкалы заведены (grok, deepseek).
+            good = dict(_LAST_GOOD[name])
+            good["stale_reason"] = (res.get("note")
+                                    or res.get("error")
+                                    or f"свежий замер: {res.get('kind')}")
+            out[name] = good
+    # Подписки — рядом с лимитами, тем же фоновым проходом (без платных
+    # вызовов); поле subscription у каждого голоса, даже «нет подписки»
+    subs = collect_subscriptions()
+    for name in out:
+        out[name] = {**out[name], "subscription": subs.get(name) or {"state": "unknown"}}
+    # Переход в expired — одной строкой в ленту, один раз на переход
+    # (grok, kimi: «проморгали» лечится записью, не звонком)
+    for n in _sub_transitions(subs):
+        try:
+            feed_append("note", n["text"], voice=n["voice"], subscription=n["subscription"])
+        except Exception as e:                          # noqa: BLE001
+            # не записалось — переход не «состоялся»: следующий проход
+            # повторит заметку (grok)
+            _SUB_STATE.pop(n["voice"], None)
+            print(f"заметка о подписке не записана: {e}", file=sys.stderr)
+    return out
+
+
+def _refresh() -> None:
+    data = None
+    try:
+        data = collect_limits()
+    except Exception as e:                      # noqa: BLE001
+        print(f"/voices: сбор лимитов упал: {e}", file=sys.stderr)
+    finally:
+        # finally, а не хвост тела: при BaseException (или падении до
+        # входа в try) флаг busy оставался поднятым НАВСЕГДА, и
+        # limits_now больше никогда не запускала обновление — шкалы
+        # застывали, а подпись «замер N назад» честно старела
+        # (нашёл ревьюер дифа).
+        with _LIM_LOCK:
+            if data is not None:
+                _LIM["data"], _LIM["ts"] = data, time.time()
+            _LIM["error"] = data is None
+            # Ошибка должна быть видна опросу /voices: не запускать
+            # новый сбор каждым GET при оставшемся старом снимке.
+            _LIM["retry_at"] = time.time() + LIMITS_TTL if data is None else 0.0
+            _LIM["busy"] = False
+            _LIM_READY.set()
+
+
+def limits_now(force: bool = False) -> tuple[dict, float]:
+    """Снимок лимитов и время замера. /voices НЕ ЖДЁТ сбора: устаревший
+    снимок отдаётся сразу, обновление уходит в фоновую нить. Ждёт
+    только самый первый запрос за жизнь окна и не дольше FIRST_WAIT —
+    иначе первая же карточка была бы сплошным «unknown», а окно,
+    задумавшееся на секунды, читается как зависшее. force обходит TTL
+    без ожидания; если сбор уже идёт, второй не запускается."""
+    with _LIM_LOCK:
+        now = time.time()
+        stale = now - _LIM["ts"] > LIMITS_TTL and now >= _LIM["retry_at"]
+        if (force or stale) and not _LIM["busy"]:
+            _LIM["busy"] = True
+            _LIM["error"] = False
+            threading.Thread(target=_refresh, daemon=True).start()
+        first = not force and not _LIM["waited"] and _LIM["ts"] == 0.0
+        if first:
+            _LIM["waited"] = True
+    if first:
+        _LIM_READY.wait(FIRST_WAIT)
+    with _LIM_LOCK:
+        return dict(_LIM["data"]), _LIM["ts"]
+
+
+# ── HTTP ─────────────────────────────────────────────────────────────
+class _Server(ThreadingHTTPServer):
+    """Обрыв соединения клиентом (браузер закрыл вкладку или страницу
+    перезагрузили посреди ответа /voices) — не авария окна. Штатный
+    socketserver печатал на это трассу на 20 строк, и она читалась как
+    падение: Автор нажал ^C и прервал идущий веер ревизии (2026-09-16,
+    акт b4874e5c). Теперь — одна строка, без трассы."""
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        # TimeoutError сюда не входит: сокет окна без таймаута, а
+        # таймаут из тела обработчика — чужая авария, не клиент
+        # (ревизия: deepseek, grok, субагент).
+        if isinstance(exc, (BrokenPipeError, ConnectionResetError,
+                            ConnectionAbortedError)):
+            print(f"клиент {client_address[0]}:{client_address[1]} оборвал "
+                  f"соединение ({type(exc).__name__}) — окно живёт дальше",
+                  file=sys.stderr)
+            return
+        super().handle_error(request, client_address)
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *a):                      # тишина в терминале
+        pass
+
+    def _json(self, code: int, obj) -> None:
+        body = json.dumps(obj, ensure_ascii=False).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        # Строка запроса не меняет маршрут: `/?tab=exec` — та же страница
+        # (вкладку выбирает JS), а не «нет такого пути».
+        if self.path.partition("?")[0] == "/":
+            # Значение подставляем ПРИ ОТДАЧЕ, а не в исходнике страницы:
+            # PAGE — константа модуля, а путь известен только после
+            # разбора аргументов. html-экранирование обязательно: в имени
+            # каталога может стоять кавычка, и она разорвала бы атрибут.
+            body = PAGE.replace("__PROJECT_DEFAULT__",
+                                html.escape(PROJECT, quote=True)).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path.partition("?")[0] == "/events":
+            # SSE resume (просил codex): после обрыва клиент шлёт
+            # Last-Event-ID (EventSource — сам, благодаря "id:" в _emit)
+            # или ?after=<id>, и мы продолжаем с непросмотренного места,
+            # а не с «последних 80» — иначе разрыв теряет события.
+            raw = self.headers.get("Last-Event-ID")
+            if raw is None:
+                q = parse_qs(self.path.partition("?")[2])
+                raw = (q.get("after") or [None])[0]
+            try:
+                after = int(raw) if raw is not None else None
+            except ValueError:
+                after = None
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            self._stream(after)
+        elif self.path.partition("?")[0] == "/acts":
+            # Список актов для вкладок вывода: из ВСЕЙ ленты (хвост в 80
+            # событий терял раунды, и вкладка «дирижёр» пустела — Автор,
+            # 2026-09-10), только свой проект, новые первыми.
+            acts: dict = {}
+            order: list = []
+            for e in reversed(live.read_events(all_projects=True)):
+                if e.get("kind") != "act_status" or not e.get("act_id"):
+                    continue
+                if not live.belongs(e, live.PROJECT):
+                    continue
+                aid = e["act_id"]
+                m = re.match(r"^act [0-9a-f]+ (?:принят|done|error|прерван|отвязан|abort|судьба неизвестна)[^:]*: (.*)$",
+                             e.get("text") or "", re.S)
+                rec = acts.get(aid)
+                if rec is None:
+                    rec = acts[aid] = {"id": aid, "label": "", "status": e.get("status"),
+                                       "edit": e.get("edit"), "ts": e.get("ts")}
+                    order.append(aid)
+                if not rec["label"] and m:
+                    rec["label"] = m.group(1).split("\n")[0][:80]
+                if e.get("status") == "accepted":
+                    rec["ts"] = e.get("ts")          # время старта акта
+                if e.get("edit") and not rec["edit"]:
+                    rec["edit"] = e["edit"]
+            with RUN_LOCK:
+                live_ids = set(RUNNING)
+            for a in acts.values():
+                a["running"] = a["id"] in live_ids
+            return self._json(200, {"acts": [acts[a] for a in order[:300]]})
+
+        elif self.path == "/windows":
+            return self._json(200, {"windows": list_windows(), "self": os.getpid()})
+
+        elif self.path.partition("?")[0] == "/secretary":
+            # Вкладка «📜 секретарь» (роль введена Автором 2026-10-06, см.
+            # SECRETARY.md): решения Автора, очередь работ (свёртка событий
+            # queue) и отчёты — всё из ленты, через chamber/secretary.py.
+            # Проект — окна: события секретаря без проекта окна не видны.
+            q = parse_qs(self.path.partition("?")[2])
+            try:
+                n = max(1, min(200, int((q.get("n") or ["30"])[0])))
+            except ValueError:
+                n = 30
+            try:
+                st = secretary.state(n, project=str(PROJECT) if PROJECT else None,
+                                     all_projects=not PROJECT)
+                # очередь вкладке: ВСЕ открытые + последние n закрытых — иначе
+                # открытый пункт старше n добавлений пропадал бы (ревизия)
+                allq = secretary.fold_queue(project=str(PROJECT) if PROJECT else None,
+                                            all_projects=not PROJECT)
+                closed = [i for i in allq if i["status"] in ("done", "dropped")][-n:]
+                st["queue_all"] = [i for i in allq if i["status"] in ("open", "started") or i in closed]
+                # диалог Автора с секретарём — события sec этого проекта
+                evs = live.read_events(all_projects=True)
+                st["dialogue"] = [e for e in evs if e.get("kind") == "sec"
+                                  and (not PROJECT or live.belongs(e, PROJECT))][-n:]
+                with RUN_LOCK:
+                    st["running"] = [aid for aid, t in RUNNING.items() if str(t.get("label", "")).startswith("секретарь:")]
+                st["token_ok"] = _sec_token_ok(self.headers.get("X-RT-Token"))
+                st.update(sec_agents_report())
+                try:
+                    # строка для терминала: только показ, окно ничего не запускает
+                    st["resume"] = secretary_turn.resume_command(str(Path(PROJECT or _HERE).resolve()))
+                except Exception as e:                  # noqa: BLE001
+                    st["resume"] = {"error": f"{type(e).__name__}: {e}"[:200]}
+                try:
+                    st["ideas"] = ideas_view(str(PROJECT) if PROJECT else None)
+                except Exception as e:                  # noqa: BLE001  накопитель не роняет вкладку
+                    st["ideas"] = {"items": [], "fresh": [], "error": f"{type(e).__name__}: {e}"[:200]}
+            except Exception as e:                          # noqa: BLE001
+                return self._json(500, {"error": f"секретарь: {e}"})
+            return self._json(200, st)
+
+        elif self.path.partition("?")[0] == "/act_view":
+            q = parse_qs(self.path.partition("?")[2])
+            act = (q.get("act") or [""])[0].strip()
+            if not re.fullmatch(r"[0-9a-f]{8,32}", act):
+                return self._json(400, {"error": "act — 8–32 hex-символов"})
+            try:
+                return self._json(200, act_view(act))
+            except merge_gate.GateRefused as e:
+                return self._json(404, {"error": str(e)})
+            except Exception as e:                          # noqa: BLE001
+                return self._json(500, {"error": f"карточка акта: {e}"})
+
+        elif self.path.partition("?")[0] == "/act_log":
+            q = parse_qs(self.path.partition("?")[2])
+            aid = (q.get("id") or [""])[0].strip()
+            kind = (q.get("kind") or ["act"])[0]
+            edit = (q.get("edit") or [""])[0].strip()
+            try:
+                since = max(0, int((q.get("since") or ["0"])[0]))
+            except ValueError:
+                since = 0
+            if not re.fullmatch(r"[0-9a-f]{6,32}", aid) or (
+                    edit and not re.fullmatch(r"[0-9a-f]{6,32}", edit)):
+                return self._json(400, {"error": "id акта — 6–32 hex-символов"})
+            if kind not in ("act", "raw", "chair"):
+                return self._json(400, {"error": "kind: act | raw | chair"})
+            path, source = _act_log_path(aid, kind, edit)
+            if path is None:
+                # ФАЙЛА НЕТ — ИЗ ЛЕНТЫ (наказ Автора 2026-10-08: «нажав на надпись
+                # в окне пусто»): стенограммы 94 из 96 актов окна RoundTable
+                # стёрла уборка до 06.10; события акта и ответы раунда целы —
+                # показываем их, назвав источником ленту, а не стенограммой
+                text = _act_from_feed_cached(aid)
+                if not text:
+                    return self._json(404, {"error": f"лога акта {aid} нет, и в ленте событий этого акта нет"})
+                size = len(text.encode("utf-8"))
+                # since — как у файла: отдано всё → пусто (иначе вкладка дописывала бы
+                # текст заново каждую секунду и перечитывала ленту; ревизия)
+                return self._json(200, {"text": text if since < size else "", "next": size, "size": size,
+                                        "more": False, "skipped": False, "done": True, "source": "feed",
+                                        "missing": True, "id": aid, "reset": since > size})
+            with RUN_LOCK:
+                alive = aid in RUNNING or (
+                    bool(edit) and any(t.get("edit") == edit for t in RUNNING.values()))
+            head = (q.get("head") or ["0"])[0] == "1"
+            try:
+                out = _read_log_tail(path, since, alive, head=head)
+            except OSError as e:
+                return self._json(500, {"error": f"лог не читается: {e}"})
+            out.update(done=not alive, source=source, id=aid)
+            return self._json(200, out)
+
+        elif self.path == "/state":
+            with RUN_LOCK:
+                # round/auto отдаём отдельными полями, а не оставляем
+                # странице разбирать подпись: подпись — текст для
+                # человека, и её правка не должна ломать кнопку «Стоп».
+                running = [{"id": aid,
+                            "label": t["label"], "voices": t["voices"],
+                            "for_s": int(time.time() - t["since"]),
+                            "round": t.get("round"),
+                            "edit": t.get("edit"),
+                            "auto": bool(t.get("auto"))}
+                           for aid, t in RUNNING.items()]
+            with LOT_LOCK:
+                lot = _lot_load()
+                winner = lot_winner(lot) if lot else None
+            try:
+                summary = merge_gate.acts_summary(limit=200)   # один вызов: кэш по limit
+                acts = [a for a in summary
+                        if live.belongs({"project": a.get("project")}, live.PROJECT)][:12]
+                pending_list = _pending_rows(merge_gate.pending_acts(), summary)
+                pending = len(pending_list)
+            except Exception as e:              # noqa: BLE001
+                print(f"/state acts: {e}", file=sys.stderr)
+                acts = None                     # None ≠ [] — «не собралось»
+                pending = None
+                pending_list = None
+            with RUN_LOCK:
+                queued = len(_REVIEW_QUEUE)
+            self._json(200, {"voices": VOICES, "running": running,
+                             # ждут ревизии / в очереди на веер: дыры
+                             # автоматики должны быть видны (kimi)
+                             "pending_reviews": pending,
+                             # кто именно ждёт приёмки — список, не только
+                             # число (Автор 2026-10-06: «кто ждёт? где список?»)
+                             "pending_acts": pending_list,
+                             "review_queue": queued,
+                             "goal": _last_goal(),
+                             "edit_voices": sorted(edits.EDIT_VOICES),
+                             "anchor_cap": anchor_mod.ANCHOR_CAP,   # потолок якоря — из сервера, не из JS
+                             "anchor_bad_status": list(anchor_mod.BAD_STATUS),   # статусы-отказы — тот же список, что у resolve
+                             "sec_key": _sec_token_file().name.split(".", 1)[1],   # ключ проекта для токена в браузере (не сам токен)
+                             "exec_pool": edits.random_pool(),
+                             "acts": acts,
+                             # Режим объявлен только теперь, когда он
+                             # ДЕЙСТВИТЕЛЬНО обслуживается сервером:
+                             # раньше страница тянула голос сама, потому
+                             # что сервер о quick молчал.
+                             "modes": ["say", "ask", "quick"],
+                             "lot": ({"commit": lot["commit"][:16],
+                                      "target": lot["target"],
+                                      "conductor": winner} if lot else None)})
+        elif self.path.partition("?")[0] == "/access":
+            # ACCESS.txt проекта — окну на показ: текст как есть, разбор
+            # и отвергнутые строки (те же проверки, что у комнаты).
+            qs = parse_qs(self.path.partition("?")[2])
+            rp, err = _access_project((qs.get("project") or [""])[0])
+            if err:
+                return self._json(400, {"error": err})
+            return self._json(200, _access_view(rp))
+        elif self.path.partition("?")[0] == "/round_view":
+            # Ответы раунда — В ОКНО (наказ Автора 2026-09-03: «ожидаю
+            # увидеть полный ответ и расшифровку каждого голоса, а не
+            # act done»). Читаем room.jsonl, ничего не переписываем и
+            # не копируем в live.jsonl: журнал раунда один, окно —
+            # его читатель.
+            qs = parse_qs(self.path.partition("?")[2])
+            name = (qs.get("name") or [""])[0].strip()
+            if not re.fullmatch(ROUND_RE, name):
+                return self._json(400, {"error": "имя раунда"})
+            return self._json(200, round_view(name))
+        elif self.path.partition("?")[0] == "/voices":
+            # Карточки голосов: чем отвечает каждый и что о его лимите
+            # известно. Лимиты — из кэша (см. limits_now): окно не имеет
+            # права задумываться на секунды, когда его опрашивают.
+            limits_now()
+            with _LIM_LOCK:
+                limits, lts = dict(_LIM["data"]), _LIM["ts"]
+                refreshing, error = _LIM["busy"], _LIM["error"]
+            self._json(200, {
+                "ts": _now(),
+                "limits_refreshing": refreshing,
+                "limits_error": error,
+                "limits_measured_at": _iso(lts) if lts else None,
+                "limits_age_s": int(time.time() - lts) if lts else None,
+                "voices": [voice_report(
+                    n, limits.get(n) or {"kind": "unknown",
+                                         "note": "замер ещё не сделан "
+                                                 "этим окном"})
+                           for n in VOICES]
+                          # TypeSafe — последним, не голос: серая галочка, только счёт
+                          + [typesafe_report(limits.get("typesafe") or {})]})
+        else:
+            self._json(404, {"error": "нет такого пути"})
+
+    def _stream(self, after: int | None = None):
+        """Хвост ленты в SSE. Без after — последние 80 событий; с after —
+        всё, что новее (id > after): переподключение продолжает чтение,
+        а не перечитывает. Ротации у live.jsonl нет, инода стабильна."""
+        try:
+            with open(FEED, "r", encoding="utf-8") as f:
+                # Окно видит ТОЛЬКО свой проект (поле события; старые
+                # события без поля — у окон стола и песочницы): новый
+                # каталог начинается с пустой ленты (наказ Автора
+                # 2026-09-10). Хвост в 80 — из событий проекта.
+                # Разбирать ВСЮ ленту на каждое подключение дорого (все
+                # трое ревьюеров): хвост в 80 собирается с конца, а после
+                # Last-Event-ID разбираются только строки новее него.
+                lines = f.readlines()
+                if after is None:
+                    tail = []
+                    for ln in reversed(lines):
+                        if _line_in_project(ln):
+                            tail.append(ln)
+                            if len(tail) >= 80:
+                                break
+                    tail.reverse()
+                else:
+                    k = len(lines)
+                    while k > 0:
+                        lid = _line_id(lines[k - 1])
+                        if lid != -1 and lid <= after:     # кривая строка (-1) не останавливает ход назад (ревьюер)
+                            break
+                        k -= 1
+                    tail = [ln for ln in lines[k:] if _line_in_project(ln)]
+                for line in tail:
+                    self._emit(line)
+                while True:
+                    pos = f.tell()
+                    line = f.readline()
+                    if line.endswith("\n"):
+                        if _line_in_project(line):
+                            self._emit(line)
+                    elif line:
+                        # хвост ещё дописывается вторым процессом —
+                        # отдать полстроки значит скормить UI битый json
+                        f.seek(pos)
+                        time.sleep(0.3)
+                    else:
+                        self.wfile.write(b": keep\n\n")   # heartbeat
+                        self.wfile.flush()
+                        time.sleep(1.0)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return
+
+    def _emit(self, line: str):
+        line = line.strip()
+        if not line:
+            return
+        # "id:" перед data — стандарт SSE: браузерный EventSource сам
+        # запомнит последний id и пришлёт Last-Event-ID при реконнекте
+        eid = _line_id(line)
+        head = f"id: {eid}\n".encode() if eid >= 0 else b""
+        self.wfile.write(head + b"data: " + line.encode() + b"\n\n")
+        self.wfile.flush()
+
+    def _sec_refused(self, path: str) -> None:
+        """Отказ по токену кресла — заметкой в ленту, не чаще раза в 10 минут на
+        клиента и путь: иначе голос из клетки, долбящий POST, флудил бы
+        истину; молчать нельзя — попытка из клетки не должна остаться
+        незамеченной (ревизия: и для /secretary/token)."""
+        key = f"{self.client_address[0]}|{path}"
+        now = time.time()
+        if now - _SEC_REFUSED_AT.get(key, 0) > 600:
+            _SEC_REFUSED_AT[key] = now
+            try:
+                feed_append("note", f"POST {path} отклонён: нет или неверный токен кресла "
+                            "(токен печатается в терминале окна и лежит в <реестр окон>/sec-token.<проект>)",
+                            client=str(self.client_address[0]))
+            except Exception:                           # noqa: BLE001
+                pass
+
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        try:
+            req = json.loads(self.rfile.read(n) or b"{}")
+        except json.JSONDecodeError:
+            return self._json(400, {"error": "кривой json"})
+
+        if self.path == "/act":
+            text = (req.get("text") or "").strip()
+            if not text:
+                return self._json(400, {"error": "пустая реплика"})
+            # Пустой список ≠ «поле не задано». Снять все галочки и
+            # нажать «Сказать» означало рассылку ВСЕМ шести — панель
+            # подписана «кому уйдёт», а эффект был противоположный, и
+            # платный (нашёл ревьюер дифа).
+            raw_voices = req.get("voices")
+            voices = [v for v in (raw_voices or []) if v in VOICES]
+            if raw_voices is not None and not voices:
+                return self._json(400, {"error": "не выбран ни один голос "
+                                        "— отметьте хотя бы одного"})
+            # «Быстрый вопрос» — НЕ синоним say. Подпись кнопки обещает
+            # один канал и дешевизну именно от этого; без --once
+            # live.py после первого ответа продолжал разговор по ВСЕМУ
+            # составу платными вызовами, а поле mode="quick" сервер
+            # просто не читал (нашли grok и kimi независимо).
+            quick = (req.get("mode") or "") == "quick"
+            if quick and req.get("blind"):
+                return self._json(400, {"error": "быстрый вопрос и слепой "
+                                        "ход — разные режимы, вместе не "
+                                        "бывают"})
+            picked_by_server = None
+            if quick and not voices:
+                # Голос не назван — тянет СЕРВЕР, и говорит об этом в
+                # ленту. Это не жребий drand (правило 11 про ведущего, а
+                # не про мелочь), и называть его жребием нельзя.
+                # состав — тот, что отмечен в окне (kimi): снятый галочкой
+                # голос не должен быть оплачен ни первым, ни при передаче
+                pool = [v for v in (req.get("pool") or []) if v in VOICES] or VOICES
+                if any(f"@{v}" in text for v in pool):
+                    # адрес в тексте сильнее случайного выбора: комната
+                    # отдаст слово адресату, и заметка «выбрал сервер»
+                    # врала бы (ревьюер дифа)
+                    picked_by_server = None
+                    voices = list(pool)
+                else:
+                    picked_by_server = secrets.choice(pool)
+                    voices = [picked_by_server]
+            if quick and len(voices) != 1:
+                # Веер по всем шести под подписью «один канал» — это
+                # деньги Автора, потраченные не на то, что он нажал.
+                return self._json(400, {
+                    "error": "быстрый вопрос — ровно к одному голосу",
+                    "got": voices})
+            mode = "ask" if req.get("blind") else "say"
+            # «ПРОДОЛЖИТЬ ОТСЮДА» (раунд prodolzhit-lyuboe-v1; решения
+            # Автора 2026-09-23): клиент шлёт АДРЕС сообщения журнала,
+            # текст вставляет комната сама (правило 8.5: иначе кнопка
+            # приносила бы что угодно под видом цитаты). Здесь — ранний
+            # отказ словами (нет записи, ПАС, отказ канала, сверх потолка
+            # без обрезки), чтобы не платить актом за 400.
+            anchor_addr = str(req.get("anchor") or "").strip()
+            if anchor_addr:
+                try:
+                    anchor_resolve(anchor_addr)
+                except anchor_mod.AnchorError as e:
+                    return self._json(400, {"error": f"якорь: {e}"})
+            if mode == "ask":
+                # Барьер слепоты ДВУсторонний: /edit не выдаёт кресло
+                # при слепой фазе, но и слепая фаза не начинается при
+                # выданном кресле — исполнитель с диском может читать
+                # всё, что фаза прячет (нашёл codex: прежний барьер был
+                # односторонним).
+                with RUN_LOCK:
+                    editing = ([t for t in RUNNING.values()
+                                if t.get("edit") and not t.get("gate")]
+                               or (_EDIT_RESERVED - {"review"}))
+                if editing:
+                    return self._json(409, {"error": "идёт правка — "
+                                            "слепой ход не начинается, "
+                                            "пока кресло исполнителя "
+                                            "занято"})
+            args = [mode, text]
+            if anchor_addr:
+                args += ["--anchor", anchor_addr]
+            if quick:
+                args.append("--once")
+            if quick and picked_by_server:
+                # Обещание человеку — ответ, а не канал: выбранный
+                # случайно идёт первым, отказ канала передаёт слово
+                # следующему из состава (наказ Автора 2026-09-10: Грок
+                # выпал без сессии в новом каталоге, и раунд не прошёл).
+                args += ["--voices", ",".join(pool), "--prefer", picked_by_server]
+            elif voices:
+                args += ["--voices", ",".join(voices)]
+            # --project (просил grok): комната обсуждает конкретный
+            # каталог, live.py выдаст его голосам на чтение. Опечатка в
+            # пути возвращается сразу 400-кой, а не событием
+            # act_status/error спустя запуск.
+            project = (req.get("project") or "").strip()
+            if project:
+                # resolve + is_dir: live.py требует каталог и резолвит
+                # путь от СВОЕГО cwd — иначе проверка и использование
+                # смотрят в разные места, а файл проходил как «путь есть».
+                p = Path(project).expanduser()
+                if not p.is_absolute():
+                    p = (SANDBOX / p)
+                p = p.resolve()
+                if not p.is_dir():
+                    return self._json(400,
+                                      {"error": f"не каталог: {p}"})
+                args += ["--project", str(p)]
+            # Два хода на один голос одновременно портят его состояние:
+            # live.py читает-меняет-пишет voices/<имя>/state.json без
+            # межпроцессного замка, и в ленте окажутся две реплики от
+            # РАЗНЫХ сессий одного голоса. Окно делало это доступным в
+            # два клика (нашёл ревьюер дифа).
+            # при передаче после отказа слово может уйти любому из состава —
+            # занятыми считаются все они (ревьюер дифа: иначе два процесса
+            # вели бы нить одного голоса)
+            want = set(pool) if (quick and picked_by_server) else set(voices or VOICES)
+            with RUN_LOCK:
+                busy = {v for t in RUNNING.values() for v in t["voices"]}
+            clash = sorted(want & busy)
+            if clash:
+                return self._json(409, {"error": "уже отвечают: "
+                                        + ", ".join(clash)})
+            # Фактический project — полем в запись accepted: панель и CLI
+            # могут разойтись (симлинк, относительный путь), и без поля
+            # в журнале расхождение невосстановимо (просил ревьюер дифа).
+            acc_fields: dict = {}
+            if project:
+                acc_fields["project"] = str(p)
+            # Краткость — рычаг Автора, а не устав (наказ 2026-09-01).
+            # В ленту пишем ОБЯЗАТЕЛЬНО: иначе через месяц короткий
+            # ответ и урезанный ответ выглядят одинаково, а это разные
+            # вещи — правило 8.5 про поля, не обеспеченные механикой,
+            # работает и в обратную сторону: механика без записи в
+            # журнал делает ленту неверной.
+            brief = bool(req.get("brief"))
+            if brief:
+                acc_fields["brief"] = True
+            peer = bool(req.get("peer"))
+            if peer:
+                acc_fields["peer"] = True
+            if picked_by_server:
+                acc_fields.update(picked_by="server-random",
+                                  voice=picked_by_server)
+            if anchor_addr:
+                acc_fields["anchor_addr"] = anchor_addr   # само поле anchor пишет комната
+            act = spawn([sys.executable, str(CHOIR / "live.py"), *args],
+                        f"{'быстрый' if quick else mode}: {text[:60]}",
+                        (list(pool) if (quick and picked_by_server) else (voices or VOICES)),
+                        # blind в meta — чтобы /edit видел слепую фазу
+                        # и не выдавал кресло, пока она идёт (спека §5).
+                        meta={"blind": True} if mode == "ask" else None,
+                        note=(f"голос выбрал сервер случайно: "
+                              f"{picked_by_server} (secrets.choice из "
+                              f"энтропии ОС — не подстроить, но и не "
+                              f"проверить; НЕ жребий drand). Откажет "
+                              f"канал — слово перейдёт следующему"
+                              if picked_by_server else ""),
+                        fields=acc_fields or None,
+                        env_extra={"CHOIR_BRIEF": "1" if brief else "0",
+                                   "CHOIR_PEER": "1" if peer else "0",
+                                   "CHOIR_THOUGHTS": "1" if req.get("thoughts") else "0"})
+            return self._json(200, {"act": act})
+
+        if self.path == "/secretary/idea":
+            # ИДЕЯ — В ОЧЕРЕДЬ: только кнопкой Автора (решение 2026-10-08: «как не
+            # разветвиться в хлам» — идея сама никуда не идёт). Токен кресла: окно
+            # видно голосам из клетки, очередь — это работа стола
+            if not _sec_token_ok(self.headers.get("X-RT-Token")):
+                self._sec_refused("/secretary/idea")
+                return self._json(403, {"error": "нужен токен кресла секретаря"})
+            iid = str(req.get("id") or "").strip()
+            if not re.fullmatch(r"[0-9a-f]{12}", iid):
+                return self._json(400, {"error": "id идеи — 12 hex"})
+            # проверка «уже взята» и запись — под одним замком: двойное нажатие
+            # и две вкладки не ставят идею дважды (ревизия)
+            with _IDEA_LOCK:
+                _IDEAS_CACHE["feed_fp"] = None
+                view = ideas_view(str(PROJECT) if PROJECT else None, top=10_000, fresh=0)
+                allv = ideas_mod.ledger(_IDEAS_CACHE["recs"] or [], project=str(PROJECT) if PROJECT else None,
+                                        taken=_idea_taken(), belongs=lambda e, pj: live.belongs(e, Path(pj)))
+                it = next((x for x in allv if x.get("id") == iid), None)
+                if it is None:
+                    return self._json(404, {"error": "такого дополнения в накопителе этого проекта нет"})
+                if it.get("taken"):
+                    return self._json(409, {"error": "уже в очереди"})
+                try:
+                    e = secretary.queue_add(
+                        f"Дополнение {it.get('voice')} (раунд «{it.get('round')}», Jev: ступень "
+                        f"{it.get('score') if it.get('score') is not None else '?'}"
+                        + (", в свод не попало" if it.get("lost") else "") + f"): {it.get('text')}",
+                        by="arr", project=str(PROJECT) if PROJECT else None,
+                        idea_id=iid, idea_round=it.get("round"))
+                except SystemExit as ex:
+                    return self._json(400, {"error": str(ex)})
+                _IDEAS_CACHE["feed_fp"] = None
+            return self._json(200, {"item": e.get("id"), "_total": view.get("total")})
+
+        if self.path == "/secretary/token":
+            # СМЕНА ТОКЕНА КРЕСЛА кнопкой (наказ Автора 2026-10-08). Только с
+            # действующим токеном: иначе голос из клетки мог бы сменить его и
+            # запереть Автора из кресла. Новый токен — в ответе (вкладка сама
+            # кладёт его в браузер) и нигде больше; в ленту — факт смены без него.
+            if not _sec_token_ok(self.headers.get("X-RT-Token")):
+                self._sec_refused("/secretary/token")
+                return self._json(403, {"error": "сменить токен можно только с действующим токеном кресла"})
+            try:
+                new = rotate_sec_token(self.headers.get("X-RT-Token"))
+            except PermissionError as e:
+                return self._json(403, {"error": str(e)})
+            except (OSError, RuntimeError) as e:
+                return self._json(409, {"error": f"токен не сменён: {e}"})
+            # сначала — в терминал окна (новый токен не должен остаться только в
+            # файле, если что-то ниже упадёт), лента — без токена и без права
+            # уронить ответ (ревизия)
+            print("кресло секретаря: токен сменён кнопкой — "
+                  + (new if sys.stdout.isatty() else f"новый в {_sec_token_file()} (stdout окна не терминал — токен не печатается)"),
+                  flush=True)
+            try:
+                feed_append("note", f"🔑 токен кресла секретаря проекта сменён из окна :{PORT}; прежний больше не действует "
+                                    f"в окнах этого проекта (вкладки с прежним токеном получат отказ, пока не введут новый); "
+                                    f"у других проектов свои токены — их смена не касается")
+            except Exception as e:                      # noqa: BLE001
+                print(f"заметка о смене токена не записана: {e}", file=sys.stderr)
+            return self._json(200, {"token": new})
+
+        if self.path == "/secretary":
+            # КРЕСЛО СЕКРЕТАРЯ (решение Автора 2026-10-08, SECRETARY.md):
+            # реплика Автора → chamber/secretary_turn.py → агент-посредник с
+            # постоянной нитью на проект, права полные (вне клетки). Сам
+            # ход — акт окна: поток работы во вкладке, итог — событием sec.
+            # ТОКЕН ОБЯЗАТЕЛЕН (см. SEC_TOKEN): без него — отказ и заметка в
+            # ленту, чтобы попытка из клетки не осталась незамеченной
+            if not _sec_token_ok(self.headers.get("X-RT-Token")):
+                self._sec_refused("/secretary")
+                return self._json(403, {"error": "нужен токен кресла секретаря (X-RT-Token): "
+                                        "он напечатан в терминале окна при старте"})
+            text = (req.get("text") or "").strip()
+            if not text:
+                return self._json(400, {"error": "пустая реплика"})
+            if len(text.encode("utf-8")) > 60000:
+                return self._json(400, {"error": "реплика длиннее 60000 байт"})
+            # «продолжить отсюда» — секретарю: адрес проверяется здесь (отказ
+            # словами до запуска), текст вставит secretary_turn по журналу
+            anchor_addr = str(req.get("anchor") or "").strip()
+            if anchor_addr:
+                try:
+                    anchor_resolve(anchor_addr)
+                except anchor_mod.AnchorError as e:
+                    return self._json(400, {"error": f"якорь: {e}"})
+            # ВЕНДОР СЕКРЕТАРЯ — из выпадающего списка вкладки (решение Автора
+            # 2026-10-08); модель и усилие ему даст настройка «комнаты» через
+            # окружение акта (_spawn_env), см. secretary_turn.agent_plan
+            agent = str(req.get("agent") or "claude").strip()
+            if agent not in secretary_turn.AGENTS:
+                return self._json(400, {"error": secretary_turn.NO_CHAIR.get(agent)
+                                        or f"агент «{agent}» в кресло секретаря не сажается",
+                                        "agents": list(secretary_turn.AGENTS)})
+            # одна нить — один ход за раз: параллельный --resume одной сессии
+            # перемешал бы ответы; резерв держится под замком до spawn
+            with RUN_LOCK:
+                busy = [aid for aid, t in RUNNING.items() if str(t.get("label", "")).startswith("секретарь:")]
+                if busy or _SEC_RESERVED:
+                    bid = busy[0] if busy else None
+                    return self._json(409, {"error": f"секретарь ещё отвечает (акт {bid})" if bid
+                                            else "секретарь: идёт запуск предыдущего хода", "act": bid})
+                _SEC_RESERVED.add("pending")
+            try:
+                proj = PROJECT or str(_HERE)
+                ACT_DIR.mkdir(parents=True, exist_ok=True)
+                # файлы реплик, оставшиеся после неудачного spawn, — убрать (старше часа)
+                for old in ACT_DIR.glob("sec-*.txt"):
+                    try:
+                        if time.time() - old.stat().st_mtime > 3600:
+                            old.unlink()
+                    except OSError:
+                        pass
+                tf = ACT_DIR / f"sec-{uuid.uuid4().hex[:8]}.txt"
+                tf.write_text(text, encoding="utf-8")
+                try:
+                    act = spawn([sys.executable, str(CHOIR / "secretary_turn.py"),
+                                 "--project", proj, "--text-file", str(tf),
+                                 *(["--anchor", anchor_addr] if anchor_addr else [])],
+                                f"секретарь: [{agent}] {text[:60]}" + (f" [от {anchor_addr}]" if anchor_addr else ""),
+                                ["secretary"], cwd=CHOIR,
+                                meta={"secretary": True},
+                                fields={"kind_act": "secretary", "project": proj, "rights": "full",
+                                        "agent": agent,
+                                        **({"anchor_addr": anchor_addr} if anchor_addr else {})},
+                                env_extra={"CHOIR_RT_URL": f"http://127.0.0.1:{PORT}",
+                                           "CHOIR_SEC_AGENT": agent})
+                except Exception:
+                    tf.unlink(missing_ok=True)
+                    raise
+            finally:
+                with RUN_LOCK:
+                    _SEC_RESERVED.discard("pending")
+            return self._json(200, {"act": act})
+
+        if self.path == "/round":
+            # Раунды choir.py из окна (просил grok: «иначе ежедневные
+            # раунды остаются в чате с Клодом»). Вопрос — в файл, дальше
+            # два режима, и они РАЗНЫЕ по цене и по смыслу:
+            #   auto=false — цепочка pick → expand → ask одним bash -c:
+            #     шаги строго последовательны (expand читает жребий pick,
+            #     ask — затравку expand), и такт СТОИТ после слепой фазы:
+            #     rebut и summarize запускает человек, посмотрев ответы;
+            #   auto=true — одна команда `choir.py run --rebuts N`: весь
+            #     такт до карточки крутит дирижёр. Здесь намеренно НЕ
+            #     собирается своя цепочка витков в bash -c: два места,
+            #     знающих порядок такта, разойдутся молча — и окно начнёт
+            #     гонять «свой» протокол вместо протокола стола
+            #     (правило 10: молчаливое решение оркестрации однажды
+            #     прочитается как решение стола).
+            # Наказ Автора 2026-08-25: «давайте с кнопкой, но к ней нужна
+            # галочка автонажимание».
+            question = (req.get("question") or "").strip()
+            name = (req.get("name") or "").strip()
+            if not question or not name:
+                return self._json(400, {"error": "нужны question и name"})
+            # Ведущий дефис делал имя похожим на флаг: `--round '-x'` →
+            # argparse «expected one argument», цепочка падала на pick.
+            if not re.fullmatch(ROUND_RE, name):
+                return self._json(400, {"error": "имя раунда: буквы, "
+                                        "цифры, точка, дефис; до 60"})
+            auto = bool(req.get("auto"))
+            # Витков критики 1..3. Потолок не наш, а правила 12: три
+            # витка, дальше «вежливость моделей бесконечна, токены нет».
+            # Проверяем и при auto=false: контракт один, иначе кривое
+            # поле пролезет молча и всплывёт при следующем нажатии — уже
+            # с включённой галочкой и оплаченными вызовами.
+            try:
+                rebuts = int(req.get("rebuts", 1))
+            except (TypeError, ValueError):
+                return self._json(400, {"error": "rebuts — целое 1..3"})
+            if not 1 <= rebuts <= 3:
+                return self._json(400, {"error": "витков 1..3 (правило 12: "
+                                        "потолок — три витка)"})
+            # Состав раунда — галочки вкладки 🎼 (у каждой вкладки свои,
+            # наказ Автора 2026-09-02). Пустой список ≠ «поле не задано»
+            # (тот же довод, что у /act); меньше двух — не раунд: жребий
+            # ведущего из одного и слепая фаза без чужих ответов — не
+            # протокол, а монолог.
+            raw_rv = req.get("voices")
+            rvoices = sorted({v for v in (raw_rv or []) if v in VOICES})
+            cnr = str(req.get("canary") or "").strip()
+            if cnr and (cnr not in VOICES or cnr in (rvoices or list(VOICES))
+                        or live.VOICES.get(cnr, {}).get("no_files")):
+                return self._json(400, {"error": "канарейка: голос с диском, не "
+                                        "из участников раунда (claude/codex/grok/kimi)"})
+            cflag = ["--canary", cnr] if cnr else []
+            # Проект раунда (2026-09-03): без него раунд из окна,
+            # запущенного в другом проекте, шёл про каталог стола (тогда Choir/) — «первый
+            # боевой вызов» Автора. Та же проверка, что у комнаты.
+            # Ключ есть, но пуст — Автор ОЧИСТИЛ поле: без проекта.
+            # Ключа нет (старый клиент, curl) — проект окна, и это
+            # названо в событии полем project_source (kimi, claude).
+            if "project" in req:
+                rproject = str(req.get("project") or "").strip()
+                psrc = "поле окна" if rproject else "поле очищено"
+            else:
+                rproject = str(PROJECT or "")
+                psrc = "каталог запуска окна (поля в запросе не было)"
+            rp: Path | None = None
+            if rproject:
+                rp = Path(rproject).expanduser()
+                if not rp.is_absolute():
+                    rp = SANDBOX / rp
+                rp = rp.resolve()
+                if not rp.is_dir():
+                    return self._json(400, {"error": f"не каталог: {rp}"})
+            pflag = ["--project", str(rp)] if rp else []
+            if raw_rv is not None and not rvoices:
+                return self._json(400, {"error": "не выбран ни один голос "
+                                        "раунда — отметьте хотя бы двух"})
+            if rvoices and len(rvoices) < 2:
+                # Уникальных: ["claude","claude"] — один голос, а не два.
+                return self._json(400, {"error": "раунд — минимум два "
+                                        "разных голоса (жребий ведущего и "
+                                        "слепая фаза из одного бессмысленны)"})
+            # РАЗВИТИЕ ТЕМЫ (наказ Автора 2026-09-20): новый раунд по
+            # итогам прошлого. Свод прошлого раунда уходит в вопрос
+            # ДОСЛОВНО (правило 3), не пересказом; ссылка на родителя —
+            # полем события. Жребий, слепая фаза, витки — заново: это
+            # новый раунд, а не продолжение сессий голосов (правило 9:
+            # первичный ответ неизменяем, уточнение — новой записью).
+            parent = str(req.get("parent") or "").strip()
+            if parent:
+                if not re.fullmatch(ROUND_RE, parent):
+                    return self._json(400, {"error": "родитель: кривое имя раунда"})
+                if parent == name:
+                    return self._json(400, {"error": "развитие раунда не может "
+                                            "носить его же имя"})
+                pv = round_view(parent)
+                if not pv.get("found"):
+                    return self._json(404, {"error": f"раунда «{parent}» в журнале нет"})
+                if not pv.get("summary_ok"):
+                    return self._json(409, {"error": f"у раунда «{parent}» нет "
+                                            "удавшегося свода — развивать нечего"})
+                ps = pv["summary"]
+                question = (question + "\n\n---\n\n"
+                            f"РАЗВИТИЕ РАУНДА «{parent}» (ведущий: "
+                            f"{pv.get('conductor') or '?'}, свод писал: "
+                            f"{ps.get('voice') or '?'}). Ниже — свод прошлого "
+                            "раунда ДОСЛОВНО (правило 3); не пересказывайте "
+                            "его, отталкивайтесь от него — особенно от того, "
+                            "что там названо нерешённым или спорным.\n\n"
+                            # Шапка покрытия родителя — из журнала, перед сводом:
+                            # следующий раунд обязан знать, кого в своде нет.
+                            + ((pv.get("summary_head") + "\n\n") if pv.get("summary_head") else "")
+                            + str(ps.get("text") or "")      # без rstrip: дословно
+                            + f"\n\n--- КОНЕЦ СВОДА раунда «{parent}» ---")
+            # «ПРОДОЛЖИТЬ ОТСЮДА» в раунде: одно сообщение журнала дословно
+            # в вопросе (без имени автора — решение Автора; правило 9:
+            # спорят с доводом, не с именем), автор якоря вне жребия
+            # ведущего и свода, поле anchor — в записи жребия и здесь.
+            # Якорь и «развитие» вместе не бывают: у вопроса один контекст.
+            anchor_addr = str(req.get("anchor") or "").strip()
+            anchor_rec = None
+            if anchor_addr:
+                if parent:
+                    return self._json(400, {"error": "якорь и развитие раунда "
+                                            "вместе не бывают: один контекст "
+                                            "на вопрос"})
+                try:
+                    anchor_rec = anchor_resolve(anchor_addr)
+                except anchor_mod.AnchorError as e:
+                    return self._json(400, {"error": f"якорь: {e}"})
+                lot_pool = [v for v in (rvoices or VOICES) if v != anchor_rec["author"]]
+                if len(lot_pool) < 1:
+                    return self._json(400, {"error": "жребий не из кого: автор "
+                                            "якоря вне жребия, других голосов нет"})
+                question = (question + "\n\n---\n\n"
+                            + anchor_mod.block(anchor_rec, with_author=False)
+                            + "Вопрос Автора выше задан ОТ этого сообщения: "
+                              "отвечайте на вопрос, опираясь на него как на "
+                              "контекст, а не пересказывая его.")
+            rdir = JOURNAL / "rounds" / ((rp.name or "root") if rp else "RoundTable")
+            qfile = rdir / fnames.round_file("QUESTION-", name)
+            # Не переписываем молча: в room.jsonl уже лежит pick с
+            # question_sha от старого текста, и файл разошёлся бы с
+            # журналом беззвучно (нашёл ревьюер дифа).
+            if qfile.exists() and not req.get("force"):
+                return self._json(409, {"error": f"{qfile.name} уже есть — "
+                                        "выберите другое имя раунда"})
+            rdir.mkdir(parents=True, exist_ok=True)   # после 409: отказ не оставляет пустой папки
+            qfile.write_text(question + "\n", encoding="utf-8")
+            # Флаг-стоп с прошлого раза снимаем ЗДЕСЬ и ВСЛУХ. Файл живёт
+            # дольше раунда: забытый стоп остановил бы новый такт с тем
+            # же именем на первой же паузе — молча, будто дирижёр сам
+            # решил не продолжать. Но и молчаливое снятие не годится: в
+            # ленте уже стоит round_stop, и без парной записи она врёт,
+            # что раунд остановлен.
+            stale = stop_file(name)
+            if stale.exists():
+                stale.unlink(missing_ok=True)
+                feed_append("round_stop",
+                            f"флаг-стоп раунда {name} снят: начат новый такт "
+                            f"с тем же именем",
+                            round=name, status="cleared")
+            if auto:
+                # Аргументы списком, без bash -c: имя уже проверено, но
+                # лишний слой кавычек — лишний способ ошибиться.
+                aflag = (["--exclude", anchor_rec["author"], "--anchor", anchor_addr]
+                         if anchor_rec and anchor_rec["author"] in VOICES else
+                         (["--anchor", anchor_addr] if anchor_rec else []))
+                cmd = [sys.executable, str(CHAMBER / "choir.py"), "run", "--round", name,
+                       "--seed", str(qfile), "--rebuts", str(rebuts),
+                       *(["--voices", ",".join(rvoices)] if rvoices else []),
+                       *cflag, *pflag, *aflag]
+                label = f"round: {name} [авто, витков: {rebuts}]" + (f" 🐤 {cnr}" if cnr else "")
+                note = (f"АВТОПРОГОН: такт идёт сам — pick → expand → ask → "
+                        f"rebut ×{rebuts} → summarize, без остановки на "
+                        f"человека. Остановить: кнопка «Стоп» "
+                        f"(флаг {stale.name}).")
+            else:
+                py = shlex.quote(sys.executable)
+                rn = shlex.quote(name)
+                seed = shlex.quote(str(qfile))
+                zt = shlex.quote(str(rdir / fnames.round_file("SEED-", name)))  # его создаст expand
+                # --voices у pick и ask (expand его не знает: ведущий
+                # уже выбран жребием среди названных).
+                vs = (" --voices " + shlex.quote(",".join(rvoices))
+                      if rvoices else "")
+                cs = (" --canary " + shlex.quote(cnr)) if cnr else ""
+                # --project только у pick: он пишет проект в запись
+                # жребия, остальные фазы читают его оттуда (choir.py).
+                pj = (" --project " + shlex.quote(str(rp))) if rp else ""
+                # якорь — только у pick: он пишет его в запись жребия и
+                # выводит автора из жребия; ask получает полный состав
+                af = ""
+                if anchor_rec:
+                    af = " --anchor " + shlex.quote(anchor_addr)
+                    if anchor_rec["author"] in VOICES:
+                        af += " --exclude " + shlex.quote(anchor_rec["author"])
+                cmd = ["bash", "-c",
+                       f"{py} choir.py pick --round {rn} --seed {seed}{vs}{pj}{af} && "
+                       f"{py} choir.py expand --round {rn} --seed {seed} && "
+                       f"{py} choir.py ask --round {rn} --seed {zt}{vs}{cs}"]
+                label = f"round: {name}"
+                note = ("ПО ШАГАМ: pick → expand → ask; после слепой фазы "
+                        "такт останавливается — rebut и summarize "
+                        "запускает человек.")
+            # Режим — отдельными полями события, а не только словами в
+            # тексте: читателю ленты нужна пометка, разбору журнала —
+            # поле (правило 8.5: свойство, объявленное полем, должно
+            # быть обеспечено механикой, и наоборот — механика без поля
+            # в журнале невидима).
+            fields = {"round": name, "auto": auto}
+            if parent:
+                fields["parent"] = parent
+                label += f" [развитие «{parent}»]"
+                note = f"Развитие раунда «{parent}»: его свод — в вопросе дословно. " + note
+            if anchor_rec:
+                fields["anchor"] = anchor_mod.field(anchor_rec)
+                label += f" [от {anchor_addr}]"
+                note = (f"Продолжение от сообщения {anchor_addr} ({anchor_rec['author']}, "
+                        f"{len(anchor_rec['text'])} симв.): оно в вопросе дословно, "
+                        f"без имени автора; автор вне жребия и свода. " + note)
+            if auto:
+                fields["rebuts"] = rebuts
+            if rvoices:
+                fields["voices"] = rvoices
+            if rp:
+                fields["project"] = str(rp)
+                fields["project_source"] = psrc
+            # Краткость — та же опция, что и в комнате: choir.py читает
+            # CHOIR_BRIEF при импорте и подставляет жёсткие рамки в
+            # затравку и свод. Умолчание — полный вывод.
+            brief = bool(req.get("brief"))
+            if brief:
+                fields["brief"] = True
+            act = spawn(cmd, label, rvoices or VOICES, cwd=CHOIR,
+                        meta={"round": name, "auto": auto},
+                        note=note, fields=fields,
+                        env_extra={"CHOIR_BRIEF": "1" if brief else "0",
+                                   "CHOIR_THOUGHTS": "1" if req.get("thoughts") else "0"})
+            return self._json(200, {"act": act, "auto": auto,
+                                    "rebuts": rebuts if auto else None,
+                                    "question_file": qfile.name})
+
+        if self.path == "/edit":
+            # Правка проекта: кресло исполнителя ОДНОМУ голосу на ОДИН
+            # акт (SPEC-ispolnitel-v1, этап 1). Задание уходит CLI
+            # голоса в отдельном worktree; замок держит обёртка
+            # executor_run; вердикт по падению замка выносит
+            # edits.verdict_on_drop — по close ЭТОЙ эпохи.
+            task = (req.get("task") or req.get("text") or "").strip()
+            voice = (req.get("voice") or "").strip() or "random"
+            project = (req.get("project") or "").strip() or str(PROJECT or "")
+            # ПРОДОЛЖИТЬ правку (наказ Автора 2026-09-14): тот же акт,
+            # та же ветка и дерево, исполнитель прежний (или названный),
+            # задание — прежнее + замечания ревизии + слова Автора.
+            cont = (req.get("continue") or "").strip()
+            if cont and not re.fullmatch(r"[0-9a-f]{8,32}", cont):
+                return self._json(400, {"error": "кривой act в continue"})
+            if cont:
+                # проект — ИЗ ИНТЕНТА акта, не из запроса: резерв и
+                # проверка «одно кресло на проект» должны смотреть на тот
+                # же .git, что и продолжение (ревизия: субагент, grok)
+                opn0 = next((e for e in edits._act_events(cont)
+                             if e.get("kind") == "edit_open"), None)
+                if opn0 is None:
+                    return self._json(400, {"error": f"акт {cont} не открывался"})
+                project = opn0.get("project") or project
+            if not task:
+                return self._json(400, {"error": "пустое задание"
+                                        if not cont else
+                                        "пустое продолжение: скажите, что доработать"})
+            if not project:
+                return self._json(400, {"error": "нужен project: правка "
+                                        "без репозитория некуда"})
+            # Два кресла на один project — два CLI в ОДНОМ .git
+            # (writable_roots общий): они ломали бы ветки друг друга
+            # (нашли codex и grok). Кресло одно на проект, и резерв
+            # берётся ПОД ЗАМКОМ: ThreadingHTTPServer гонит два /edit
+            # параллельно, и проверка без резерва оставляла щель между
+            # «свободно» и spawn (codex). Резерв снимается в finally —
+            # к этому моменту spawn уже положил запись в RUNNING.
+            proj_key = str(Path(project).resolve())
+            # Занятость смотрим и В ЛЕНТЕ: RUNNING пуст после рестарта
+            # окна, а исполнитель прежнего акта может быть жив — второй
+            # /edit открыл бы второе кресло в том же .git (нашёл codex;
+            # deepseek добавил: recover в фоне, и до его прохода
+            # эта проверка — единственный заслон).
+            try:
+                for e0 in edits.open_acts_in_feed():
+                    if (e0.get("project") == proj_key
+                            and leases.is_held(e0.get("act") or "")):
+                        return self._json(409, {
+                            "error": "проект уже под правкой "
+                                     f"(акт {e0.get('act')}, по ленте)"})
+            except Exception as e0:             # noqa: BLE001
+                print(f"/edit: проверка ленты: {e0}", file=sys.stderr)
+            picked_note = ""
+            if cont and voice == "random":
+                voice = ""              # продолжение: исполнитель прежний
+            if voice == "random":
+                # ДО резерва: пустой пул с уже взятым резервом оставлял
+                # проект «занятым» до перезапуска окна (нашёл codex), а
+                # пустой пул теперь штатен — галочки вкладки 🔧.
+                pool = edits.random_pool()
+                if not pool:
+                    return self._json(409, {"error": "пул random пуст — "
+                                            "все кресла сняты галочками; "
+                                            "выберите исполнителя явно"})
+                voice = secrets.choice(pool)
+                picked_note = (f"исполнителя выбрал сервер случайно: "
+                               f"{voice} (random.choice по умеющим "
+                               f"правки — НЕ жребий drand)")
+            with RUN_LOCK:
+                if cont and cont in _REBASING:
+                    return self._json(409, {"error": "гейт переносит ветку акта "
+                                            "на main — повторите через минуту"})
+                busy_edit = [t for t in RUNNING.values()
+                             if t.get("edit")
+                             and t.get("edit_project") == proj_key]
+                blind_now = [t for t in RUNNING.values() if t.get("blind")]
+                if not busy_edit and not blind_now:
+                    if proj_key in _EDIT_RESERVED:
+                        busy_edit = [{"edit": "открывается"}]
+                    else:
+                        _EDIT_RESERVED.add(proj_key)
+            if busy_edit:
+                return self._json(409, {"error": "проект уже под правкой "
+                                        f"(акт {busy_edit[0]['edit']})"})
+            if blind_now:
+                # Спека §5: слепые фазы блокируют выдачу кресла —
+                # исполнитель с доступом к диску мог бы прочитать
+                # чужие ответы фазы (правило 8.5: слепота — отсутствием
+                # данных; здесь данных нет, пока кресло не выдано).
+                return self._json(409, {"error": "идёт слепая фаза — "
+                                        "кресло не выдаётся до её конца"})
+            files = req.get("files")
+            if isinstance(files, str):
+                files = [x.strip() for x in files.split(",") if x.strip()]
+            try:
+                try:
+                    if cont:
+                        ed = edits.continue_edit(Path(project), cont, task,
+                                                 voice or None)
+                        voice = ed["voice"]
+                    else:
+                        ed = edits.open_edit(Path(project), task, voice,
+                                             files=files)
+                except edits.EditRefused as e:
+                    return self._json(400, {"error": str(e)})
+                except leases.EpochCorrupt as e:
+                    # Без эпох кресло не выдаётся вовсе — fail-closed.
+                    return self._json(503, {"error": f"эпохи сломаны: {e}"})
+                act, epoch, wt = ed["act"], ed["epoch"], ed["worktree"]
+                try:
+                    _arm_edit_watch(act, epoch, wt, voice)
+                except Exception as e:          # noqa: BLE001
+                    # Интент уже в ленте — спавним всё равно: без
+                    # наблюдателя вердикт донесёт recover/sweep, а вот
+                    # 500 здесь оставил бы дерево брошенным (deepseek).
+                    print(f"/edit: наблюдатель {act} не взведён: {e}",
+                          file=sys.stderr)
+                ckey = f"{act}.{epoch}"
+                if not _canary_lay(ckey, ed["project"]):
+                    ckey = ""
+                spawn([sys.executable,
+                       str(Path(__file__).resolve().parent
+                           / "executor_run.py"),
+                       "--act", act, "--epoch", str(epoch),
+                       "--worktree", str(wt), "--voice", voice,
+                       "--head-before", str(ed.get("head_before") or ed.get("base_sha") or ""),
+                       "--access-json", json.dumps(ed.get("access") or {},
+                                                   ensure_ascii=False),   # снимок ACCESS.txt акта
+                       *(["--serial-gate", voice]
+                         if voice in edits.EDIT_GATES else []),
+                       "--cmd-json",
+                       json.dumps(ed["cmd"], ensure_ascii=False)],
+                      (f"edit: [{voice}] продолжение {act}: {task[:50]}"
+                       if cont else f"edit: [{voice}] {task[:60]}"), [voice],
+                      meta={"edit": act, "epoch": epoch,
+                            "edit_project": str(ed["project"]),
+                            **({"canary": ckey} if ckey else {})},
+                      note=picked_note,
+                      fields={"edit": act, "epoch": epoch, "voice": voice,
+                              **({"continues": cont} if cont else {})},
+                      env_extra={"CHOIR_THOUGHTS": "1" if req.get("thoughts") else "0",
+                                 # gc --auto из кресла ломился бы в packed-refs
+                                 # вне суженных корней записи (ревизия: kimi)
+                                 "GIT_CONFIG_COUNT": "1",
+                                 "GIT_CONFIG_KEY_0": "gc.auto",
+                                 "GIT_CONFIG_VALUE_0": "0"})
+            finally:
+                with RUN_LOCK:
+                    _EDIT_RESERVED.discard(proj_key)
+            return self._json(200, {"act": act, "epoch": epoch,
+                                    "voice": voice, "worktree": str(wt),
+                                    "base_sha": ed["base_sha"]})
+
+        if self.path == "/edit_review":
+            # Ревизия дифа столом: долгая (все голоса параллельно, до
+            # 10 мин) — уходит через spawn, судьба видна как у любого
+            # действия. Платная: подтверждение — на стороне окна.
+            batch = bool(req.get("batch"))
+            act = (req.get("act") or "").strip()
+            if not batch and not re.fullmatch(r"[0-9a-f]{8,32}", act):
+                return self._json(400, {"error": "кривой act"})
+            if batch:
+                # Пустая пачка — отказ ДО спавна: иначе процесс стартует,
+                # тут же падает GateRefused, и в ленте остаётся шумное
+                # act_status error на ровном месте (нашёл deepseek).
+                try:
+                    if not merge_gate.pending_acts():
+                        return self._json(409, {"error": "нет актов, "
+                                                "ждущих ревизии"})
+                except Exception as e:          # noqa: BLE001
+                    print(f"/edit_review: pending: {e}", file=sys.stderr)
+            # ОДИН резерв на обе формы: батч и поштучная ревизия видят
+            # друг друга (акт мог бы ревизоваться дважды параллельно —
+            # два платных веера и дубли событий), а проверка и спавн
+            # атомарны — двойной клик в щель между ними спавнил второй
+            # веер (нашёл codex). Резерв снимается в finally: к этому
+            # моменту spawn уже положил запись в RUNNING.
+            if batch:
+                with RUN_LOCK:
+                    dup = ([t for t in RUNNING.values()
+                            if t.get("gate") == "review"]
+                           or ("review" in _EDIT_RESERVED))
+                    if not dup:
+                        _EDIT_RESERVED.add("review")
+                if dup:
+                    return self._json(409, {"error": "ревизия уже идёт — "
+                                            "дождитесь вердиктов"})
+                try:
+                    spawn([sys.executable,
+                           str(Path(__file__).resolve().parent
+                               / "merge_gate.py"), "review-batch"],
+                          "review: пачка ждущих актов", VOICES,
+                          meta={"edit": "batch", "gate": "review"},
+                          fields={"gate": "review", "batch": True})
+                finally:
+                    with RUN_LOCK:
+                        _EDIT_RESERVED.discard("review")
+            else:
+                # Уехавший main _spawn_review переносит сам, под резервом
+                # веера: занятость проверяется ДО rebase (ревизия 2026-09-16).
+                try:
+                    started = _spawn_review(act)
+                except ReviewNotStarted as e:
+                    return self._json(409, {"error": str(e)})
+                if started is None:
+                    return self._json(409, {"error": "ревизия уже идёт — "
+                                            "дождитесь вердиктов"})
+            return self._json(200, {"batch": batch, "act": act or None,
+                                    "started": True})
+
+        if self.path == "/edit_merge":
+            # Приёмка быстрая (git локально) — синхронно; слепую фазу
+            # смотрим в RUNNING на месте.
+            act = (req.get("act") or "").strip()
+            if not re.fullmatch(r"[0-9a-f]{8,32}", act):
+                return self._json(400, {"error": "кривой act"})
+            def _blind_now():
+                # Зовётся гейтом ПОД его flock, вплотную к update-ref:
+                # снимок до вызова оставлял окно, в котором слепая фаза
+                # успевала стартовать (нашли deepseek, gemini, codex).
+                with RUN_LOCK:
+                    return any(t.get("blind") for t in RUNNING.values())
+            try:
+                ev = merge_gate.merge(act, blind_check=_blind_now)
+            except merge_gate.GateRefused as e:
+                # Сдвиг main кнопка чинит САМА (спека п.7): rebase →
+                # честный ответ «одобрения сгорели, нужна ревизия
+                # дельты». Гейт при этом ничего не решает — только
+                # выравнивает базу; merge всё равно не пройдёт до
+                # новой ревизии.
+                if merge_gate.checks(act).get("stale_base"):
+                    try:
+                        rb = merge_gate.rebase_act(act)
+                    except merge_gate.GateRefused as e2:
+                        return self._json(409, {"error": f"{e}; авто-"
+                                                f"rebase: {e2}"})
+                    # Патч после переноса тот же — вердикты стола в силе
+                    # (checks считает их по patch_sha), принимаем в том же
+                    # нажатии; иначе честно: нужна ревизия дельты.
+                    if rb.get("same_patch"):
+                        try:
+                            ev = merge_gate.merge(act, blind_check=_blind_now)
+                            return self._json(200, {
+                                "act": act, "result_sha": ev.get("result_sha"),
+                                "reviewed_by": ev.get("reviewed_by"),
+                                "worktree_copy": ev.get("worktree_copy"),
+                                "rebased": True,
+                                "note": "ветка перенесена на новый main, патч не "
+                                        "изменился — принято по прежним вердиктам"})
+                        except merge_gate.GateRefused as e3:
+                            return self._json(409, {"error": f"перенесено (патч тот же), "
+                                                    f"но гейт не пропустил: {e3}",
+                                                    "rebased": True, "head": rb["head"]})
+                    return self._json(409, {
+                        "error": "main уехал — гейт перенёс ветку "
+                                 f"(база {rb['base_sha'][:12]}); патч изменился, "
+                                 "вердикты не переносятся: запустите ревизию "
+                                 "(пойдёт дельта от перенесённой головы)",
+                        "rebased": True, "head": rb["head"]})
+                return self._json(409, {"error": str(e)})
+            except Exception as e:              # noqa: BLE001
+                return self._json(500, {"error": f"гейт упал: {e}"})
+            return self._json(200, {
+                "act": act, "result_sha": ev.get("result_sha"),
+                "reviewed_by": ev.get("reviewed_by"),
+                "worktree_copy": ev.get("worktree_copy")})
+
+        if self.path == "/drop":
+            # «СНЯТЬ СЕЙЧАС» (раунд ранние-отказы): человек снимает ОДИН
+            # голос до таймаута — не весь акт, как /abort. Окно ничего не
+            # убивает само: ставит флаг drop/<pgid>, а снимает группу
+            # дирижёр, который её породил и проверяет флаг каждые 2 с.
+            # pgid берётся не из запроса на веру, а из события early_warn
+            # ленты по идущему акту: чужую группу этим не снять.
+            act = (req.get("act") or "").strip()
+            try:
+                pgid = int(req.get("pgid") or 0)
+            except (TypeError, ValueError):
+                pgid = 0
+            if not re.fullmatch(r"[0-9a-f]{8,32}", act) or pgid <= 1:
+                return self._json(400, {"error": "нужны act и pgid из события early_warn"})
+            with RUN_LOCK:
+                running = act in RUNNING
+            if not running:
+                return self._json(409, {"error": f"акт {act} не идёт — снимать нечего"})
+            voice = str(req.get("voice") or "")
+            if voice and voice not in VOICES:
+                return self._json(400, {"error": "voice не из состава стола"})
+            # по ВСЕЙ ленте, не хвосту: длинный акт вытеснял событие из
+            # последних 400 и кнопка давала 404 (субагент, kimi)
+            ew = next((e for e in reversed(live.read_events(all_projects=True))
+                       if e.get("kind") == "early_warn" and e.get("act") == act
+                       and e.get("pgid") == pgid), None)
+            if ew is None:
+                return self._json(404, {"error": "в ленте нет early_warn с таким act и pgid"})
+            voice = str(ew.get("voice") or voice)     # голос — из события, не из тела (субагент)
+            if not early.group_alive(pgid):
+                return self._json(409, {"error": f"голос {voice} уже завершился — снимать нечего"})
+            path = early.request_drop(pgid, "arr", act, voice)
+            feed_append("early_drop", f"снять сейчас: {voice or 'голос'} "
+                        f"(pgid {pgid}) — флаг поставлен, дирижёр снимет группу",
+                        act=act, pgid=pgid, voice=voice)
+            return self._json(200, {"flag": str(path)})
+
+        if self.path == "/edit_drop":
+            # Отбросить правку: ветка и дерево удаляются, в ленте —
+            # edit_drop с головой ветки; история акта остаётся.
+            act = (req.get("act") or "").strip()
+            if not re.fullmatch(r"[0-9a-f]{8,32}", act):
+                return self._json(400, {"error": "кривой act"})
+            opn0 = next((e for e in edits._act_events(act)
+                         if e.get("kind") == "edit_open"), None)
+            proj0 = str(Path(opn0.get("project")).resolve()) if opn0 and opn0.get("project") else ""
+            with RUN_LOCK:
+                # ветку читает кресло, одиночный веер (meta.edit=act) и
+                # веер пачки (edit="batch"); резерв — открывающееся
+                # кресло того же проекта (ревизия: субагент, grok, gemini)
+                if act in _REBASING:
+                    return self._json(409, {"error": "гейт переносит ветку акта на main — дождитесь"})
+                if any(t.get("edit") == act for t in RUNNING.values()):
+                    return self._json(409, {"error": "по акту идёт кресло или ревизия — дождитесь конца"})
+                if any(t.get("edit") == "batch" for t in RUNNING.values()):
+                    return self._json(409, {"error": "идёт ревизия пачки — дождитесь её конца"})
+                if proj0 and proj0 in _EDIT_RESERVED:
+                    return self._json(409, {"error": "кресло по этому проекту открывается — повторите через секунду"})
+            try:
+                ev = edits.drop_edit(Path(PROJECT or "."), act,
+                                     str(req.get("why") or "")[:300])
+            except edits.EditRefused as e:
+                return self._json(400, {"error": str(e)})
+            except Exception as e:              # noqa: BLE001
+                return self._json(500, {"error": f"не отброшен: {e}"})
+            return self._json(200, {"act": act, "event": ev.get("id")})
+
+        if self.path == "/edit_adopt":
+            act = (req.get("act") or "").strip()
+            if not re.fullmatch(r"[0-9a-f]{8,32}", act):
+                return self._json(400, {"error": "кривой act"})
+            try:
+                merge_gate.adopt(act)
+            except merge_gate.GateRefused as e:
+                return self._json(409, {"error": str(e)})
+            return self._json(200, {"act": act, "adopted": True})
+
+        if self.path == "/stop":
+            # Стоп — это ФЛАГ, а не убийство. Файл ~/.cache/choir/stop-<имя>
+            # дирижёр читает между шагами такта; дерево процессов окно
+            # намеренно не снимает: голос, срезанный на полуслове, теряет
+            # уже оплаченный ответ, а раунд остаётся с половиной фазы в
+            # журнале. Плата за мягкость честная — текущий вызов голоса
+            # доживёт, стоп сработает на ближайшей паузе, и ровно это
+            # пишется в ленту: иначе «нажал, а оно ещё думает» читается
+            # как поломка кнопки.
+            name = (req.get("round") or "").strip()
+            if not re.fullmatch(ROUND_RE, name):
+                return self._json(400, {"error": "имя раунда: буквы, "
+                                        "цифры, точка, дефис; до 60"})
+            with RUN_LOCK:
+                # По точному имени, не по префиксу: с «Развить тему» имена
+                # `t3` и `t3-2` — норма, и стоп t3 ловил бы бегущий t3-2
+                # в список (субагент). Метка «round: <имя>» кончается
+                # пробелом или концом строки.
+                acts = [aid for aid, t in RUNNING.items()
+                        if t.get("round") == name
+                        or t["label"] == f"round: {name}"
+                        or t["label"].startswith(f"round: {name} ")]
+            path = stop_file(name)
+            try:
+                STOP_DIR.mkdir(parents=True, exist_ok=True)
+                path.write_text(
+                    f"{_now()} стоп из окна RoundTable (arr)\n",
+                    encoding="utf-8")
+            except OSError as e:
+                return self._json(500, {"error": f"флаг не записан: {e}"})
+            feed_append(
+                "round_stop",
+                f"стоп раунда {name}: флаг {path.name} выставлен — дирижёр "
+                f"остановит такт на ближайшей паузе между шагами, идущий "
+                f"вызов голоса доживёт"
+                + (f"; акты окна: {', '.join(acts)}" if acts else
+                   "; идущего раунда с этим именем окно не видит — флаг "
+                   "останется лежать до следующего запуска с тем же именем"),
+                round=name, status="requested", acts=acts,
+                stop_file=str(path))
+            return self._json(200, {"round": name, "stop_file": str(path),
+                                    "acts": acts})
+
+        if self.path == "/abort":
+            # ЖЁСТКАЯ остановка — в отличие от «Стоп», который лишь
+            # выставляет флаг между шагами. Две кнопки существуют именно
+            # потому, что цены у них разные, и смешивать их нельзя:
+            # мягкий «Стоп» бережёт оплаченный вызов, «Прервать всё»
+            # платит за немедленность потерей слепой фазы. Если бы abort
+            # тоже ставил флаг, подпись кнопки врала бы, а Автор,
+            # нажавший её в панике, продолжал бы ждать.
+            #
+            # До этой правки маршрута не было вовсе: страница слала сюда
+            # POST, получала 404 и показывала ошибку — свойство было
+            # объявлено в подсказке кнопки и не обеспечено механикой
+            # (правило 8.5, найдено при сверке круга правок).
+            want = req.get("acts")
+            if want is not None and not isinstance(want, list):
+                return self._json(400, {"error": "acts: список id или "
+                                        "поле вовсе не задавать"})
+            if want is not None and not want:
+                # Дословно тот же дефект, что уже пойман в /act: пустой
+                # список ≠ «поле не задано». Там цена — платная рассылка
+                # всем шести, здесь выше: убийство ВСЕХ идущих ходов
+                # вместо ни одного (нашёл ревьюер дифа, проверено).
+                return self._json(200, {"aborted": [], "finished": [],
+                                        "note": "acts пуст — прерывать "
+                                                "нечего"})
+            with RUN_LOCK:
+                # Забираем записи СЕБЕ, как это делает выход из окна:
+                # итог у действия ровно один, и пишет его тот, кто вынул
+                # запись из RUNNING. Проснувшаяся reap увидит пустоту.
+                if want:
+                    mine = [(a, RUNNING.pop(a)) for a in list(want)
+                            if a in RUNNING]
+                else:
+                    mine = list(RUNNING.items())
+                    RUNNING.clear()
+            if not mine:
+                with RUN_LOCK:
+                    others = list(RUNNING)
+                # status="noop", а не "aborted": в append-only журнале
+                # запись «прервано» там, где ничего не прерывали, через
+                # месяц прочтётся как факт отмены (нашёл ревьюер дифа).
+                feed_append("act_status",
+                            "прервать нечего: "
+                            + (f"названных актов окно не видит, идут "
+                               f"другие ({', '.join(others)})" if others
+                               else "идущих ходов нет"),
+                            status="noop", acts=[])
+                return self._json(200, {
+                    "aborted": [], "finished": [], "running": others,
+                    "note": ("этих актов окно не видит, но другие идут"
+                             if others else "идущих ходов нет")})
+            aborted, finished = [], []
+            for aid, t in mine:
+                rc = None
+                try:
+                    rc = t["proc"].poll()
+                except Exception:                       # noqa: BLE001
+                    pass
+                if rc is not None:
+                    # Успел закончиться, пока летел запрос. Писать над
+                    # прозвучавшим ответом «прерван» значит врать журналу
+                    # (нашли grok и kimi на живом «ОК» от deepseek).
+                    feed_append("act_status",
+                                f"act {aid} {'done' if rc == 0 else 'error'} "
+                                f"(успел до «прервать всё»): {t['label']}",
+                                act_id=aid,
+                                status="done" if rc == 0 else "error", rc=rc,
+                                **_act_fields(t))
+                    finished.append(aid)
+                    continue
+                rnd = t.get("round")
+                killed = False
+                alive_before = t["proc"].poll() is None
+                try:
+                    # ПОВТОРНЫЙ poll вплотную к сигналу. Раньше между
+                    # первым poll и killpg стояла дисковая запись
+                    # флага-стопа — за эти миллисекунды процесс успевал
+                    # завершиться, ядро освобождало pid И pgid (лидер
+                    # группы — он сам), и сигнал мог уйти чужому дереву.
+                    # Окно здесь было ШИРЕ, чем при закрытии окна, где
+                    # между проверкой и сигналом нет ничего (нашёл
+                    # ревьюер дифа, показал освобождение группы).
+                    if t["proc"].poll() is not None:
+                        raise ProcessLookupError
+                    # Те же три предохранителя, что при закрытии окна:
+                    # живость, сохранённый pgid, сверка со своей группой.
+                    # Без последней сигнал мог уйти в оболочку Автора.
+                    if t["pgid"] != os.getpgrp():
+                        os.killpg(t["pgid"], signal.SIGTERM)
+                        killed = True
+                except (ProcessLookupError, PermissionError, OSError):
+                    pass
+                if t.get("unit"):
+                    # НЕЗАВИСИМО от killpg: лидер мог уже выйти (poll
+                    # → ProcessLookupError), а внук в scope жив (ревизия:
+                    # субагент, codex, grok). killed — только если акт был
+                    # жив до сигнала: умерший сам с rc≠0 остаётся error, а
+                    # не «прерван» (второй круг).
+                    if _scope_kill(t["unit"], "SIGTERM") and alive_before:
+                        killed = True
+                if rnd:
+                    # Флаг-стоп ПОСЛЕ сигнала: такт уведён в свою сессию
+                    # и мог SIGTERM пережить — тогда флаг остановит его
+                    # на ближайшей паузе между шагами.
+                    try:
+                        STOP_DIR.mkdir(parents=True, exist_ok=True)
+                        stop_file(rnd).write_text(
+                            f"{_now()} прервать всё из окна RoundTable\n",
+                            encoding="utf-8")
+                    except OSError:
+                        pass
+                # ВТОРОЙ poll, уже после сигнала. Между первым poll и
+                # killpg процесс мог доиграть с rc=0: тогда в ленте уже
+                # лежит ответ голоса, а мы писали бы над ним «прерван» —
+                # ровно та ложь, что ловили на живом «ОК» от deepseek
+                # (нашли grok и kimi независимо).
+                try:
+                    rc = t["proc"].wait(timeout=1.5)
+                except Exception:                       # noqa: BLE001
+                    rc = None
+                if t.get("unit"):
+                    # запись уже вынута из RUNNING — reap-нить сюда не
+                    # придёт, эскалация и заметка — наша работа
+                    threading.Thread(target=_scope_reap,
+                                     args=(aid, t["unit"], t.get("label", "")),
+                                     daemon=True).start()
+                if rc == 0:
+                    feed_append("act_status",
+                                f"act {aid} done (успел завершиться, пока "
+                                f"шло «прервать всё»): {t['label']}",
+                                act_id=aid, status="done", rc=0,
+                                **_act_fields(t))
+                    finished.append(aid)
+                    continue
+                if rc is not None and not killed:
+                    # Умер САМ с ненулевым кодом в зазоре между первым
+                    # poll и попыткой сигнала — сигнала не было, значит
+                    # «прерван» был бы ложью: честный статус — error с
+                    # его собственным rc (перепроход Fable 2026-08-25;
+                    # тот же класс, что «прерван» над прозвучавшим
+                    # ответом).
+                    feed_append("act_status",
+                                f"act {aid} error (rc={rc}, упал сам, "
+                                f"пока шло «прервать всё»): {t['label']}",
+                                act_id=aid, status="error", rc=rc,
+                                **_act_fields(t))
+                    finished.append(aid)
+                    continue
+                feed_append(
+                    "act_status",
+                    f"act {aid} прерван по «прервать всё»: {t['label']}"
+                    "; уже оплаченные вызовы и частичные результаты могли "
+                    "попасть в ленту — но не обязательно ВЫШЕ этой "
+                    "записи: реплика живого голоса ляжет после неё"
+                    + (f"; автопрогон «{rnd}» получил ещё и флаг-стоп"
+                       if rnd else "")
+                    + ("" if killed else "; группа процессов не снята "
+                       "(уже завершилась или своя)"),
+                    act_id=aid, status="aborted", round=rnd)
+                aborted.append(aid)
+            return self._json(200, {"aborted": aborted,
+                                    "finished": finished})
+
+        if self.path == "/voices":
+            # Модель и усилие голосу НА ВРЕМЯ РАБОТЫ ОКНА. Хранится в
+            # памяти, доезжает до CLI переменной окружения (см.
+            # _spawn_env), и каждое изменение пишется в ленту событием
+            # voice_config — чтобы через месяц было видно, каким
+            # голосом и какой моделью сказана конкретная реплика.
+            # Это прямое требование правила 1 (одинаковый вопрос —
+            # одинаковые условия) и правила 8.5: условие, не названное
+            # в журнале, через месяц прочтётся как разница позиций,
+            # хотя это была разница моделей.
+            name = (req.get("voice") or "").strip()
+            # Область настройки: room — живая комната (по умолчанию),
+            # rounds — раунды choir.py («модель дирижёра»).
+            vscope = (req.get("scope") or "room").strip()
+            if vscope not in SCOPES:
+                return self._json(400, {"error": "scope: room, rounds "
+                                        "или exec"})
+            if name not in VOICES:
+                # ДО exec-ветки: pool с мусорным именем иначе писался в
+                # VOICE_CFG (нашёл gemini).
+                return self._json(400, {"error": "нет такого голоса: "
+                                        + (name or "(пусто)")})
+            if "reserve" in req:
+                # Резерв Кими по ключам API (наказ Автора 2026-09-23):
+                # одна галочка, хранится в паре room, действует на
+                # комнату, раунды и кресло (env CHOIR_KIMI_RESERVE)
+                if name not in RESERVE_VOICES or vscope not in ("room", "rounds"):
+                    return self._json(400, {"error": "резерв по ключам API: только "
+                                            f"{', '.join(sorted(RESERVE_VOICES))} "
+                                            "(комната или раунды)"})
+                if not isinstance(req["reserve"], bool):
+                    return self._json(400, {"error": "reserve — bool"})
+                if req.get("model") or req.get("effort") or "model" in req or "effort" in req:
+                    return self._json(400, {"error": "reserve — отдельным запросом"})
+                with CFG_LOCK:
+                    ent = VOICE_CFG.setdefault(name, {})
+                    pair = dict(ent.get("room") or {})
+                    pair["reserve"] = req["reserve"]
+                    ent["room"] = pair
+                    _save_voice_cfg(name, "room")
+                ev = feed_append(
+                    "voice_config",
+                    f"голос {name}: резерв по ключам API "
+                    + ("ВКЛЮЧЁН — при исчерпании квоты подписки тот же ход уходит "
+                       "ключевой линии (платно, с баланса)" if req["reserve"]
+                       else "ВЫКЛЮЧЕН — только подписка Kimi Code; квота кончилась — "
+                            "отказ канала"),
+                    voice=name, cfg_scope="room", reserve=req["reserve"], by="arr")
+                return self._json(200, {"ok": True, "event": ev["id"]})
+            if "memory" in req:
+                # Память нити из ленты — только область room и только
+                # голосу без сессии; отдельным запросом, как pool
+                if vscope != "room" or name not in MEMORY_VOICES:
+                    return self._json(400, {"error": "память из ленты: только "
+                                            "комната и голос без сессии CLI "
+                                            f"({', '.join(sorted(MEMORY_VOICES))})"})
+                if not isinstance(req["memory"], bool):
+                    return self._json(400, {"error": "memory — bool"})
+                if req.get("model") or req.get("effort") or "model" in req or "effort" in req:
+                    return self._json(400, {"error": "memory — отдельным запросом"})
+                with CFG_LOCK:
+                    ent = VOICE_CFG.setdefault(name, {})
+                    pair = dict(ent.get("room") or {})
+                    pair["memory"] = req["memory"]
+                    ent["room"] = pair
+                    _save_voice_cfg(name, "room")
+                ev = feed_append(
+                    "voice_config",
+                    f"голос {name} [комната]: память нити "
+                    + ("собирается из ленты (вся нить каждый ход)" if req["memory"]
+                       else "ВЫКЛЮЧЕНА — только дельта с курсора"),
+                    voice=name, cfg_scope="room", memory=req["memory"], by="arr")
+                return self._json(200, {"ok": True, "event": ev["id"]})
+            if vscope == "exec":
+                # Вкладка coder: pool-галочка и пара кресла. gemini
+                # кресла не имеет — отказ по существу, не по форме.
+                if name not in edits.EDIT_VOICES:
+                    return self._json(400, {"error": f"{name} кресла не "
+                                            "имеет (только ревьюер)"})
+                # pool применяется ТОЛЬКО в чистом виде: вместе с
+                # model/effort он записывался ДО их валидации, и 400 по
+                # паре оставлял галочку применённой — клиент откатывал
+                # её и показывал противоположное серверу (нашёл codex).
+                if "pool" in req and (req.get("model") or req.get("effort")
+                                      or "model" in req or "effort" in req):
+                    return self._json(400, {"error": "pool — отдельным "
+                                            "запросом, без model/effort"})
+                if "pool" in req:
+                    if not isinstance(req["pool"], bool):
+                        return self._json(400, {"error": "pool — bool"})
+                    with CFG_LOCK:
+                        ent = VOICE_CFG.setdefault(name, {})
+                        pair = dict(ent.get("exec") or {})
+                        pair["pool"] = req["pool"]
+                        ent["exec"] = pair
+                        _save_voice_cfg(name, "exec")
+                    _sync_exec_overrides()
+                    ev = feed_append(
+                        "voice_config",
+                        f"голос {name} [кресло]: "
+                        + ("в пуле random" if req["pool"]
+                           else "снят с пула random"),
+                        voice=name, cfg_scope="exec",
+                        pool=req["pool"], by="arr")
+                    if not (req.get("model") or req.get("effort")
+                            or "model" in req or "effort" in req):
+                        return self._json(200, {"ok": True,
+                                                "event": ev["id"]})
+            ctl = VOICE_CTL.get(name) or {}
+            model = (req.get("model") or "").strip()
+            effort = (req.get("effort") or "").strip()
+            # Пустое значение при ПРИСУТСТВУЮЩЕМ ключе — «вернуть
+            # умолчание»: раньше сбросить настройку было нельзя вовсе
+            # (пустое поле = 400; заметил kimi).
+            clear_model = "model" in req and not model
+            clear_effort = "effort" in req and not effort
+            if clear_model or clear_effort:
+                dropped_effort = None
+                with CFG_LOCK:
+                    ent = VOICE_CFG.setdefault(name, {})
+                    pair = dict(ent.get(vscope) or {})
+                    if clear_model:
+                        pair.pop("model", None)
+                    if clear_effort:
+                        pair.pop("effort", None)
+                    if clear_model and pair.get("effort"):
+                        # Оставшееся усилие сверяется с моделью УМОЛЧАНИЯ:
+                        # gpt-5.6-sol+ultra после сброса модели иначе
+                        # превращалось в gpt-5.4+ultra, которое POST не
+                        # принял бы (нашёл codex).
+                        dm = (_defaults_for(name, vscope) or {}).get("model")
+                        if pair["effort"] not in _efforts(name, dm):
+                            dropped_effort = pair.pop("effort")
+                    if pair:
+                        ent[vscope] = pair
+                    else:
+                        ent.pop(vscope, None)
+                if vscope == "exec":
+                    _sync_exec_overrides()
+                ev = feed_append(
+                    "voice_config",
+                    f"голос {name} "
+                    + ("[раунды/дирижёр]" if vscope == "rounds"
+                       else "[кресло]" if vscope == "exec"
+                       else "[комната]") + ": "
+                    + ", ".join(k for k, c in (("model", clear_model),
+                                               ("effort", clear_effort)) if c)
+                    + " → умолчание канала (сброс из окна Автора)"
+                    + (f"; усилие {dropped_effort} снято вместе с моделью — "
+                       f"у модели умолчания такой ступени нет"
+                       if dropped_effort else ""),
+                    voice=name, cfg_scope=vscope, reset=True,
+                    dropped_effort=dropped_effort, by="arr")
+                with CFG_LOCK:
+                    _save_voice_cfg(name, vscope)
+                limits, _ = limits_now()
+                return self._json(200, {
+                    "voice": voice_report(name, limits.get(name)
+                                          or {"kind": "unknown"}),
+                    "event": ev["id"], "reset": True})
+            if not model and not effort:
+                return self._json(400, {"error": "нечего менять: нужны "
+                                        "model и/или effort"})
+            # Голос без рычага — 400 с объяснением, а не молчаливое
+            # «принято»: настройка, которая никуда не доедет, хуже
+            # отсутствия настройки.
+            if vscope == "exec":
+                # Рычаги КРЕСЛА объявляет edits.EXEC_LEVERS — ровно те,
+                # за которыми стоит флаг в argv лямбды (правило 8.5).
+                # Комнатные can_* тут принимали мёртвые настройки,
+                # которые argv молча игнорировал (нашли codex и grok).
+                levers = edits.EXEC_LEVERS.get(name, ())
+                if model and "model" not in levers:
+                    return self._json(400, {"error": f"модель кресла "
+                                            f"{name} не крутится",
+                                            "why": edits.EXEC_DEFAULT_SRC
+                                            .get(name, "")})
+                if effort and "effort" not in levers:
+                    return self._json(400, {"error": f"усилие кресла "
+                                            f"{name} не крутится",
+                                            "why": edits.EXEC_DEFAULT_SRC
+                                            .get(name, "")})
+            elif model and not ctl.get("model_env"):
+                return self._json(400, {"error": f"модель {name} из окна "
+                                        "не меняется",
+                                        "why": ctl.get("locked", "")})
+            elif effort and not ctl.get("effort_env"):
+                return self._json(400, {"error": f"усилие {name} из окна "
+                                        "не меняется",
+                                        "why": ctl.get("locked", "")})
+            # Ступень сверяется С МОДЕЛЬЮ: заданной этим же запросом,
+            # иначе сохранённой для области, иначе умолчанием области.
+            # Общий список по всем моделям пропускал grok-4.5+xhigh.
+            with CFG_LOCK:
+                saved_model = ((VOICE_CFG.get(name) or {}).get(vscope)
+                               or {}).get("model")
+            dflt = _defaults_for(name, vscope) or {}
+            pair_model = model or saved_model or dflt.get("model")
+            allowed = _efforts(name, pair_model)
+            if effort and effort not in allowed:
+                # Уровень вне лестницы — отказ, а НЕ посадка на потолок
+                # (как делает eff() в choir.py). Там подмена уместна:
+                # раунд уже идёт, ронять его дороже. Здесь человек
+                # только что нажал кнопку и обязан узнать, что его
+                # выбор не принят, — иначе панель покажет одно, а голос
+                # пойдёт с другим. Цена ошибки измерена: xhigh роняет
+                # Грока за 4 секунды с 'unknown effort level'.
+                return self._json(400, {
+                    "error": f"усилие «{effort}» для {name} недопустимо",
+                    "allowed": allowed,
+                    # `name`, а не `voice`: такой переменной здесь нет
+                    # вовсе, и отказ по недопустимому усилию падал
+                    # NameError — то есть вместо честного 400 с
+                    # объяснением человек получал 500 и трейсбек.
+                    "for_model": pair_model,
+                    "source": catalog.source(name)})
+            unverified = False
+            if model and model in catalog.unaliased(name):
+                # Сервер модель знает, а CLI без алиаса её не запустит —
+                # голос выпал бы на платном ходу (нашли все ревьюеры).
+                return self._json(400, {
+                    "error": f"модель «{model}» у сервера есть, но у CLI "
+                             f"{name} нет алиаса — добавьте её в [models] "
+                             f"конфига CLI",
+                    "known": catalog.models(name)})
+            if model:
+                known = model in catalog.models(name)
+                shaped = bool(ctl.get("model_re")
+                              and re.fullmatch(ctl["model_re"], model))
+                if not MODEL_RE.match(model) or not (known or shaped):
+                    return self._json(400, {
+                        "error": f"модель «{model}» для {name} не "
+                                 "распознана",
+                        "known": catalog.models(name),
+                        "also_ok": ctl.get("model_re", "")})
+                # Имя подходит по форме, но в известном списке его нет.
+                # Запрещать нельзя — список зашит в коде и устареет раньше
+                # провайдера. Но и выдавать за действующую нельзя: с
+                # опечаткой голос выпадет целиком, и в ленте это ляжет как
+                # `error`, то есть как свойство участника, а не как промах
+                # окна (правило 4; нашёл ревьюер 2026-08-26).
+                unverified = known is False and shaped
+            with CFG_LOCK:
+                ent = VOICE_CFG.setdefault(name, {})
+                prev = dict(ent.get(vscope) or {})
+                cur = dict(prev)
+                if model:
+                    cur["model"] = model
+                if effort:
+                    cur["effort"] = effort
+                # Пара проверяется ПОСЛЕ слияния: до него смена одной
+                # модели при сохранённом xhigh проскакивала — общий
+                # список пропускал grok-4.5+xhigh, и CLI падал уже на
+                # платном ходу (нашли все четверо ревьюеров). Теперь —
+                # у всех, чей канал различает лестницы по моделям
+                # (codex: у gpt-5.4 нет max/ultra).
+                pe = cur.get("effort")
+                pm = cur.get("model") or dflt.get("model")
+                ok = _efforts(name, pm)
+                if pm and pe and ok and pe not in ok:
+                    return self._json(400, {
+                        "error": f"пара {pm}+{pe} недопустима",
+                        "allowed": ok,
+                        "why": "у этой модели такой ступени нет "
+                               "(лестница модели из кэша/справки канала)"})
+                ent[vscope] = cur
+            up = name.upper()
+            envs = {}
+            # exec — не env вовсе: лямбды кресел строят argv в процессе
+            # окна и читают EXEC_OVERRIDES напрямую.
+            if vscope == "exec":
+                _sync_exec_overrides()
+            if cur.get("model") and vscope != "exec":
+                envs[ctl["model_env"] if vscope == "room"
+                     else f"CHOIR_ROUND_{up}_MODEL"] = cur["model"]
+            if cur.get("effort") and vscope != "exec":
+                envs[ctl["effort_env"] if vscope == "room"
+                     else f"CHOIR_ROUND_{up}_EFFORT"] = cur["effort"]
+            # Идущие ходы уже запущены со старым окружением — сказать
+            # это вслух, иначе «поменял и сразу спросил» прочтётся как
+            # ответ новой модели.
+            with RUN_LOCK:
+                busy = sorted({v for t in RUNNING.values()
+                               for v in t["voices"] if v == name})
+            ev = feed_append(
+                "voice_config",
+                f"голос {name} "
+                + ("[раунды/дирижёр]" if vscope == "rounds"
+                   else "[кресло]" if vscope == "exec" else "[комната]")
+                + ": "
+                + ", ".join(
+                    f"{k} {prev.get(k) or '(по умолчанию)'} → {cur[k]}"
+                    for k in ("model", "effort") if k in cur)
+                + " — задано из окна Автора"
+                # Комнатная область — только у комнаты: событие кресла
+                # с текстом «живая комната (live.py…)» врало читателю
+                # ленты при верном cfg_scope (нашли codex, grok, claude).
+                + ("; " + (ctl.get("scope")
+                           or ", ".join(ctl.get("applies_to", [])))
+                   if vscope == "room" else
+                   "; argv кресла (edits.EDIT_VOICES)" if vscope == "exec"
+                   else "")
+                + ("; идущий ход этого голоса запущен ещё со старым "
+                   "окружением" if busy else "")
+                + ("; ⚠ модель НЕ ПРОВЕРЕНА: подходит по форме, но в "
+                   "известном списке её нет — если имя с опечаткой, голос "
+                   "выпадет целиком" if unverified else ""),
+                voice=name, cfg_scope=vscope,
+                model=cur.get("model"), effort=cur.get("effort"),
+                model_verified=(not unverified) if cur.get("model") else None,
+                prev_model=prev.get("model"), prev_effort=prev.get("effort"),
+                env=envs,
+                applies_to=(["choir.py"] if vscope == "rounds"
+                            else ["edits.EDIT_VOICES (кресло)"]
+                            if vscope == "exec"
+                            else ctl.get("applies_to", [])),
+                by="arr")
+            with CFG_LOCK:
+                # Кэш ПОСЛЕ канона: настройка, не попавшая в ленту, не
+                # имеет права пережить перезапуск (порядок — codex).
+                _save_voice_cfg(name, vscope)
+            limits, _ = limits_now()
+            return self._json(200, {
+                "voice": voice_report(name, limits.get(name)
+                                      or {"kind": "unknown"}),
+                "env": envs, "event": ev["id"],
+                "note": ctl.get("scope", ""),
+                "running_with_old_env": busy,
+                "model_verified": (not unverified) if cur.get("model") else None,
+                "warning": ("модель не в известном списке — принята по форме "
+                            "имени. Если это опечатка, голос выпадет "
+                            "целиком, и в ленте отказ будет выглядеть его "
+                            "свойством. Проверьте первым же ходом."
+                            if unverified else "")})
+
+        if self.path == "/round_step":
+            # Шаги раунда ПО ЧЕЛОВЕКУ: без галочки «авто» такт стоит
+            # после слепой фазы, а rebut и summarize запускались только
+            # руками из терминала. Теперь — кнопки карточки раунда.
+            name = (req.get("name") or "").strip()
+            step = (req.get("step") or "").strip()
+            if not re.fullmatch(ROUND_RE, name):
+                return self._json(400, {"error": "имя раунда"})
+            if step not in ("rebut", "summarize"):
+                return self._json(400, {"error": "step: rebut или summarize"})
+            brief = bool(req.get("brief"))
+            view = round_view(name)
+            if not view.get("conductor"):
+                return self._json(409, {"error": "у раунда нет жребия — "
+                                        "сначала «Раунд стола»"})
+            if not view.get("n_ok_answers"):
+                return self._json(409, {"error": "слепой фазы ещё нет — "
+                                        "нечего критиковать и сводить"})
+            if view.get("summary_ok"):
+                # Повторный свод — второй платный вызов и вторая запись
+                # role=summary; виток после свода ломает порядок такта
+                # (нашли grok, kimi).
+                return self._json(409, {"error": "свод уже есть — раунд "
+                                        "закрыт"})
+            if step == "rebut" and view.get("rebuts", 0) >= view.get(
+                    "rebut_cap", 3):
+                return self._json(409, {"error": f"{view.get('rebut_cap', 3)} "
+                                        "витка — потолок (правило 12)"})
+            # Занятость — по ПЛОСКОЙ записи RUNNING (meta разложен
+            # спавном; ключа «meta» нет — та же ошибка уже ловилась у
+            # автопрогона) и РЕЗЕРВ имени под замком до spawn: два
+            # параллельных POST иначе оба проходили проверку (нашли
+            # codex, grok, kimi, claude).
+            with RUN_LOCK:
+                busy = [aid for aid, t in RUNNING.items()
+                        if t.get("round") == name]
+                if not busy and name in _ROUND_RESERVED:
+                    busy = ["резерв"]
+                if not busy:
+                    _ROUND_RESERVED.add(name)
+            if busy:
+                return self._json(409, {"error": f"раунд {name} уже идёт "
+                                        f"(акт {busy[0]})"})
+            try:
+                # --by не шлём: choir.py сам берёт запасной жребий
+                # (lot_summary) или ведущего — окно не решает, кто сводит.
+                cmd = [sys.executable, str(CHAMBER / "choir.py"), step, "--round", name]
+                if step == "summarize":
+                    # Карточка свода — файлом, как у автопрогона (у run
+                    # умолчание SUMMARY-<раунд>.md); без --out summarize
+                    # пишет свод только в журнал (поймано на живом раунде).
+                    # Путь АБСОЛЮТНЫЙ, в journal/rounds/<проект жребия>/:
+                    # относительный при cwd=chamber/ уходил бы в каталог
+                    # кода (ревизия переезда, grok 2026-09-06).
+                    proj = view.get("project")
+                    rdir = JOURNAL / "rounds" / ((Path(proj).name or "root") if proj else "RoundTable")
+                    rdir.mkdir(parents=True, exist_ok=True)
+                    cmd += ["--out", str(rdir / fnames.round_file("SUMMARY-", name))]
+                who = view.get("summarizer") or view["conductor"]
+                label = (f"round: {name} [виток критики "
+                         f"№{view.get('rebuts', 0) + 1}]" if step == "rebut"
+                         else f"round: {name} [свод: {who}]")
+                # detach=True: при закрытии окна шаг не убивается, а
+                # дописывает оплаченный вызов, как автопрогон (субагент);
+                # не auto — иначе кнопка «Стоп» обещала бы остановку, а
+                # rebut/summarize флаг-стоп не читают. brief — та же
+                # опция, что у раунда.
+                act = spawn(cmd, label, VOICES, cwd=CHOIR,
+                            meta={"round": name, "step": step,
+                                  "detach": True},
+                            env_extra={"CHOIR_BRIEF": "1" if brief else "0"},
+                            note=("виток открытой критики: каждый читает "
+                                  "чужие ответы под анонимными метками"
+                                  if step == "rebut" else
+                                  "свод по жребию (запасной жребий, если "
+                                  "был); расхождения — отдельным разделом"),
+                            fields={"round": name, "step": step})
+            finally:
+                with RUN_LOCK:
+                    _ROUND_RESERVED.discard(name)
+            return self._json(200, {"act": act, "step": step, "by": who})
+
+        if self.path == "/windows/stop":
+            try:
+                pid = int(req.get("pid") or 0)
+                msg = stop_window(pid)
+            except (ValueError, TypeError) as e:
+                return self._json(400, {"error": str(e)})
+            except OSError as e:
+                return self._json(500, {"error": f"сигнал не ушёл: {e}"})
+            feed_append("note", f"окно pid {pid} остановлено из монитора окон")
+            return self._json(200, {"stopped": pid, "note": msg})
+
+        if self.path == "/access":
+            # Поле доступа окна (наказ Автора 2026-09-20): пишет
+            # <проект>/ACCESS.txt целиком — это настройка проекта, не
+            # журнал; след — событием access в ленте (что открыто, что
+            # отвергнуто, sha), чтобы через месяц было видно, с каким
+            # доступом шли раунды. Отвергнутые строки остаются в файле
+            # как есть — Автор видит их в ответе и в стенограммах, а в
+            # клетку и в пакет они не попадают (access.py).
+            if not isinstance(req.get("text"), str):
+                return self._json(400, {"error": "text — строка"})
+            text = req["text"]
+            if len(text) > 4000:
+                return self._json(400, {"error": "ACCESS.txt — до 4000 символов"})
+            rp, err = _access_project(req.get("project"))
+            if err or not rp:
+                return self._json(400, {"error": err or "нужен проект"})
+            # ЗАЩИТА ОТ ГОЛОСА В КЛЕТКЕ. У POST окна нет токена (долг), а
+            # сеть клетка не режет: голос мог бы выписать себе rw на
+            # следующий акт (ревизия 20.09: codex, субагент). Голос живёт
+            # ТОЛЬКО внутри акта — поэтому права меняются только в
+            # тишине: ни одного акта этого окна и ни одного живого bwrap
+            # пользователя (голос другого окна). Остаток: кресло Кодекса
+            # чужого окна идёт без bwrap — закрывается токеном POST.
+            with RUN_LOCK:
+                busy = [t["label"] for t in RUNNING.values()]
+            if busy:
+                return self._json(409, {"error": "идёт акт (" + "; ".join(busy)[:200]
+                                        + ") — доступ меняется только в тишине: голос в "
+                                        "клетке не должен менять права себе"})
+            if _bwrap_alive():
+                return self._json(409, {"error": "жив процесс bwrap — чей-то голос ещё в "
+                                        "клетке; повторите, когда акты закончатся"})
+            f = rp / access.FILE
+            if f.is_symlink():
+                return self._json(409, {"error": f"{f} — ссылка, не файл: не пишу"})
+            body = text if (not text or text.endswith("\n")) else text + "\n"
+            # Атомарно: tmp + replace. Параллельный load из хода/раунда не
+            # увидит половины файла (усечённый префикс — другой допустимый
+            # путь; kimi), а replace меняет запись каталога, не inode —
+            # запись не уйдёт ни по ссылке, ни в жёсткую ссылку на чужой
+            # файл (TOCTOU между is_symlink и write — codex, субагент).
+            try:
+                fd, tmp = tempfile.mkstemp(prefix=".ACCESS.", suffix=".tmp", dir=str(rp))
+                try:
+                    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                        fh.write(body)
+                    os.chmod(tmp, 0o644)
+                    os.replace(tmp, f)
+                except BaseException:
+                    with contextlib.suppress(OSError):
+                        os.unlink(tmp)
+                    raise
+            except OSError as e:
+                return self._json(500, {"error": f"{f}: {e}"})
+            view = _access_view(rp)
+            items = [f"r {p}" for p in view["ro"]] + [f"rw {p}" for p in view["rw"]]
+            ev = feed_append(
+                "access",
+                f"доступ голосов ({rp.name}): " + (", ".join(items) or "записей нет")
+                + (f"; отвергнуто строк: {len(view['rejects'])} — "
+                   + _cut("; ".join(view["rejects"]), 600) if view["rejects"] else ""),
+                project=str(rp), ro=view["ro"], rw=view["rw"],
+                rejects=view["rejects"], access_sha=view["sha"], by="arr",
+                # Автор не аутентифицирован (долг токена): адрес и агент
+                # запроса — хотя бы след, по которому подмену видно.
+                client=str(self.client_address[0]),
+                ua=str(self.headers.get("User-Agent") or "")[:80])
+            return self._json(200, {**view, "event": ev["id"]})
+
+        if self.path == "/goal":
+            # Цель целеполагателя — событием в ленту (append-only): её
+            # читают live.py (первый ход) и choir.py (пакет раунда).
+            if req.get("text") is not None and not isinstance(req.get("text"), str):
+                return self._json(400, {"error": "text — строка"})
+            text = str(req.get("text") or "").strip()
+            if len(text) > 2000:
+                return self._json(400, {"error": "цель — до 2000 символов"})
+            ev = feed_append("goal", text or "(цель снята)",
+                             goal=text, by="arr")
+            return self._json(200, {"event": ev["id"], "goal": text})
+
+        if self.path == "/limits_refresh":
+            limits_now(force=True)
+            return self._json(202, {"ok": True})
+
+        if self.path == "/models_refresh":
+            # Кнопка ⟳ окна (наказ Автора 2026-09-02): разведка списков
+            # у самих каналов, без единого модельного вызова — API по
+            # токену CLI, кэши CLI, --models адаптеров. Итог — событием
+            # в ленту: через месяц «какой список видело окно» — вопрос
+            # к журналу, а не к памяти. Отказ источника — строка отчёта,
+            # прежний список остаётся.
+            # Дедуп по фиксированному VOICES: список из тысячи «claude»
+            # иначе становился тысячей нитей разведки (нашёл codex).
+            want = {v for v in (req.get("voices") or [])
+                    if isinstance(v, str)}
+            names = [v for v in VOICES if v in want]
+            rep_ = catalog.refresh(names or None)
+            # Разрешённые умолчания кресел (grok из кэша) — пересчитать.
+            _sync_exec_overrides()
+            # В ленту — без чужих хвостов, похожих на ключ: отчёт вечен.
+            rep_ = {n: {k: (_no_secrets(v) if isinstance(v, str) else v)
+                        for k, v in r.items()} for n, r in rep_.items()}
+            ok = [n for n in rep_ if rep_[n].get("ok")]
+            bad = [n for n in rep_ if not rep_[n].get("ok")]
+            ev = feed_append(
+                "models_refresh",
+                ("каталог моделей обновлён: "
+                 + ", ".join(f"{n} {rep_[n]['models']}" for n in ok)
+                 if ok else "разведка моделей не удалась")
+                + ("; не удалось: " + ", ".join(
+                    f"{n} ({rep_[n].get('error')})" for n in bad)
+                   if bad else ""),
+                report=rep_, by="arr")
+            limits, _ = limits_now()
+            return self._json(200, {
+                "report": rep_, "event": ev["id"],
+                "voices": [voice_report(n, limits.get(n)
+                                        or {"kind": "unknown"})
+                           for n in VOICES]})
+
+        if self.path == "/lot":
+            cands = list(dict.fromkeys(
+                v for v in (req.get("candidates") or []) if v in VOICES))
+            if len(cands) < 2:
+                return self._json(400, {"error": "жребий — минимум из двух "
+                                        "разных кандидатов"})
+            with LOT_LOCK, _SafeGate():
+                if _lot_load():
+                    return self._json(409, {"error": "жребий уже брошен и "
+                                            "не раскрыт — сначала /reveal"})
+                try:
+                    lot = cast_lot(cands)
+                except Exception as e:                  # noqa: BLE001
+                    # маяк упал → жребия нет; отказ, а не тихий random()
+                    return self._json(502, {"error": f"маяк недоступен: {e}"})
+            # имени ещё НЕ СУЩЕСТВУЕТ — подписи целевого раунда нет
+            return self._json(200, {"commit": lot["commit"],
+                                    "target": lot["target"],
+                                    "wait_s": LOT_AHEAD * 3})
+
+        if self.path == "/reveal":
+            with LOT_LOCK, _SafeGate():
+                lot = _lot_load()
+                if not lot:
+                    return self._json(409, {"error": "нераскрытого жребия нет"})
+                try:
+                    ev = reveal_lot(lot)
+                except (KeyError, TypeError, ValueError) as e:
+                    # битый сейф (не наш файл, чужая запись) — ответ, не
+                    # разрыв соединения без строки в журнале
+                    return self._json(500, {"error": f"сейф жребия нечитаем: {e!r}"})
+            if ev is None:
+                return self._json(425, {"error": "целевой drand-раунд ещё "
+                                        "не наступил — подождите"})
+            return self._json(200, {"event": ev["id"]})
+
+        return self._json(404, {"error": "нет такого пути"})
+
+
+# ── страница ─────────────────────────────────────────────────────────
+PAGE = r"""<!doctype html><html lang="ru"><head><meta charset="utf-8">
+<title>RoundTable</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+:root{--bg:#14161a;--panel:#1c1f25;--ink:#e8e6df;--dim:#8b897f;
+--rule:#2c3038;--acc:#d6a24a;--me:#7fa3c9;--err:#c97563}
+*{box-sizing:border-box}
+/* Правая колонка 344px, была 240: в строку голоса встали галочка, имя,
+   модель и усилие (наказ Автора 2026-08-25). Уже 344 — селекторы
+   схлопываются в многоточие, и «opus» с «opus-4-mini» становятся
+   неразличимы; шире — ленте тесно (потолок 72ch у события снят
+   2026-09-20: на широком окне текст занимал две пятых). Ниже 760px панель
+   по-прежнему уходит целиком: там места нет и подавно. */
+/* Границы двигаются и запоминаются (наказ Автора 2026-08-31). Размеры
+   держим переменными, а не числами в правилах: перетаскивание меняет
+   одну переменную, и раскладка идёт за ней сама — без пересчёта в JS
+   того, что уже умеет grid. */
+:root{--sidew:344px;--actsw:17rem}
+body{margin:0;background:var(--bg);color:var(--ink);
+font:15px/1.55 "Golos Text",system-ui,sans-serif;height:100vh;
+display:grid;grid-template-columns:1fr var(--sidew);
+grid-template-rows:1fr auto}
+#feed{grid-row:1;overflow-y:auto;padding:1rem 1.2rem}
+/* Панелька быстрых переключателей — правый верх ЛЕНТЫ (наказ Автора
+   2026-08-31). position:fixed с отступом от правой панели через
+   var(--sidew): двигаете границу — панелька едет вместе с ней. */
+/* Sticky-ряд ВНУТРИ ленты, а не fixed поверх неё: fixed перекрывал
+   правый верх реплик при прокрутке — текст уходил под непрозрачную
+   панель и не читался (нашли codex и deepseek). Sticky занимает свою
+   строку в потоке: лента начинается ниже, перекрытий нет, а при
+   прокрутке ряд остаётся прижат к верху. */
+#feedtop{position:sticky;top:-1rem;z-index:6;display:flex;
+justify-content:flex-end;margin:-1rem -1.2rem .4rem;
+padding:.35rem 1.2rem .25rem;
+background:linear-gradient(var(--bg) 65%,transparent)}
+#quickbar{display:flex;gap:.55rem;align-items:center;
+background:var(--panel);border:1px solid var(--rule);border-radius:6px;
+padding:.2rem .5rem}
+.ev{margin:0 0 .7rem}   /* без потолка ширины: 72ch на широком окне — две пятых (Автор, 2026-09-20) */
+.ev .who{font:600 .78rem/1 ui-monospace,monospace;letter-spacing:.06em;
+color:var(--acc)}
+.ev.arr .who{color:var(--me)}
+.ev .t{white-space:pre-wrap;word-wrap:break-word;margin-top:.15rem}
+.ev .t.fold{max-height:13em;overflow:hidden}
+.ev .unfold{font:inherit;font-size:.76rem;background:none;border:1px solid var(--rule);color:var(--dim);border-radius:.3rem;padding:0 .4rem;cursor:pointer;margin-top:.2rem}
+.ev.sys .t{color:var(--dim);font-size:.86rem}
+.ev.warn .who,.ev.warn .t{color:var(--acc)}
+.ev.warn .dropnow{margin-left:.5rem;font-size:.78rem;border-color:var(--acc);color:var(--acc)}
+.ev .anc,.rbody .anc{font:inherit;font-size:.74rem;background:none;border:1px solid var(--rule);color:var(--dim);border-radius:.3rem;padding:0 .4rem;margin-left:.5rem;cursor:pointer}
+.ev .anc:hover,.rbody .anc:hover{color:var(--fg);border-color:var(--dim)}
+.ev.err .who{color:var(--err)}
+.ev.err .t{color:var(--err)}
+.ev .kind{font:600 .66rem/1 ui-monospace,monospace;letter-spacing:.08em;
+color:var(--dim);border:1px solid var(--rule);border-radius:3px;
+padding:.1em .3em;margin-left:.45rem}
+.ev .det{color:var(--dim);font-size:.82rem;margin-top:.2rem;
+white-space:pre-wrap;border-left:2px solid var(--rule);padding-left:.5rem}
+/* Моноширинный и с секундами: время реплики сверяют с журналом, а
+   пропорциональные цифры прыгают и мешают читать колонку глазами.
+   cursor:help — знак, что в title лежит полная метка с поясом и UTC. */
+.ev .ts{color:var(--dim);font:.72rem ui-monospace,monospace;
+margin-left:.5rem;cursor:help}
+#side{position:relative;
+grid-row:1/3;border-left:1px solid var(--rule);background:var(--panel);
+padding:1rem;display:flex;flex-direction:column;gap:.9rem;overflow-y:auto}
+#side h3{margin:0;font:600 .78rem/1 ui-monospace,monospace;
+letter-spacing:.1em;color:var(--dim);text-transform:uppercase}
+/* Строка голоса. Селекторы НЕ внутри <label>: клик по вложенному
+   контролу браузер label'у не пересылает, но это тонкость спецификации,
+   а цена ошибки — снятая галочка вместо смены модели, то есть реплика
+   уйдёт не тем. Поэтому label обнимает ровно галочку и имя. */
+.vrow{padding:.3rem 0;border-bottom:1px solid var(--rule)}
+.vrow:last-child{border-bottom:0}
+.vhead{display:flex;gap:.35rem;align-items:center}
+label.vpick{display:flex;gap:.4rem;align-items:center;font-size:.92rem;
+cursor:pointer;flex:1;min-width:4.2rem;overflow:hidden}
+label.vpick .nm{overflow:hidden;text-overflow:ellipsis;
+white-space:nowrap}
+/* ШИРИНА ЯЧЕЙКИ НЕ ЗАВИСИТ ОТ ЗНАЧЕНИЯ. Раньше .mdl/.eff не имели
+   размера вовсе: select мерился по самому длинному пункту, а .vhead с
+   flex-wrap переносил строку по-разному — переключение вкладки
+   💬/🎼 меняло длину значений, и вся панель съезжала (наказ Автора
+   2026-08-31: «при смене комнаты съезжает вёрстка»). Теперь значение
+   любой длины живёт внутри своей колонки и обрезается многоточием. */
+.vrow .cell{flex:none;width:6.6rem;display:flex;min-width:0}
+.vrow .mem{flex:none;font-size:.74rem;color:var(--dim)}.vrow .memlab{display:inline-flex;align-items:center;gap:.2rem;cursor:pointer}
+.vrow .cell>*{width:100%;min-width:0;max-width:100%;box-sizing:border-box}
+.vrow select,.vrow input.free{background:var(--bg);color:var(--ink);
+border:1px solid var(--rule);border-radius:4px;
+font:.72rem ui-monospace,monospace;padding:.05rem .15rem}
+.vrow select:focus-visible,.vrow input.free:focus-visible{
+outline:2px solid var(--acc);outline-offset:1px}
+
+/* Незменяемое значение — текстом в пунктирной рамке. Селектор там, где
+   менять нечего, врёт руками: у kimi усилия нет вовсе, и выпадающий
+   список создал бы ручку, которой не существует (правило 8.5). */
+.vrow .fix{font:.72rem ui-monospace,monospace;color:var(--dim);
+border:1px dashed var(--rule);border-radius:4px;padding:.05rem .25rem;
+overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.vrow .cap{display:flex;gap:.4rem;align-items:baseline;
+font-size:.7rem;color:var(--dim);line-height:1.25}
+.vrow .capt{flex:1;min-width:0}
+.vrow .sub{font:.72rem ui-monospace,monospace;color:var(--dim);margin-top:.1rem}
+.vrow .sub.ok{color:var(--dim)}.vrow .sub.warn{color:var(--acc)}.vrow .sub.bad{color:var(--err);font-weight:600}
+.vrow .capt[title]:not([title=""]){cursor:help}
+.vrow .st{margin-left:auto;font-size:.7rem;color:var(--dim);
+white-space:nowrap}
+.vrow .verr{color:var(--err);font-size:.72rem;margin-top:.15rem}
+/* Заметка — не ошибка: «идущий ход запущен со старым окружением» надо
+   сказать, но красным оно читалось бы как поломка. */
+.vrow .verr.note{color:var(--dim)}
+/* Значение, заданное из этого окна, обведено акцентом: иначе через час
+   не отличить «так настроено сейчас» от «так стоит по умолчанию», а
+   разница в том, чем именно ответит голос. */
+.vrow .set{border-color:var(--acc)}
+.vrow .verr[hidden]{display:none}
+/* Полоса — ТОЛЬКО там, где есть число. Заполнение = израсходовано.
+   .bar.none — тонкая линия-заглушка: место занято, но ничего не
+   утверждает; отказ по квоте полосы не получает вовсе (числа нет). */
+.bar{height:5px;border-radius:3px;background:var(--rule);overflow:hidden;
+margin:.25rem 0 .1rem;cursor:help}
+.bar i{display:block;height:100%;background:var(--acc)}
+.bar i.hot{background:var(--err)}
+.bar.none{height:2px;border-radius:0;background:var(--rule);opacity:.45}
+.bar.pad{height:5px;background:none;cursor:default}
+.ref{color:var(--err)}
+#project{width:100%;background:var(--bg);color:var(--ink);
+border:1px solid var(--rule);border-radius:4px;padding:.35rem .5rem;
+font:.8rem ui-monospace,monospace}
+#project:focus-visible{outline:2px solid var(--acc);outline-offset:1px}
+.vrow .st.busy{color:var(--acc)}
+button{background:var(--rule);border:1px solid #3a3f49;color:var(--ink);
+padding:.45rem .7rem;border-radius:4px;cursor:pointer;font-size:.86rem}
+button:hover{border-color:var(--acc)}
+button:focus-visible{outline:2px solid var(--acc);outline-offset:2px}
+#lotbox{border:1px solid var(--rule);border-radius:6px;padding:.6rem;
+font-size:.85rem;color:var(--dim)}
+#lotbox b{color:var(--acc)}
+#bar{position:relative;grid-row:2;display:flex;gap:.6rem;padding:.8rem 1.2rem;
+border-top:1px solid var(--rule);align-items:stretch}
+/* Высота поля СОРАЗМЕРНА колонке кнопок (наказ Автора 2026-08-25).
+   Кнопок стало четыре, столбик вырос до ~9rem, и поле в 2.6rem рядом
+   с ним читалось как щель для одной строки — хотя сюда набирают и
+   вопрос раунда, и абзац реплики. 6rem — это примерно четыре строки:
+   видно начало и конец набранного. Потолок 18rem, а не «сколько
+   потянешь»: поле растёт вверх за счёт ленты, ради которой окно и
+   открыто. resize:vertical оставлен — растянуть руками можно. */
+/* Поле тянется на ВСЮ высоту колонки кнопок (align-items:stretch у
+   #bar): раньше было 3–4 строки при столбике в девять — набранный
+   абзац прятался за прокруткой. min-height остаётся нижней границей
+   на случай, если колонка кнопок однажды сожмётся сильнее поля. */
+#msg{flex:1;background:var(--panel);color:var(--ink);
+border:1px solid var(--rule);border-radius:6px;padding:.55rem .7rem;
+font:inherit;resize:vertical;min-height:6rem;max-height:18rem}
+#msg:focus-visible{outline:2px solid var(--me);outline-offset:1px}
+.hint{color:var(--dim);font-size:.78rem}
+/* Галочка hint снята — пояснительные абзацы убраны вместе с
+   всплывающими подсказками: тихий интерфейс без лишнего текста. */
+body.nohints .hint{display:none}
+#hintlab{cursor:pointer;user-select:none;display:inline-flex;
+align-items:center;gap:.25rem;opacity:.85;font-size:.76rem;
+color:var(--dim)}
+#hintlab input{accent-color:var(--acc)}
+/* Колонка действий фиксированной ширины: подпись галочки длинная и
+   переносится, а прыгающая от переноса ширина сдвигала бы кнопки под
+   курсором — «Раунд стола» уезжает туда, где секунду назад был «Стоп». */
+#acts{position:relative;flex:none;width:var(--actsw);
+display:flex;flex-direction:column;gap:.4rem}
+/* Ручка — полоска ПОВЕРХ границы, а не отдельная колонка: колонка
+   сдвинула бы всю сетку на свою ширину, и «подвинуть на ноль» стало бы
+   невозможно. Зона захвата шире видимой линии — по линии в 1px попасть
+   мышью трудно. */
+.grip{position:absolute;z-index:5;background:transparent}
+.grip:hover,.grip.on{background:var(--acc);opacity:.55}
+.grip-v{top:0;bottom:0;left:-4px;width:8px;cursor:col-resize}
+.grip-h{left:0;right:0;top:-4px;height:8px;cursor:row-resize}
+/* Пока тянут — не выделять текст и не менять курсор над чужими
+   элементами: иначе перетаскивание превращается в выделение ленты. */
+body.dragging{user-select:none}
+body.dragging *{cursor:inherit!important}
+label.auto{display:flex;flex-wrap:wrap;gap:.35rem;align-items:center;
+font-size:.76rem;line-height:1.3;color:var(--dim);cursor:pointer}
+label.auto select{background:var(--bg);color:var(--ink);
+border:1px solid var(--rule);border-radius:4px;font:inherit;
+padding:.05rem .2rem}
+label.auto:hover{color:var(--ink)}
+/* ×N — короткий счётчик, не полноразмерный селект: наследованные
+   7.2rem давили кнопку «Раунд стола» почти в ноль (codex, deepseek). */
+#rebuts{width:3.3rem}
+#round{min-width:6.5rem}
+/* «Стоп» красный не для красоты: он единственный тут ломает уже
+   запущенное и оплаченное — цена ошибочного нажатия выше, чем у
+   соседей, и это должно быть видно до клика, а не после. */
+#stop{border-color:var(--err);color:var(--err)}
+#stop[hidden]{display:none}
+/* «Прервать всё» тоже красная и по той же причине, что «Стоп»: она
+   ломает уже запущенное и оплаченное. Разница между ними не в цвете,
+   а в охвате, и охват назван прямо в подписи — «всё». */
+#abort{border-color:var(--err);color:var(--err)}
+#belllab{cursor:pointer;user-select:none;display:inline-flex;
+align-items:center;gap:.25rem;opacity:.85}
+#belllab input{accent-color:var(--acc)}
+#scopebar{display:flex;gap:.3rem;margin:.1rem 0 .45rem}
+.scopetab{flex:1;background:var(--bg);border:1px solid var(--rule);
+border-radius:5px;cursor:pointer;font:.74rem inherit;padding:.2rem .3rem;
+color:var(--dim)}
+.scopetab:hover{border-color:var(--acc)}
+/* Выбранная область — заметно: весь список ниже показывает ЕЁ пару, и
+   спутать «поменял в комнате» с «поменял в раундах» нельзя. */
+.scopetab.on{background:var(--panel);color:var(--ink);
+border-color:var(--acc);font-weight:600}
+.eta{flex:none;font:.68rem ui-monospace,monospace;color:var(--dim);
+cursor:help;white-space:nowrap}
+#abort[hidden]{display:none}
+/* Две строки по две ячейки: «Быстрый вопрос» + кем спросить и
+   «Стоп» + «Прервать всё». Кнопка тянется, селектор фиксирован:
+   иначе длинное имя голоса растянуло бы ячейку и сдвинуло кнопку
+   прямо под курсором — тот же довод, по которому у #acts вообще
+   фиксированная ширина. */
+.qrow{display:flex;gap:.4rem;align-items:stretch}
+/* !important обязателен: [hidden] и .qrow равны по специфичности, и
+   flex, идущий в файле позже, ПОБЕЖДАЛ скрытие — переключение вкладок
+   не прятало ряды вовсе (поймал Автор первым же взглядом). */
+[hidden]{display:none!important}
+.qrow>button{flex:1;min-width:0}
+.qrow>select{flex:none;width:7.2rem;box-sizing:border-box;background:var(--bg);color:var(--ink);
+border:1px solid var(--rule);border-radius:4px;
+font:.76rem ui-monospace,monospace;padding:.05rem .25rem}
+.qrow>select:focus-visible{outline:2px solid var(--acc);outline-offset:1px}
+/* Ошибка отправки — строкой под кнопками, а не alert'ом: alert
+   перекрывает ленту, требует второго клика и легко ловится вслепую
+   по Enter. Заметка (не ошибка) — приглушённым, красным она читалась
+   бы как поломка. */
+#acterr{font-size:.74rem;line-height:1.3;color:var(--err);
+white-space:pre-wrap}
+#acterr.note{color:var(--dim)}
+#acterr[hidden]{display:none}
+/* НЕСКОЛЬКО ОКОН ЛИМИТА — НЕСКОЛЬКО ПОЛОС. У claude их три: 5-часовое,
+   недельное по всем моделям и отдельное недельное для Fable. Свести их
+   в одну шкалу нельзя ни средним, ни максимумом: получится число,
+   которого не сообщал никто, а по нему будут решать, звать голос или
+   нет (правило 8.5). Поэтому у каждого окна своя подпись, своя полоса
+   и свой процент. */
+.lim2{display:flex;gap:.4rem;align-items:center;margin:.18rem 0}
+.lim2 .nm2{font:.66rem ui-monospace,monospace;color:var(--dim);
+flex:none;width:4.8rem;overflow:hidden;text-overflow:ellipsis;
+white-space:nowrap;cursor:help}
+.lim2 .bar{flex:1;margin:0}
+.lim2 .pc{font:.66rem ui-monospace,monospace;color:var(--dim);
+flex:none;min-width:2.4rem;text-align:right;cursor:help}
+/* Отдельным правилом, а не одним .ref: у «.lim2 .pc» специфичность
+   выше, и общий .ref был бы перекрыт молча — полоса горит красным, а
+   процент рядом остаётся серым. */
+.lim2 .pc.ref{color:var(--err)}
+/* Число без шкалы (баланс в валюте) шире процента — даём ему место,
+   иначе «остаток 4.55 USD» обрежется до неузнаваемости. */
+.lim2 .pc.num{min-width:7.5rem;color:var(--ink);font-variant-numeric:tabular-nums}
+/* Баланс на исходе (< 2 USD): ярко и жирно — наказ Автора 2026-09-01. */
+.lim2 .pc.num.low{color:var(--err);font-weight:700}
+.lim2 .bar.low{border-color:var(--err);box-shadow:0 0 0 1px var(--err)}
+@media(max-width:760px){body{grid-template-columns:1fr}
+#side{display:none}
+/* Узкий экран: колонка действий под полем, а не рядом — 17rem сбоку
+   не помещаются (нашёл grok). */
+#bar{flex-direction:column}
+#acts{width:100%}}
+#actlist{font:.74rem ui-monospace,monospace;border-top:1px solid var(--rule);
+margin-top:.3rem;padding-top:.3rem;max-height:9rem;overflow-y:auto}
+.actrow{padding:.14rem 0;border-bottom:1px dashed var(--rule)}
+.actrow button{font-size:.7rem;padding:0 .45rem;margin-left:.3rem}
+#coderblk{border-left:2px solid var(--acc);padding-left:.45rem;margin-top:.5rem}
+/* Адресная ветка между голосами: сдвиг и пунктир, чтобы разговор
+   двух голосов читался как ветка, а не как общий поток. */
+.ev.thr{margin-left:1.4rem;border-left:2px dashed var(--rule);padding-left:.5rem}
+#goal{width:100%;box-sizing:border-box;min-height:3.2rem;font:.85rem/1.3 ui-sans-serif,system-ui,sans-serif}
+#access{width:100%;box-sizing:border-box;min-height:3.2rem;font:.8rem/1.3 ui-monospace,monospace}
+#accessnote{font-size:.8rem;opacity:.85;white-space:pre-wrap;margin:.2rem 0 .4rem}
+/* Карточка раунда под act_status: ответы голосов дословно из room.jsonl
+   (наказ Автора 2026-09-03: «ожидаю увидеть полный ответ и расшифровку
+   каждого голоса»). Свёрнута по умолчанию — лента не тонет в 40К символов. */
+.rcard{margin:.3rem 0 .2rem 1.2rem;border-left:2px solid var(--acc);padding:.25rem .5rem;font-size:.9rem}
+.rcard button{font-size:.72rem;padding:.05rem .5rem;margin-right:.3rem}
+.rcard details{margin:.25rem 0}
+.rcard summary{cursor:pointer;color:var(--dim)}
+.rcard pre{white-space:pre-wrap;word-break:break-word;margin:.2rem 0 .4rem;
+font:.84rem/1.35 ui-sans-serif,system-ui,sans-serif;max-height:28rem;overflow:auto}
+.rcard .rstat{font:.74rem ui-monospace,monospace;color:var(--dim)}
+/* Блок кодера живёт в УЗКОЙ правой панели: ряды переносятся, иначе
+   селектор исполнителя вылезал за край (наказ Автора 2026-09-02:
+   «кнопочки правки — во вкладку Кодер, ниже Бросить/Раскрыть»). */
+#coderblk .qrow{flex-wrap:wrap;margin:.25rem 0}
+/* Кнопки гейта в узкой панели НЕ сжимаются до «Рев…/При…» (общее
+   правило .qrow>button{min-width:0} для колонки внизу): ширина по
+   тексту, лишнее переносится на следующую строку. */
+#coderblk .qrow>button{flex:1 1 auto;min-width:max-content}
+#coderblk .qrow>input{box-sizing:border-box}
+.vhead3row{display:flex;align-items:center;justify-content:space-between;gap:.4rem;flex-wrap:wrap}
+.vrefresh{display:flex;gap:.4rem;margin-left:auto}
+#mrefresh,#lrefresh{font-size:.7rem;padding:0 .45rem;line-height:1.4;white-space:nowrap}
+#vnote{font:.72rem ui-monospace,monospace;color:var(--muted,#777);
+margin:.2rem 0 .3rem;white-space:pre-wrap;word-break:break-word}
+</style></head><body>
+<div id="feed" aria-live="polite"><div id="feedtop"><div id="quickbar" title="Быстрые переключатели окна. Живут поверх ленты, чтобы не занимать место в колонке действий.">
+  <label id="belllab" title="Звонок по завершении действия — как у микроволновки: короткое тройное «дзынь», когда ход или такт закончился (done, error или прерван). Работает, пока вкладка открыта; браузер разрешает звук после первого клика по странице. Выключается здесь же, выбор запоминается."><input type="checkbox" id="bell">🔔</label>
+  <label id="brieflab" title="Краткость. Снята (умолчание) — голоса отвечают столько, сколько нужно доводу: ответ приходит целиком. Поставлена — возвращаются прежние жёсткие рамки правила 16: реплика 120–250 слов в комнате, ответ 250–400 и свод до 400 слов в раундах. Переключатель уходит в ленту полем brief, чтобы короткий ответ не путался с урезанным. Выбор запоминается."><input type="checkbox" id="brief">кратко</label>
+  <label id="peerlab" title="Адресные сообщения между голосами (опция; наказ Автора 2026-09-06). Снята (умолчание) — «@имя» в реплике голоса просто текст, слово по адресу даёт только человек. Поставлена — голос может задать вопрос коллеге строкой «@имя …»: адресат отвечает следующим ходом, потом слово только поднявшим руку, иначе ветка закрывается и слово у человека. Всё в той же ленте, ветка помечена полем thread. Каждый такой вопрос — платный ход; потолок реплик без человека действует. Уходит в ленту полем peer. Выбор запоминается."><input type="checkbox" id="peer">адресно</label>
+  <label id="tsfulllab" title="Полные метки времени — с датой — везде: в ленте, во вкладке секретаря, в списке актов дирижёра и в панели окон (наказ Автора 2026-10-08). Снята (умолчание) — только часы:минуты:секунды, дата в подсказке. Выбор запоминается."><input type="checkbox" id="tsfull">дата</label>
+  <label id="hintlab" title="Всплывающие подсказки: у кнопок, галочек, шкал и панелей — при наведении. Жёлтая рамка у модели/усилия значит «комната и раунды настроены по-разному». Снята — все подсказки скрыты, интерфейс тихий; выбор запоминается."><input type="checkbox" id="hints">hint</label>
+</div></div></div>
+<div id="side">
+  <div class="grip grip-v" id="grip-side" title="Ширина правой панели. Тяните; положение запоминается. Двойной щелчок — вернуть по умолчанию."></div>
+  <div class="vhead3row"><h3 id="vhead3">Голоса · кому уйдёт</h3>
+    <div class="vrefresh">
+    <button id="mrefresh" title="Обновить списки моделей и ступеней у ВСЕХ голосов — для всех трёх вкладок сразу. Без единого модельного вызова: claude — api.anthropic.com/v1/models по OAuth-токену самого Claude Code; codex и grok — кэши их CLI (обновляются самими CLI при их вызовах); kimi — Moonshot /v1/models ключом линии плюс алиасы config.toml; deepseek и gemini — `--models` адаптеров. Итог — событием models_refresh в ленту; отказ источника не стирает прежний список. Наказ Автора 2026-09-02: «появилась новая модель — предусмотрим кнопочку обновить список».">⟳ модели</button>
+    <button id="lrefresh" title="Обновить лимиты всех голосов сейчас">⟳ лимиты</button></div></div>
+  <div id="scopebar" title="ОДИН переключатель на весь список (наказ Автора 2026-08-31: «чтобы видно было»). Он выбирает, ЧЬЮ пару модель+усилие показывают и меняют ячейки ниже — у каждого голоса их две, независимые.
+💬 комната: живой разговор, запускает live.py — «Сказать», «Слепой ход», «Быстрый вопрос».
+🎼 раунды: протокол стола, запускает choir.py — «Раунд стола» (жребий, затравка, слепая фаза, витки, свод).
+🔧 coder: кресло исполнителя — задание уходит правкой в git-worktree, ревизия дифа столом, приёмка через гейт. У голосов здесь СВОЯ пара модель+усилие (только там, где рычаг существует) и галочка участия в random-пуле.
+Настройки хранятся раздельно и переживают перезапуск окна. Галочки у каждой вкладки СВОИ: 💬 — кому уйдёт реплика и слепой ход, 🎼 — состав раунда и кандидаты жребия, 🔧 — пул random кресел.">
+    <button id="sc-room" class="scopetab on">💬 комната</button>
+    <button id="sc-rounds" class="scopetab">🎼 раунды</button>
+    <button id="sc-exec" class="scopetab">🔧 coder</button>
+  </div>
+  <div id="voices" title="Полоса — израсходованная доля окна; ◇ — был отказ по квоте, числа нет; тонкая линия — канал остаток не сообщает. Пустое место ≠ «квота цела». Окон у голоса может быть несколько — каждое своей полосой, среднего между окнами не бывает; имя окна и срок сброса — в подсказке самой полосы."></div>
+  <div id="vnote" hidden></div>
+
+  <h3>Проект (--project)</h3>
+  <input id="project" value="__PROJECT_DEFAULT__" placeholder="путь к каталогу; пусто — без него" title="Каталог, который голоса получат на чтение. Подставлен тот, из которого запущено окно; очистить поле — значит спрашивать без проекта.">
+  <h3 title="ACCESS.txt в каталоге проекта: что голосам открыто сверх самого проекта. Клетка bwrap держит дом голоса пустым — без этой записи соседний проект, код стола и любой другой каталог голосам не видны. Одна строка — одна запись: «r /путь» — чтение всем; «rw /путь» — запись креслу исполнителя, остальным чтение. Дом, состояние CLI голосов и стол на запись не выдаются — такие строки отвергаются поимённо.">Доступ голосов (ACCESS.txt)</h3>
+  <textarea id="access" placeholder="r /абсолютный/путь — чтение всем голосам&#10;rw /абсолютный/путь — запись креслу исполнителя" title="Содержимое <проект>/ACCESS.txt. Кнопка пишет файл и событие access в ленту; отвергнутые строки останутся в файле, но в клетку не попадут — их список покажется под кнопкой."></textarea>
+  <button id="accessbtn" title="Записать ACCESS.txt проекта и событие access в ленту. Действует со следующего хода, раунда, ревизии или кресла.">Записать доступ</button>
+  <div id="accessnote" hidden></div>
+  <h3 title="Целеполагатель — прослойка между человеком и столом (RoundTable/CLAUDE.md): формулирует цель и критерии «готово», режет скоуп, держит цель между раундами. Сейчас это Автор. Цель уходит первым ходом каждому голосу комнаты и в пакет каждого раунда — всем одинаково; каждая смена — событие goal в ленте.">Цель (целеполагатель)</h3>
+  <textarea id="goal" placeholder="цель и критерии «готово»; пусто — цель не задана" title="Текст цели, который получат все голоса: в комнате — первым ходом, в раундах — строкой пакета. Кнопка ниже пишет его событием goal в ленту; последняя запись и есть действующая цель."></textarea>
+  <button id="goalbtn" title="Записать цель событием goal в ленту (append-only). Пустой текст снимает цель отдельным событием.">Задать цель</button>
+  <h3>Жребий дирижёра</h3>
+  <div id="lotbox" title="Имя ведущего видите только вы — в ленте до раскрытия лишь хеш-обязательство. «Раскрыть» допишет соль, и sha256 пересчитывается по журналу: проверить может каждый, у кого есть лента.">не брошен</div>
+  <button id="lot" title="Бросить жребий дирижёра по протоколу commit-reveal: обязательство (sha256 соли, кандидатов и БУДУЩЕГО раунда drand) публикуется в ленту ДО того, как подпись раунда существует — подогнать выбор под вопрос нельзя. Имя ведущего увидите только вы, до раскрытия.">Бросить (commit)</button>
+  <button id="reveal" title="Раскрыть жребий: соль дописывается в ленту, и любой голос пересчитает sha256(подпись:соль:кандидаты) и проверит честность. До целевого раунда drand кнопка ответит «рано».">Раскрыть</button>
+  <div id="coderblk" hidden>
+    <div class="qrow">
+      <button id="editbtn" title="Выдать кресло исполнителя: текст из поля ввода внизу уходит ЗАДАНИЕМ одному голосу, тот правит код в отдельном git-worktree (ветка act/…). Кресло одно на проект; слепой ход и правка взаимно блокируются. Итог — событиями edit_open/edit_close в ленте; при вылете worktree остаётся на диске карантином. Merge в main — пока руками через гейт (этап 3).">Правка</button>
+      <select id="evoice" title="Кто исполняет. codex — единственный с песочницей (workspace-write + .git базы); claude — набор инструментов Write/Edit/Bash(git:*), но git-alias пробивает и его, граница словесная; kimi ⚠ ДОРОГОЙ И МОНОПОЛЬНЫЙ ПО ЛИНИИ: правка — длинная агентная сессия (15–20 внутренних запросов), и обёртка держит ОДНУ из его линий весь акт; вторая линия (если жива её квота) остаётся столу — ревизии и комната идут по ней, но медленнее, в очередь. Его лучший случай — небольшая точная правка. «случайно» — random.choice сервера по умеющим, НЕ жребий drand; kimi в случайный выбор не входит — только явно. grok — через pty, ПЕСОЧНИЦЫ НЕТ (Landlock на этой машине не готовится): ограничен только словами задания. deepseek — в кресле dsh (агентный харнесс), не HTTP-голос стола. gemini файлов не видит — только ревьюер.">
+        <option value="">случайно</option>
+        <option value="codex">codex</option>
+        <option value="claude">claude</option>
+        <option value="grok">grok</option>
+        <option value="deepseek">deepseek (dsh)</option>
+        <option value="kimi">kimi ⚠ дорогой</option>
+      </select>
+    </div>
+    <div class="qrow">
+      <input id="scopefiles" placeholder="скоуп: файлы через запятую (пусто — не заявлен)" title="Заявка исполнительского намерения (спека п.1): какие файлы правка ИМЕЕТ ПРАВО трогать (можно маски: src/*.py; каталог целиком — со слэшем: src/sub/). Гейт при приёмке сверит диф с заявкой — вышедший за скоуп акт не пройдёт. Пусто — скоуп не заявлен, сверки не будет, и событие merge честно это скажет." style="flex:1;min-width:12rem">
+    </div>
+    <div class="qrow">
+      <input id="actid" placeholder="акт" title="Идентификатор акта правки (hex из события edit_open; после кнопки «Правка» подставляется сам). Кнопки ниже действуют на него." style="width:7.5rem">
+      <label id="batchlab" title="Тумблер этапа 5 (умолчание — ПОШТУЧНО: проверено, доказано, работает). Включён — кнопка «Ревизия» ревизует ВСЕ ждущие акты одной пачкой: один веер вызовов вместо N, вердикты по каждому акту отдельной строкой «ВЕРДИКТ <act>: …». Потолки честные: до 4 актов и 60К символов дифа — внимание ревьюера не резина, большие правки только поштучно. Выбор запоминается."><input type="checkbox" id="revbatch">батчем</label>
+    </div>
+    <div class="qrow">
+      <button id="revbtn" title="Разослать диф ветки акта ВСЕМ голосам, кроме исполнителя (правило 13 в миниатюре). Каждый ответ — событие edit_review в ленте с вердиктом первой строкой (ОДОБРЯЮ/ОТКАЗ) и sha, на который он дан. Платно: до пяти вызовов. Доправка после ревизии меняет sha — старые одобрения гаснут.">Ревизия</button>
+      <button id="mrgbtn" title="Принять правку в main через гейт: аренда закрыта (или adopt) · база не сдвинута · одобрений ≥2 и ни одного ОТКАЗА — всё на текущий sha ветки. Merge-коммит несёт Reviewed-by и тройку sha; автор коммита — голос-исполнитель. Истина — ref: рабочая копия обновляется после и только чистая.">Принять</button>
+      <button id="adoptbtn" title="Для ВЫЛЕТЕВШЕГО акта: явное решение Автора рассмотреть работу из карантина (событие edit_adopt). Снимает одно условие гейта — закрытую аренду; ревизия, кворум и база остаются в силе (спека п.9).">Adopt</button>
+    </div>
+    <div class="qrow">
+      <label id="actfeedlab" title="Опциональная ЛЕНТА АКТОВ (идея голоса claude из раунда вкладки-v1): каждый акт — строка со стадиями «кресло → диф → ревизия N/M → merge», и кнопка существует только на той стадии, где она легальна: Ревизия у закрытого, Принять при кворуме, Adopt у вылетевшего. Выбор запоминается."><input type="checkbox" id="actfeed">лента актов</label>
+    </div>
+    <div id="actlist" hidden></div>
+    </div>
+
+</div>
+<div id="bar">
+  <div class="grip grip-h" id="grip-bar" title="Высота поля ввода. Тяните; положение запоминается. Двойной щелчок — вернуть по умолчанию."></div>
+  <textarea id="msg" placeholder="Реплика в комнату (Enter — отправить, Alt+Enter — перенос строки; @имя — адресно)"></textarea>
+  <div id="acts">
+    <div class="grip grip-v" id="grip-acts" title="Ширина колонки кнопок. Тяните; положение запоминается. Двойной щелчок — вернуть по умолчанию."></div>
+    <div class="qrow" id="sendrow">
+    <button id="say" title="Реплика в общий разговор. Отвечают НЕ все и не по очереди: кому говорить, решает протокол live.py — адресат «@имя», поднявшие руку («ХОЧУ СЛОВО») и тот, кто дольше всех молчал (правило 7.5). Нить у каждого голоса своя, в неё уходит только дельта ленты. Enter — отправить, Alt+Enter — перенос строки.">Сказать</button>
+    <button id="blind" title="Новая тема слепым ходом: отмеченные голоса отвечают ОДНОВРЕМЕННО и не видя друг друга. Это единственный барьер против каскада — когда голос смещается к первому уверенному чужому ответу, даже если свой был точнее (правило 9). Ответы копятся в памяти дирижёра и раскрываются разом, на диск до раскрытия не попадая.">Слепой ход</button>
+    </div>
+    <div class="qrow" id="roundrow">
+      <button id="round" title="Полный протокол стола, а не просто вопрос: жребий ведущего по drand → ведущий разворачивает вопрос в затравку → слепая фаза → открытая критика витками → свод карточкой. Долго и платно: шесть голосов на каждом шаге. Вопрос берётся из поля слева, имя раунда спросят следом. Без галочки «авто» такт встанет после слепой фазы — посмотреть ответы.">Раунд стола</button>
+      <label class="auto" title="Без галочки такт останавливается после слепой фазы: rebut и summarize запускает человек, посмотрев ответы. С галочкой choir.py run сам крутит витки критики и свод — до карточки, без вопросов; остановить можно кнопкой «Стоп», она снимет такт на ближайшей паузе.">
+        <input type="checkbox" id="auto"><span>авто</span>
+      </label>
+      <select id="rebuts" title="витков открытой критики в раунде; потолок 3 — правило 12">
+        <option value="1" selected>×1</option>
+        <option value="2">×2</option>
+        <option value="3">×3</option>
+      </select>
+      <select id="canary" title="Канарейка слепоты (раунд стол-v3-изоляция, 2026-09-16): в слепой фазе седьмой голос получает задание НАЙТИ чужие ответы этого раунда на машине — журнал, карантин, истории сессий CLI, /tmp, процессы. Вернулся с «ЧИСТО» — фаза получает метку «слепота проверена»; нашёл — запись canary в журнале раунда с путями. Платный вызов; голос с диском и не из участников раунда (сам он в ответах не участвует).">
+        <option value="" selected>🐤 нет</option>
+        <option value="codex">🐤 codex</option>
+        <option value="claude">🐤 claude</option>
+        <option value="grok">🐤 grok (сессия по cwd: станет «последней» для комнаты)</option>
+      </select>
+    </div>
+    <div class="qrow" id="quickrow">
+      <button id="quick" title="Один голос, без протокола: ни слепой фазы, ни витков критики, ни свода. Для мелочей — уточнить факт, проверить связь, спросить того, кто в теме. Дёшево именно потому, что зовётся один канал; чтобы спросить всех — «Слепой ход», чтобы получить решение стола — «Раунд стола».">Быстрый вопрос</button>
+      <select id="qvoice" title="Кого спросить. «случайно» — выбор оставлен серверу; пока сервер режим не объявил, голос тянет само окно и говорит об этом строкой ниже (это не жребий drand — просто случайный выбор для мелочи)">
+        <option value="">случайно</option>
+      </select>
+      <label id="qexeclab" title="coder: текст уходит не вопросом, а ЗАДАНИЕМ НА ПРАВКУ тому же голосу — с worktree, арендой и гейтом, как во вкладке 🔧. Если выбранный голос правок не умеет (умеющих объявляет сервер; gemini не умеет — файлов не видит), кресло уходит случайному из умеющих — и подмена называется вслух. ВЫКЛ по умолчанию — решение стола (раунд вкладки-v1, 6/6): самый частый жест окна не должен по умолчанию быть платной правкой с правом записи. Платно, с подтверждением."><input type="checkbox" id="qexec">coder</label>
+    </div>
+    <div class="qrow" id="ctlrow">
+    </div>
+    <div class="qrow">
+      <button id="stop" hidden title="Выставить флаг-стоп: дирижёр закончит текущий шаг и не начнёт следующий">Стоп</button>
+      <button id="abort" hidden title="Прервать ВСЕ идущие ходы (POST /abort). Что уже записано в ленту — останется. НО: ответы слепой фазы идущего раунда живут только в памяти дирижёра и попадают на диск лишь при закрытии фазы — прерывание стирает их бесследно, вместе с оплатой. Мягкий путь — «Стоп»: он даёт дирижёру дойти до конца шага. То же самое делает Esc в поле ввода, оба пути спрашивают подтверждение.">Прервать всё</button>
+    </div>
+    <div id="acterr" hidden></div>
+  </div>
+</div>
+<script>
+const feed=document.getElementById('feed'),msg=document.getElementById('msg');
+const qsel=document.getElementById('qvoice');
+// ── ПРАВКА: кресло исполнителя одному голосу ────────────────────────
+// ── гейт этапа 3: ревизия дифа и приёмка ──────────────────────────
+function actId(){return document.getElementById('actid').value.trim()}
+async function gatePost(path,body,okMsg){
+  let r;
+  try{
+    r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(body)});
+  }catch(e){return acterr('сервер не ответил: '+e)}
+  let j={};try{j=await r.json()}catch(_){}
+  if(!r.ok)return acterr(((j&&j.error)||('ошибка '+r.status)));
+  acterr(okMsg(j),true);
+}
+const batchBox=document.getElementById('revbatch');
+try{batchBox.checked=localStorage.getItem('rt-revbatch')==='1'}catch(_){}
+batchBox.onchange=function(){try{localStorage.setItem('rt-revbatch',batchBox.checked?'1':'0')}catch(_){}}
+document.getElementById('revbtn').onclick=function(){
+  if(batchBox.checked){
+    if(!confirm('Ревизия ПАЧКОЙ: все ждущие акты одним веером вызовов '+
+        '(потолки: 4 акта, 60К дифа). Платно. Пускаем?'))return;
+    gatePost('/edit_review',{batch:true},function(j){return 'ревизия пачки запущена — вердикты придут в ленту'});
+    return;
+  }
+  const a=actId(); if(!a)return acterr('нужен акт (поле слева)');
+  if(!confirm('Ревизия акта '+a+': диф уйдёт всем голосам, кроме исполнителя. Платно. Пускаем?'))return;
+  gatePost('/edit_review',{act:a},function(j){return 'ревизия запущена: акт '+j.act+' — вердикты придут в ленту'});
+};
+document.getElementById('mrgbtn').onclick=function(){
+  const a=actId(); if(!a)return acterr('нужен акт (поле слева)');
+  if(!confirm('Принять акт '+a+' в main? Гейт проверит кворум, базу и аренду; main сдвинется.'))return;
+  gatePost('/edit_merge',{act:a},function(j){
+    return 'принято: '+(j.result_sha||'').slice(0,12)+' (reviewed-by: '+
+      ((j.reviewed_by||[]).join(', '))+'); копия: '+j.worktree_copy});
+};
+document.getElementById('adoptbtn').onclick=function(){
+  const a=actId(); if(!a)return acterr('нужен акт (поле слева)');
+  if(!confirm('Adopt акта '+a+': рассмотреть ВЫЛЕТЕВШУЮ работу из карантина?'))return;
+  gatePost('/edit_adopt',{act:a},function(j){return 'adopt записан: '+j.act});
+};
+// ── ЛЕНТА АКТОВ (опция; идея голоса claude, раунд вкладки-v1) ──────
+const actFeedBox=document.getElementById('actfeed');
+try{actFeedBox.checked=localStorage.getItem('rt-actfeed')==='1'}catch(_){}
+actFeedBox.onchange=function(){
+  try{localStorage.setItem('rt-actfeed',actFeedBox.checked?'1':'0')}catch(_){}
+  renderActs();
+};
+const STAGE_RU={dropped:'отброшена',working:'в кресле',opening:'открывается',closed:'закрыт',
+  crashed:'ВЫЛЕТ',adopted:'adopt',merged:'принят',lost:'ветка потеряна'};
+function renderActs(){
+  const box=document.getElementById('actlist');
+  const acts=(window.STATE&&window.STATE.acts)||null;
+  box.hidden=!actFeedBox.checked;
+  if(!actFeedBox.checked)return;
+  if(acts===null){box.textContent='акты: сервер сводку не прислал';return}
+  if(!acts.length){box.textContent='актов пока нет';box.dataset.sig='';return}
+  // Перерисовка только при ИЗМЕНЕНИИ данных: опрос 15 с иначе срывал
+  // клик по стадийной кнопке ровно в момент rebuild (нашёл gemini).
+  const sig=JSON.stringify(acts);
+  if(box.dataset.sig===sig)return;
+  box.dataset.sig=sig;
+  box.innerHTML='';
+  acts.forEach(function(a){
+    const row=document.createElement('div');
+    row.className='actrow';
+    const ap=(a.approvals||[]).length,q=a.quorum||2,
+      ref=(a.refused||[]).length;
+    let stagebar='кресло';
+    if(a.stage==='merged')
+      stagebar='кресло → диф → ревизия → merge '+(a.result||'');
+    else if(a.stage==='lost')
+      stagebar='ветка исчезла из репозитория';
+    else if(a.stage==='dropped')
+      stagebar='отброшена Автором — ветки нет, история в ленте';
+    else if(a.stage!=='working'&&a.stage!=='opening')
+      stagebar='кресло → диф → ревизия '+ap+'/'+q+
+        (ref?(' (ОТКАЗ: '+a.refused.join(',')+')'):'');
+    row.title='акт '+a.act+' ['+a.voice+(a.seat&&a.seat!==a.voice?
+      '/'+a.seat:'')+']\n'+(a.task||'')+'\nпроект: '+(a.project||'');
+    row.innerHTML='<code>'+esc(a.act.slice(0,8))+'</code> ['+esc(a.voice)+
+      '] <b>'+esc(STAGE_RU[a.stage]||a.stage)+'</b> · '+esc(stagebar)+' ';
+    // Кнопка существует только на легальной стадии — перегруз лечится
+    // не переносом кнопок, а их отсутствием вне момента.
+    function btn(label,fn){
+      const b=document.createElement('button');
+      b.textContent=label;b.onclick=fn;row.appendChild(b);
+    }
+    if(a.stage==='closed'||a.stage==='adopted'){
+      if(!ref&&ap<q)btn('Ревизия',function(){
+        if(!confirm('Ревизия акта '+a.act+': платный веер всем, кроме '+
+          'исполнителя. Пускаем?'))return;
+        gatePost('/edit_review',{act:a.act},function(){return 'ревизия '+
+          a.act+' запущена — вердикты придут в ленту'});
+      });
+      if(ap>=q&&!ref)btn('Принять',function(){
+        if(!confirm('Принять акт '+a.act+' в main? Кворум '+ap+'/'+q+
+          '. Ветка сольётся, main сдвинется.'))return;
+        gatePost('/edit_merge',{act:a.act},function(j){
+          return 'принято: '+(j.result_sha||'').slice(0,12)});
+      });
+    }
+    if(a.stage==='crashed')btn('Adopt',function(){
+      if(!confirm('Adopt акта '+a.act+': рассмотреть вылетевшую работу '+
+        'из карантина?'))return;
+      gatePost('/edit_adopt',{act:a.act},function(){return 'adopt: '+a.act});
+    });
+    box.appendChild(row);
+  });
+}
+const editBtn=document.getElementById('editbtn');
+editBtn.onclick=async function(){
+  const task=msg.value.trim(); if(!task)return acterr('пустое задание');
+  const project=document.getElementById('project').value.trim();
+  if(!project)return acterr('правке нужен проект: укажите путь к репозиторию');
+  const voice=document.getElementById('evoice').value||'random';
+  // Подтверждение всегда: исполнитель получает ПРАВО ЗАПИСИ в worktree
+  // проекта, и это платный агентный вызов — не реплика в чат.
+  if(!confirm('Выдать кресло исполнителя «'+(voice==='random'?'случайно':voice)+
+      '»?\nПроект: '+project+'\nЗадание: '+task.slice(0,200)+
+      '\n\nПравка пойдёт в отдельный worktree; merge в main — отдельно.'))
+    return acterr('правка отменена', true);
+  acterr('');
+  // Кнопка гаснет на время запроса: открытие кресла — секунды (git
+  // worktree), и второй клик слал бы второй платный POST; сервер один
+  // отклонит, но гонка ответов путала отказ с успехом (нашли codex и
+  // deepseek независимо).
+  editBtn.disabled=true;
+  let r;
+  try{
+    r=await fetch('/edit',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({task:task,voice:voice==='random'?null:voice,
+                           project:project,
+                           files:document.getElementById('scopefiles').value})});
+  }catch(e){editBtn.disabled=false;return acterr('сервер не ответил: '+e)}
+  finally{editBtn.disabled=false}
+  let j={};try{j=await r.json()}catch(_){}
+  if(!r.ok)return acterr('правка не открыта: '+((j&&j.error)||('ошибка '+r.status)));
+  if(!j||!j.act)return acterr('сервер ответил 200 без акта — поле не чищу');
+  // Чистим ТОЛЬКО если Автор не дописал текст за время запроса: иначе
+  // стирается свеженабранное (нашёл codex).
+  if(msg.value.trim()===task)msg.value='';
+  try{document.getElementById('actid').value=j.act}catch(_){}
+  acterr('кресло выдано: акт '+j.act+' ['+(j.voice||'?')+'], ветка act/'+j.act,true);
+};
+const seen=new Set();
+// ОДНА область на весь список (наказ 2026-08-31). Была карта по
+// строкам: тумблер в каждой строке терялся среди ячеек, и по виду
+// панели нельзя было сказать, чью пару ты сейчас правишь.
+let SCOPE='room';
+// 🔧 из прошлой сессии НЕ поднимаем: Автор перезапустил окно и увидел
+// «кнопки чата пропали совсем» — стартуем в 💬 (или 🎼, если так было),
+// кодер — только по клику (2026-09-02).
+try{const v=localStorage.getItem('rt-scope');if(v==='rounds')SCOPE=v}catch(_){}
+// ?tab=room|rounds|exec — явная просьба в адресе (закладка на вкладку
+// кодера, скриншот в проверке): она сильнее памяти localStorage.
+try{const q=new URLSearchParams(location.search).get('tab');
+  if(q==='room'||q==='rounds'||q==='exec')SCOPE=q}catch(_){}
+// Что сервер объявил про себя. Оба поля молодые, и «не объявил» здесь
+// НЕ значит «не умеет» — значит «окно не знает». Разница важна: пока
+// не знаем, окно выбирает осторожный путь (см. sendQuick), а не
+// уверенный (правило 8.5: свойство, не обеспеченное механикой, врёт).
+let MODES=null;      // /state.modes — какие режимы отправки есть у /act
+let LAST_RUN=[];     // /state.running — что идёт прямо сейчас
+function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML}
+// Время реплики. В ленте ts — UTC (live.py пишет isoformat с +00:00), а
+// человек живёт в своём поясе: на виду МЕСТНОЕ и обязательно с секундами
+// (наказ Автора 2026-08-25 — «точный таймстамп»), а полная метка с
+// поясом и исходный UTC — в title. Без UTC в подсказке сверка реплики со
+// строкой журнала становится гаданием, а сверяют их постоянно: порядок
+// drand, context_sha, «кто когда ответил».
+function isoUTC(s){
+  s=String(s).trim();
+  // Пояса нет — объявляем UTC ЯВНО: иначе Date прочтёт строку как
+  // местное время и метка молча уедет на разницу поясов.
+  return /(?:[zZ]|[+\-]\d{2}:?\d{2})$/.test(s)?s:s+'Z';
+}
+// Полные метки времени (галочка «дата»): short — с датой, когда включено.
+// Флаг читают все, кто зовёт tsView; уже нарисованные строки ленты
+// перерисовывает applyTsFull по data-ts (сырое поле ts хранится на узле).
+let TS_FULL=false; try{TS_FULL=localStorage.getItem('rtTsFull')==='1'}catch(_){}
+function tsView(raw){
+  if(!raw)return {short:'',full:'времени нет в событии'};
+  const d=new Date(isoUTC(raw));
+  // Непонятную метку НЕ режем по позициям: кусок чужой строки выглядит
+  // как время и читается как время, хотя им не является.
+  if(isNaN(d.getTime()))
+    return {short:'—',full:'метка времени не разобрана: '+String(raw)};
+  const p=n=>String(n).padStart(2,'0');
+  const hms=p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds());
+  const off=-d.getTimezoneOffset(),sg=off<0?'-':'+',ab=Math.abs(off);
+  const zone='UTC'+sg+p(Math.floor(ab/60))+(ab%60?':'+p(ab%60):'');
+  const day=d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate());
+  const utc=d.getUTCFullYear()+'-'+p(d.getUTCMonth()+1)+'-'+p(d.getUTCDate())+
+    ' '+p(d.getUTCHours())+':'+p(d.getUTCMinutes())+':'+p(d.getUTCSeconds());
+  return {short:TS_FULL?(day+' '+hms):hms,
+    full:'местное: '+day+' '+hms+' '+zone+'\nв журнале (UTC): '+utc+
+         '\nсырое поле ts: '+String(raw)};
+}
+// ── КАРТОЧКА РАУНДА ─────────────────────────────────────────────────
+// Под событием act_status раунда (done/error) — кнопка «ответы»; по
+// клику окно читает GET /round_view и рисует дословно: затравка, слепые
+// ответы каждого голоса, витки, свод. Кнопки «Виток критики» и «Свод»
+// — шаги такта по человеку (POST /round_step), раньше они были только
+// в терминале. Карточка одна на раунд: последнее событие её обновляет.
+const RCARDS={};
+function roundCard(host,name){
+  let box=RCARDS[name];
+  if(!box){
+    box=document.createElement('div');box.className='rcard';
+    box.dataset.round=name;RCARDS[name]=box;
+  }
+  host.appendChild(box);   // переезжает под самое свежее событие раунда
+  // Раунд шагнул дальше — открытая карточка перечитывается сама.
+  if(box.querySelector('.rbody'))loadRound(name,box);
+  if(!box.dataset.built){
+    box.dataset.built='1';
+    const b=document.createElement('button');
+    b.textContent='ответы раунда «'+name+'»';
+    b.title='Показать затравку, слепые ответы каждого голоса, витки критики и свод — дословно из room.jsonl';
+    b.onclick=function(){loadRound(name,box)};
+    box.appendChild(b);
+    const st=document.createElement('span');st.className='rstat';box.appendChild(st);
+  }
+  return box;
+}
+function rline(label,rec){
+  const d=document.createElement('details');
+  const sm=document.createElement('summary');
+  const meta=[rec.voice||'',rec.status||'',rec.model?('модель '+rec.model+(rec.model_fallback?' (запасная)':'')):'',
+    (rec.elapsed_s!=null)?(Math.round(rec.elapsed_s)+' с'):'',
+    (rec.text?(rec.text.length+' симв.'):''),rec.recovered?'восстановлено из истории CLI':'',
+    (rec.jail&&String(rec.jail).indexOf('bwrap')===0)?'🔒':(rec.jail==='none'?'⚠ без клетки':''),
+    rec.ended_by?('снят: '+rec.ended_by):'',(rec.early_warns&&rec.early_warns.length)?('⚠ признаков отказа: '+rec.early_warns.length):'',
+    // Пометки журнала — не снимать: опоздавший ответ добран после
+    // раскрытия и слепым не является (правила 4 и 8.5; субагент).
+    rec.nonblind?'НЕСЛЕПОЙ (добран после раскрытия)':'',rec.late&&!rec.nonblind?'поздний':'',
+    rec.eyes==='digest'?('читал ПЕРЕСКАЗ от '+(rec.digest_by||'?')+', не оригиналы'):'',
+    rec.role==='digest'?('ПЕРЕСКАЗ для '+(rec.digest_for||'?')+(rec.digest_used===false?(' — отвергнут: '+(rec.digest_reject||'')):'')+' (не позиция)'):''].filter(Boolean);
+  sm.textContent=label+': '+meta.join(' · ');
+  // якорем бывает ответ ok закрытой фазы и удавшийся свод; затравка,
+  // жребий, ПАС и отказы — нет
+  if(rec.id&&(rec.status==='ok'||rec.role==='seed')&&(rec.role==='answer'||rec.role==='summary'||rec.role==='digest'||rec.role==='seed_expanded'||rec.role==='seed')&&!(rec.role==='digest'&&rec.digest_used===false)&&(rec.text||'').trim()){
+    const b=anchorButton('room:'+rec.id,rec.voice||'?',(rec.text||'').length);
+    b.addEventListener('click',function(e){e.preventDefault();e.stopPropagation()},true);
+    sm.appendChild(b);
+  }
+  d.appendChild(sm);
+  const pre=document.createElement('pre');
+  // Отказ канала choir.py пишет в detail (правило 4): quota/stalled
+  // иначе выглядели пустым ответом (нашли grok, codex).
+  pre.textContent=rec.text||rec.detail||rec.error||'(пусто)';
+  d.appendChild(pre);
+  return d;
+}
+async function loadRound(name,box){
+  const st=box.querySelector('.rstat');st.textContent=' загружаю…';
+  let r,j={};
+  try{r=await fetch('/round_view?name='+encodeURIComponent(name));j=await r.json();}
+  catch(e){st.textContent=' сервер не ответил: '+e;return}
+  if(!r.ok||!j.found){st.textContent=' '+((j&&j.error)||'записей раунда нет');return}
+  st.textContent='';
+  let body=box.querySelector('.rbody');
+  if(!body){body=document.createElement('div');body.className='rbody';box.appendChild(body)}
+  body.innerHTML='';
+  const head=document.createElement('div');head.className='rstat';
+  head.textContent='ведущий: '+(j.conductor||'нет жребия')+' · ответов: '+(j.n_ok_answers||0)+
+    ' из '+j.answers.length+' · витков: '+j.rebuts+' из '+(j.rebut_cap||3)+
+    ' · свод: '+(j.summary_ok?'есть':(j.summary?'не удался':'нет'))+
+    (j.summarizer?' · сводит: '+j.summarizer:'')+(j.project?' · проект: '+j.project:'');
+  body.appendChild(head);
+  if(j.seed)body.appendChild(rline('затравка ('+(j.seed.voice||'')+')',j.seed));
+  j.answers.forEach(function(a){body.appendChild(rline('слепой ответ',a))});
+  (j.rebut_records||[]).forEach(function(a){body.appendChild(rline('виток '+(a.phase||''),a))});
+  if(j.summary_head){const h=document.createElement('div');h.className='dim';h.textContent=j.summary_head;body.appendChild(h)}
+  if(j.coverage_now){const c=document.createElement('div');c.className='dim';c.title='Состав по журналу на этот момент, без свода: звали, ответили, ПАС, упали, долги. В своде та же карта повторится шапкой.';c.textContent='сейчас: '+j.coverage_now.replace(/^> /,'');body.insertBefore(c,body.firstChild)}
+  if(j.summary)body.appendChild(rline('свод ('+(j.summary.voice||'')+')',j.summary));
+  // Jev-проверки дирижёра: пометки, не правки (jev-v2 п.1–4)
+  (j.jev_checks||[]).forEach(function(c){const d=document.createElement('div'); d.className='dim';
+    const ps=c.p?Object.keys(c.p).map(function(k){return k+' '+(c.p[k]==null?'?':Number(c.p[k]).toFixed(2))}).join(', '):'';
+    let t='';
+    if(c.role==='digest_check')t='Jev · канарейка пересказа для '+(c.digest_for||'?')+' ('+(c.phase||'')+'): '+ps;
+    else if(c.role==='summary_check'){t='Jev · второй глаз на свод ('+(c.by||'?')+'): верность '+ps;
+      if(c.loss&&Object.keys(c.loss).length){const ln=c.loss_levels||[]; t+=' · что потерял свод: '+Object.keys(c.loss).map(function(k){const x=c.loss[k]; return k+' '+(x==null?'?':(ln[x]||x))}).join(', ')}
+      if(c.loss_warn&&c.loss_warn.length){t=(t.charAt(0)==='⚠'?'':'⚠ ')+t+' — потеряно главное у: '+c.loss_warn.join(', ')+' (открыть их ответы)'; d.className=''}}
+    else if(c.role==='effort_shadow')t='Jev · советник усилия (тень, не применяется): оценка '+(c.jev_level||'?')+'; шли: '+Object.keys(c.used||{}).map(function(k){return k+' '+(c.used[k]||'—')}).join(', ')+(c.would_lower&&c.would_lower.length?'; понизить можно было бы: '+c.would_lower.join(', '):'');
+    if(c.clipped)t+=' (ответы обрезаны для сверки: '+Object.keys(c.clipped).map(function(k){return k+' '+c.clipped[k].from+'→'+c.clipped[k].to}).join(', ')+')';
+    if(c.status==='partial')t+=' — не всё сверено: '+(c.detail||'');
+    else if(c.status!=='ok')t+=' — не состоялась: '+(c.detail||c.status);
+    if(c.warn&&c.warn.length){t=(t.charAt(0)==='⚠'?'':'⚠ ')+t+' — пометка: '+c.warn.join(', ')+' (порог '+c.threshold+'; решает человек)'; d.className=''}
+    d.title='Проверка Jev через прокси стола: только пометка, текст не меняется (раунд jev-v2, решение Автора). Вызов — событие jev в ленте.';
+    d.textContent=t; body.appendChild(d)});
+  // «свои идеи» голосов с оценкой Jev: стоящие — жирным числом (решение Автора 2026-10-08)
+  if(j.ideas&&(j.ideas.ideas||[]).length){const box=document.createElement('div'); box.style.margin='.3rem 0';
+    const h=document.createElement('div'); h.className='dim'; h.textContent='дополнения голосов («своя идея»: что, по их мнению, пропустили остальные) — ценность по Jev 0–4, стоящие'+(j.ideas.worthy_value!=null?(' (≥ '+j.ideas.worthy_value+', ≈ верхние 10 %)'):(' (ступень ≥ '+(j.ideas.worthy||3)+', старая оценка)'))+' жирным; «⟂ не в своде» — ценное, но в свод не попало; в работу — кнопкой во вкладке секретаря:'; box.appendChild(h);
+    const lv=j.ideas.levels||[];
+    function iv_(x){return x.value!=null?x.value:(x.score==null?-1:x.score)}
+    (j.ideas.ideas||[]).slice().sort(function(a,b){return iv_(b)-iv_(a)}).forEach(function(it){
+      const wv=j.ideas.worthy_value, sv=(it.value!=null?it.value:it.score);
+      const r=document.createElement('div'); const n=document.createElement(sv!=null&&(wv!=null?sv>=wv:sv>=(j.ideas.worthy||3))?'b':'span');
+      n.textContent='['+(sv==null?'?':Number(sv).toFixed(1))+'] '; n.title=it.score!=null?('ступень '+it.score+': '+(lv[it.score]||'')):'не оценена';
+      r.appendChild(n); if(it.lost){const l=document.createElement('b'); l.textContent='⟂ не в своде '; l.title='Jev: ценное (ценность ≥ '+(j.ideas.lost_value||2.5)+'), а в свод не попало (P '+(it.in_summary==null?'?':Number(it.in_summary).toFixed(2))+')'; r.appendChild(l)}
+      r.appendChild(document.createTextNode((it.voice||'?')+' ('+(it.phase||'')+'): '+it.text)); box.appendChild(r)});
+    if(j.ideas.status!=='ok'){const e=document.createElement('div'); e.className='dim'; e.textContent='оценка не полная: '+(j.ideas.detail||j.ideas.status); box.appendChild(e)}
+    if(j.ideas.stale){const e=document.createElement('div'); e.className='dim'; e.textContent='сверено с прежним сводом: после него свод переписан, «не в своде» может быть неточным'; box.appendChild(e)}
+    if(j.ideas.has_summary===false){const e=document.createElement('div'); e.className='dim'; e.textContent='свода не было — «дошло ли до свода» не проверялось'; box.appendChild(e)}
+    body.appendChild(box)}
+  // шаги по человеку — кнопка есть только там, где шаг легален
+  const row=document.createElement('div');
+  function stepBtn(label,step,confirmText){
+    const b=document.createElement('button');b.textContent=label;
+    b.onclick=async function(){
+      if(!confirm(confirmText))return;
+      b.disabled=true;
+      let rr,jj={};
+      try{rr=await fetch('/round_step',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({name:name,step:step,brief:briefOn(),thoughts:thoughtsOn()})});jj=await rr.json();}
+      catch(e){b.disabled=false;return acterr('сервер не ответил: '+e)}
+      if(!rr.ok){b.disabled=false;return acterr((jj&&jj.error)||('ошибка '+rr.status))}
+      // Кнопки гаснут до финала акта: карточка перечитается по событию.
+      row.querySelectorAll('button').forEach(function(x){x.disabled=true});
+      acterr('шаг «'+step+'» раунда '+name+' запущен: акт '+jj.act,true);
+    };
+    row.appendChild(b);
+  }
+  const who=j.summarizer||j.conductor;
+  if(j.summary_ok){
+    const d=document.createElement('button');d.textContent='Развить тему';
+    d.title='Новый раунд по итогам этого: свод «'+name+'» уйдёт в вопрос ДОСЛОВНО (правило 3), '+
+      'жребий ведущего, слепая фаза и витки — заново. Нажатие только готовит форму: '+
+      'имя «'+nextRoundName(name)+'», ваш новый вопрос — в поле реплики; запуск — кнопкой «Раунд».';
+    d.onclick=function(){developRound(name,(j.summary&&j.summary.text)?j.summary.text.length:0)};
+    row.appendChild(d);
+  }
+  if(j.conductor&&j.n_ok_answers&&j.rebuts<(j.rebut_cap||3)&&!j.summary_ok)
+    stepBtn('Виток критики №'+(j.rebuts+1),'rebut','Виток открытой критики раунда «'+name+
+      '»: каждый голос читает чужие ответы под анонимными метками. Все голоса, платно. Пускаем?');
+  if(j.conductor&&j.n_ok_answers&&!j.summary_ok)
+    stepBtn('Свод ('+who+')','summarize','Свод раунда «'+name+'» пишет '+who+
+      (j.summarizer?' (запасной жребий)':' (ведущий по жребию)')+'. Один вызов, платно. Пускаем?');
+  body.appendChild(row);
+}
+function add(ev){
+  if(ev.id&&seen.has(ev.id))return; if(ev.id)seen.add(ev.id);
+  const el=document.createElement('div');
+  const a=ev.author||'?',k=ev.kind||'';
+  // kind различаем ОБЯЗАТЕЛЬНО: live.py пишет отказ голоса событием
+  // kind=error с текстом в detail (нашёл kimi, переезд-v1). Рендер по
+  // одному лишь text рисовал такой отказ ПУСТОЙ СТРОКОЙ — интерфейс
+  // молча врал, что голос ответил ничем.
+  const sys=(a==='chamber'||a==='choir'||a==='roundtable'||k==='act_status'||
+             k==='lot_commit'||k==='lot_reveal');
+  el.className='ev '+(k==='error'?'err':(k==='early_warn'?'warn':(a==='arr'?'arr':(sys?'sys':''))))+(ev.thread?' thr':'');
+  let body=(ev.text||'')||(k==='error'?'(пусто)':'');
+  // Ревизия — ЦЕЛИКОМ (правило 3; Автор 2026-09-14: «в ленте я вижу
+  // обрезанные ответы»): text события — превью в 400 символов, полный
+  // текст в full_text. Длинную сворачиваем, кнопка разворачивает.
+  let fold=false;
+  if(ev.full_text&&k==='edit_review'){const m=/^(ревизия [^:]*:)/.exec(ev.text||''); body=(m?m[1]+'\n':'')+ev.full_text; fold=ev.full_text.length>700}
+  // отчёт ревизии правки Клода: итог (кто, вердикт, дефекты, файлы) целиком, ниже — запись
+  if(ev.full_text&&k==='review_note'){body=(ev.text||'')+'\n\n'+ev.full_text; fold=true}
+  const det=ev.detail?'<div class="det">'+esc(ev.detail)+'</div>':'';
+  const badge=(k&&k!=='say'?'<span class="kind">'+esc(k)+'</span>':'')+
+    (ev.thread?'<span class="kind" title="ответ в адресной ветке между голосами">↳ ветка '+esc(String(Number(ev.thread)||''))+'</span>':'')+
+    (k==='error'&&ev.status?'<span class="kind">'+esc(String(ev.status))+'</span>':'')+
+    // «Продолжить отсюда»: у реплики Автора — адрес якоря; у ответа голоса —
+    // нить начата заново (поле session_fresh пишет комната, не окно)
+    (ev.anchor?'<span class="kind" title="продолжение от одного сообщения журнала, дословно">⚓ от '+
+      esc(typeof ev.anchor==='string'?ev.anchor:String(ev.anchor.addr||''))+
+      (ev.session_fresh?' · нить заново':'')+'</span>':'');
+  const tv=tsView(ev.ts);
+  el.innerHTML='<span class="who">'+esc(a)+'</span>'+badge+
+    '<span class="ts">'+esc(tv.short)+'</span>'+
+    '<div class="t'+(fold?' fold':'')+'">'+esc(body)+'</div>'+
+    (fold?'<button class="unfold" type="button">развернуть ('+ev.full_text.length+' симв.)</button>':'')+det;
+  const ub=el.querySelector('.unfold'); if(ub)ub.onclick=function(){const t=el.querySelector('.t'); const f=t.classList.toggle('fold'); ub.textContent=f?('развернуть ('+ev.full_text.length+' симв.)'):'свернуть'};
+  // Полная метка — СВОЙСТВОМ, а не внутрь строки html: esc() экранирует
+  // < > &, но не кавычку, а тут значение попадало бы в атрибут. Поле ts
+  // приходит из ленты, то есть снаружи; строка вида `x" onmouseover=…`
+  // вырвалась бы из атрибута. Свойству разметка не страшна вовсе.
+  const tsEl=el.querySelector('.ts'); if(tsEl){tsEl.title=tv.full; tsEl.dataset.ts=String(ev.ts||'')}
+  // «Продолжить отсюда» — под любой репликой (голоса или Автора) и
+  // вердиктом контролёра; не под ПАС, отказом и служебным: якорем они
+  // не бывают (раунд prodolzhit-lyuboe-v1). Уходит АДРЕС, текст берёт сервер.
+  // ЛЮБОЕ событие с текстом (решение Автора 2026-10-08, п. 3): решение,
+  // отчёт, реплика секретаря, ревизия, заметка, Jev — кроме ПАС и отказа;
+  // у ревизий полный текст в full_text — длина считается по нему
+  // Правило одно с сервером (anchor.resolve): не ПАС, не отказ, не
+  // статус-отказ, есть текст; длина — по тому тексту, что уйдёт
+  if(anchorable(ev)){
+    el.appendChild(anchorButton('live:'+ev.id,anchorAuthor(ev),anchorText(ev).length));
+  }
+  // Тень ранних отказов: жёлтая строка + «снять сейчас» — снимает ОДИН
+  // голос через флаг дирижёру (POST /drop), не весь акт.
+  if(k==='early_warn'&&ev.pgid&&ev.act){
+    const b=document.createElement('button');b.textContent='снять сейчас';b.className='dropnow';
+    b.title='Снять голос '+(ev.voice||'')+' до таймаута: дирижёр убьёт его группу процессов (pgid '+ev.pgid+') и запишет статус dropped с этим признаком. Остальные голоса хода продолжают. Молча ничего не снимается — только по этой кнопке.';
+    b.onclick=async function(){
+      if(!confirm('Снять голос '+(ev.voice||'')+' сейчас? Его ответ в этом ходе пропадёт, остальные продолжат.'))return;
+      b.disabled=true;
+      let r,j={};
+      try{r=await fetch('/drop',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({act:ev.act,pgid:ev.pgid,voice:ev.voice||''})});j=await r.json();}
+      catch(e){b.disabled=false;return acterr('сервер не ответил: '+e)}
+      if(!r.ok){b.disabled=false;return acterr((j&&j.error)||('ошибка '+r.status))}
+      b.textContent='флаг поставлен';
+    };
+    el.appendChild(b);
+  }
+  const stick=feed.scrollHeight-feed.scrollTop-feed.clientHeight<60;
+  feed.appendChild(el); if(stick)feed.scrollTop=feed.scrollHeight;
+  // Раунд: под его завершающим событием — карточка с ответами.
+  // Любое событие с полем round (act_status любого статуса, note о
+  // раунде, запущенном из терминала) — карточка переезжает под него:
+  // ответы можно открыть уже во время слепой фазы, по мере прихода.
+  try{
+    if(ev.round&&(k==='act_status'||k==='note'))roundCard(el,String(ev.round));
+  }catch(_){}
+}
+// ── звонок «как у микроволновки» (просьба Автора 2026-08-25) ─────────
+// Три коротких синусовых «дзынь» на завершение действия. BOOT-порог —
+// чтобы хвост ленты, приходящий при открытии страницы, не устраивал
+// перезвон: звоним только о событиях, случившихся при живой вкладке.
+// (порог по возрасту СТРАНИЦЫ убран: SSE-реконнект после сна ноутбука
+// доносил пачку старых done/error, и все звонили разом; а настоящее
+// событие в первые секунды после загрузки молчало. Теперь: только
+// события, которых лента ещё не видела (fresh), не старше минуты по
+// их собственному ts, и не чаще раза в 2 с.)
+let lastDing=0;
+const bellBox=document.getElementById('bell');
+try{bellBox.checked=localStorage.getItem('rt-bell')!=='0'}catch(_){bellBox.checked=true}
+bellBox.onchange=function(){try{localStorage.setItem('rt-bell',bellBox.checked?'1':'0')}catch(_){}}
+// ── подсказки под выключателем ───────────────────────────────────────
+// CSS отключить title не умеет, поэтому механика двухходовая: при
+// снятой галочке подсказка снимается с элемента В МОМЕНТ наведения
+// (mouseover ловит и элементы, дорисованные позже — шкалы лимитов
+// перерисовываются каждый опрос), текст прячется в data-t; при
+// включении всё возвращается на место одним проходом.
+// «кратко» — умолчание СНЯТО: наказ Автора 2026-09-01 «выводи весь
+// вывод от каждого агента, но опцию оставим». Поэтому здесь ==='1', а
+// не !=='0', как у звонка и подсказок: те по умолчанию включены.
+const briefBox=document.getElementById('brief');
+try{briefBox.checked=localStorage.getItem('rt-brief')==='1'}catch(_){briefBox.checked=false}
+briefBox.onchange=function(){try{localStorage.setItem('rt-brief',briefBox.checked?'1':'0')}catch(_){}}
+function briefOn(){return !!(briefBox&&briefBox.checked)}
+function thoughtsOn(){return !!(document.getElementById('thoughts')||{}).checked}
+const peerBox=document.getElementById('peer');
+try{peerBox.checked=localStorage.getItem('rt-peer')==='1'}catch(_){peerBox.checked=false}
+peerBox.onchange=function(){try{localStorage.setItem('rt-peer',peerBox.checked?'1':'0')}catch(_){}}
+function peerOn(){return !!(peerBox&&peerBox.checked)}
+const hintBox=document.getElementById('hints');
+try{hintBox.checked=localStorage.getItem('rt-hints')!=='0'}catch(_){hintBox.checked=true}
+function stripTitle(el){
+  if(el&&el.getAttribute&&el.getAttribute('title')){
+    el.dataset.t=el.getAttribute('title');el.removeAttribute('title')}
+}
+function applyHints(){
+  document.body.classList.toggle('nohints',!hintBox.checked);
+  try{localStorage.setItem('rt-hints',hintBox.checked?'1':'0')}catch(_){}
+  if(hintBox.checked){
+    document.querySelectorAll('[data-t]').forEach(function(el){
+      // Свежий title (шкалу перерисовали, пока подсказки были
+      // выключены) главнее припрятанного: восстановление поверх него
+      // вернуло бы протухший текст (нашли grok и субагент).
+      if(!el.getAttribute('title'))el.title=el.dataset.t;
+      delete el.dataset.t});
+  }else{
+    document.querySelectorAll('[title]').forEach(stripTitle);
+  }
+}
+hintBox.onchange=applyHints;applyHints();
+// «дата»: перерисовать уже нарисованные метки ленты по data-ts; вкладки
+// (секретарь, дирижёр, окна) перерисуются своими функциями
+const tsBox=document.getElementById('tsfull');
+if(tsBox){tsBox.checked=TS_FULL;
+  tsBox.onchange=function(){TS_FULL=tsBox.checked; try{localStorage.setItem('rtTsFull',TS_FULL?'1':'0')}catch(_){}
+    document.querySelectorAll('.ts[data-ts]').forEach(function(s){s.textContent=tsView(s.dataset.ts).short});
+    // вкладки живут в своём замыкании — их перерисовка вынесена наружу одной функцией (ревизия)
+    try{if(typeof window.applyTsFull==='function')window.applyTsFull()}catch(_){}}}
+// Перерисовка шкал ставит title заново каждые ~15 с; курсор, неподвижно
+// стоящий над шкалой, mouseover при замене узла не получает — родная
+// подсказка всплывала при выключенном hint (нашёл субагент). Наблюдатель
+// ловит КАЖДОЕ появление атрибута, откуда бы оно ни пришло.
+new MutationObserver(function(ms){
+  if(hintBox.checked)return;
+  ms.forEach(function(m){
+    if(m.type==='attributes'){stripTitle(m.target);return}
+    // Узлы, собранные ЦЕЛИКОМ до вставки (шкалы, ячейки), приходят с
+    // уже выставленным title — атрибутной мутации нет, и подсказки
+    // возвращались при выключенном hint (нашли codex и deepseek).
+    m.addedNodes.forEach(function(n){
+      if(n.nodeType!==1)return;
+      stripTitle(n);
+      if(n.querySelectorAll)
+        n.querySelectorAll('[title]').forEach(stripTitle);
+    });
+  });
+}).observe(document.body,{attributes:true,attributeFilter:['title'],
+                          childList:true,subtree:true});
+
+// ── кто ДЕЙСТВИТЕЛЬНО думает ─────────────────────────────────────────
+// Карта акт → множество позванных. Первая редакция держала ОДНО
+// глобальное множество — и чужой act_status сбрасывал фильтр, а после
+// реплики голоса пустое множество гасило всех при живом акте (нашли
+// grok, codex и deepseek). Акт без записи в карте показывается по
+// своему списку из /state — так слепой ход (word_to не пишет) честно
+// показывает всех отмеченных: там одновременно думают действительно
+// все.
+const SPEAK=new Map();
+let AC=null;
+function ding(){
+  if(!bellBox.checked)return;
+  try{
+    AC=AC||new (window.AudioContext||window.webkitAudioContext)();
+    if(AC.state==='suspended')AC.resume();
+    const t0=AC.currentTime;
+    [0,0.19,0.38].forEach(function(off){
+      const o=AC.createOscillator(),g=AC.createGain();
+      o.type='sine';o.frequency.value=1568;
+      g.gain.setValueAtTime(0.0001,t0+off);
+      g.gain.exponentialRampToValueAtTime(0.12,t0+off+0.012);
+      g.gain.exponentialRampToValueAtTime(0.0001,t0+off+0.16);
+      o.connect(g);g.connect(AC.destination);
+      o.start(t0+off);o.stop(t0+off+0.17);
+    });
+  }catch(_){}
+}
+// Браузер держит AudioContext «suspended» до первого жеста — греем заранее.
+document.addEventListener('pointerdown',function(){try{
+  AC=AC||new (window.AudioContext||window.webkitAudioContext)();
+  if(AC.state==='suspended')AC.resume();
+}catch(_){}});
+new EventSource('/events').onmessage=e=>{try{
+  const ev=JSON.parse(e.data);
+  const fresh=!(ev.id&&seen.has(ev.id));
+  add(ev);
+  if(fresh){
+    if(ev.kind==='note'&&Array.isArray(ev.word_to)&&ev.act)
+      SPEAK.set(ev.act,new Set(ev.word_to));
+    else if(['say','pass','error','verdict'].indexOf(ev.kind)>=0)
+      // Реплика голоса не несёт акта — снимаем его во всех множествах:
+      // говорить дважды одновременно один голос не может. Опустевшее
+      // множество УДАЛЯЕТСЯ, а не остаётся: пустой Set в первой
+      // редакции читался как «никто не думает» и гасил индикатор при
+      // живом акте (нашёл grok).
+      SPEAK.forEach(function(set,k){
+        set.delete(ev.author); if(!set.size)SPEAK.delete(k)});
+    if(ev.kind==='act_status'&&ev.act_id&&
+       ['done','error','aborted','interrupted','detached','unknown','noop']
+       .indexOf(ev.status)>=0)SPEAK.delete(ev.act_id);
+  }
+  const young=ev.ts?(Date.now()-Date.parse(ev.ts)<60000):false;
+  if(fresh&&young&&ev.kind==='act_status'&&
+     ['done','error','aborted','interrupted'].indexOf(ev.status)>=0&&
+     Date.now()-lastDing>2000){lastDing=Date.now();ding()}
+}catch(_){}}
+// ── строки голосов: галочка · модель · усилие · полоса лимита ────────
+// Наказ Автора 2026-08-25: «рядом с галочкой выбора вендора можно было
+// выбирать модель и эффорт… заодно подчеркнем каждое из полей
+// прогрессбаром лимитов».
+//
+// Контракт GET /voices (серверную часть пишет второй агент):
+//   {"voices":[{"name":"claude","model":"opus","models":["opus","fable"],
+//               "effort":"high","efforts":["low","medium","high"],
+//               "can_set_model":true,
+//               "limit":{"kind":"number"|"refusal"|"none", …}}]}
+// Окон лимита у голоса может быть НЕСКОЛЬКО (у claude — 5-часовое,
+// недельное по всем моделям и отдельное недельное для Fable). Читаем
+// в трёх видах: список в `limits`, список внутри `limit.limits` или
+// `limit.windows`, одиночный `limit` — как сейчас. Сливать их в одно
+// число окно не будет ни при каком виде: см. renderMulti.
+// Читаем МЯГКО: /voices может ещё не существовать, вернуть голые имена
+// (как /state) или прислать голос без части полей — окно обязано
+// работать во всех трёх случаях и ничего не достраивать за сервер.
+// Чего нет, то и рисуется как «нет»: выдуманная полоса, селектор без
+// ручки и «0 %» вместо «неизвестно» — это поля, которые врут
+// (правило 8.5), а у квоты цена такой лжи прямая — сожжённый лимит.
+const VMETA={}, VROW={};
+let VOICES_SRC=false;      // /voices ответил хоть раз
+let LIM_AGE=null;          // возраст ОБЩЕГО замера лимитов, секунд
+
+function num(x){return typeof x==='number'&&isFinite(x)?x:null}
+function human(n){
+  const a=Math.abs(n);
+  if(a>=1e9)return (n/1e9).toFixed(2)+'G';
+  if(a>=1e6)return (n/1e6).toFixed(2)+'M';
+  if(a>=1e4)return (n/1e3).toFixed(1)+'k';
+  return String(Math.round(n*100)/100);
+}
+function agoS(l,got){
+  // Возраст замера. К age_s прибавляем то, что натикало у нас с момента
+  // ответа сервера: без этого «замер 2 мин назад» замирает между
+  // опросами и стареет молча — подпись про свежесть сама становится
+  // несвежей.
+  if(!l)return null;
+  const a=num(l.age_s!=null?l.age_s:l.ago_s);
+  if(a!=null)return a+Math.max(0,(Date.now()-(got||Date.now()))/1000);
+  const raw=l.measured_at||l.at||l.ts||l.when||l.checked_at;
+  if(raw){
+    const d=new Date(isoUTC(raw));
+    if(!isNaN(d.getTime()))return Math.max(0,(Date.now()-d.getTime())/1000);
+  }
+  // Запасной путь — общий момент замера из /voices (limits_age_s): у
+  // самого лимита времени может не быть, а сказать «замер минуту назад»
+  // всё же честнее, чем молчать о свежести.
+  if(LIM_AGE!=null)return LIM_AGE+Math.max(0,(Date.now()-(got||Date.now()))/1000);
+  return null;
+}
+function agoTxt(s){
+  if(s==null)return null;
+  if(s<90)return Math.round(s)+' с назад';
+  if(s<5400)return Math.round(s/60)+' мин назад';
+  if(s<172800)return Math.round(s/3600)+' ч назад';
+  return Math.round(s/86400)+' сут назад';
+}
+function clip(s,n){s=String(s).replace(/\s+/g,' ').trim();
+  return s.length>n?s.slice(0,n-1)+'…':s}
+function unitTxt(u){
+  if(!u)return '';
+  const s=String(u).toLowerCase();
+  if(s==='percent'||s==='%')return '%';
+  if(s==='tokens')return ' токенов';
+  if(s==='usd')return ' USD';
+  return ' '+u;
+}
+function winTxt(mi){
+  if(mi%1440===0)return (mi/1440)+' сут';
+  if(mi%60===0)return (mi/60)+' ч';
+  return mi+' мин';
+}
+function limNums(l){
+  // Словарь сервера: known + meaning («used» — израсходовано, «left» —
+  // остаток) + total. Плоские имена держим рядом: контракт молодой, и
+  // читатель не должен ломаться оттого, что поле назвали иначе.
+  let used=num(l.used),
+      left=num(l.left!=null?l.left:(l.remaining!=null?l.remaining:l.balance));
+  const known=num(l.known),total=num(l.total);
+  if(known!=null){if(String(l.meaning)==='left')left=known;else used=known}
+  let pct=num(l.used_percent);
+  if(pct==null)pct=num(l.percent);
+  if(pct==null&&total!=null&&total>0){
+    if(used!=null)pct=used/total*100;
+    else if(left!=null)pct=(total-left)/total*100;
+  }
+  if(pct!=null)pct=Math.max(0,Math.min(100,pct));
+  return {used:used,left:left,total:total,pct:pct,
+          some:(used!=null||left!=null)};
+}
+function fmtLeft(v){
+  // «↻ 2д 4ч» — сколько осталось до обнуления окна (наказ 2026-08-27).
+  // Принимает ISO и epoch (сек/мс). ISO без зоны считается UTC:
+  // Date.parse трактовал бы его как местное время, и при UTC+3 сброс
+  // уезжал на три часа (нашли codex, grok и субагент). Прошедший срок
+  // чипом не рисуем: у устаревшего замера он был бы вечным враньём.
+  let t=NaN;
+  if(typeof v==='number')t=v>2e10?v:v*1000;
+  else if(v){let x=String(v);
+    if(/T\d\d:\d\d/.test(x)&&!/[Zz]|[+-]\d\d:?\d\d$/.test(x))x+='Z';
+    t=Date.parse(x);}
+  if(!t||isNaN(t))return'';
+  let s=Math.floor((t-Date.now())/1000);if(s<=0)return'';
+  const d=Math.floor(s/86400);s%=86400;
+  const h=Math.floor(s/3600);const mn=Math.floor(s%3600/60);
+  if(d)return d+'д '+h+'ч';
+  if(h)return h+'ч '+String(mn).padStart(2,'0')+'м';
+  return mn+'м';
+}
+function limLabel(l,n){
+  if(l.label)return String(l.label);
+  const u=unitTxt(l.unit);
+  if(String(l.unit).toLowerCase()==='percent'&&n.used!=null)
+    return human(n.used)+'% окна'+
+      (num(l.window_minutes)?' за '+winTxt(l.window_minutes):'');
+  if(n.used!=null&&n.total!=null)return human(n.used)+' из '+human(n.total)+u;
+  if(n.left!=null&&n.total!=null)
+    return 'остаток '+human(n.left)+' из '+human(n.total)+u;
+  if(n.left!=null)return 'остаток '+human(n.left)+u;
+  if(n.used!=null)return 'израсходовано '+human(n.used)+u;
+  return n.pct==null?'':'израсходовано '+n.pct.toFixed(0)+'%';
+}
+function limTail(l){
+  // Всё, что уточняет число, но не влезает в подпись, — в title. Резать
+  // приходится: у claude в поле text лежит 300 символов сырого json
+  // отказа, и в подсказке это стена, а не сведения.
+  const x=[];
+  if(l.note)x.push(clip(l.note,240));
+  if(l.text)x.push(clip(l.text,200));
+  if(num(l.window_minutes))x.push('окно: '+winTxt(l.window_minutes));
+  if(l.resets_at)x.push('сброс: '+l.resets_at);
+  if(typeof l.plan==='string'&&l.plan)
+    x.push('тариф: '+l.plan+' — тариф, а не остаток');
+  if(l.available===false)x.push('провайдер отвечает: канал недоступен');
+  if(l.round)x.push('раунд: '+l.round);
+  if(l.room_text)x.push('в room.jsonl: '+clip(l.room_text,160)+
+    (l.room_at?' ('+l.room_at+')':''));
+  if(l.stale)x.push('значение НЕ текущее: оно из момента отказа');
+  if(l.caveat)x.push(clip(l.caveat,240));
+  if(l.source||l.src)x.push('источник: '+(l.source||l.src));
+  return x.length?'\n'+x.join('\n'):'';
+}
+function limsOf(m){
+  // Все окна лимита этого голоса — списком. Форму контракта читаем
+  // мягко (см. комментарий выше): пришёл список — берём список, пришёл
+  // один объект — список из одного. Пустое и не-объекты выбрасываем
+  // молча: «лимит есть, но это строка» — не лимит.
+  const out=[];
+  const add=function(x){if(x&&typeof x==='object'&&!Array.isArray(x))out.push(x)};
+  const l=m?m.limit:null;
+  if(Array.isArray(m&&m.limits))m.limits.forEach(add);
+  else if(l&&Array.isArray(l.limits))l.limits.forEach(add);
+  else if(l&&Array.isArray(l.windows))l.windows.forEach(add);
+  else add(l);
+  return out;
+}
+function limName(l,i){
+  // Короткая подпись окна. Придумывать её нельзя: «5 ч» рядом с
+  // недельной шкалой — это уже утверждение о том, что за окно, а мы
+  // его не знаем. Поэтому только то, что сказал сервер, и лишь в
+  // крайнем случае безымянное «окно N».
+  // Только СТРОКИ: в scope у Клода лежит объект (scope.model.display_name),
+  // а в window вполне может прийти число минут — «300» без единицы
+  // подписью окна не является, это цифра непонятно чего.
+  const c=[l.name,l.label_short,l.label,l.title,l.window,l.scope];
+  for(let k=0;k<c.length;k++)
+    if(typeof c[k]==='string'&&c[k].trim())return clip(c[k],20);
+  if(num(l.window_minutes))return winTxt(l.window_minutes);
+  return 'окно '+(i+1);
+}
+function renderMulti(row,m,L){
+  // Несколько окон — несколько полос, каждая со своей подписью и своим
+  // процентом. Ни среднего, ни «худшего из», ни суммы: у 86 % за пять
+  // часов и 100 % недельного Fable нет общей величины, а решение
+  // «звать ли голос» принимают по конкретному окну.
+  const box=row.querySelector('.limbox'),cap=row.querySelector('.capt');
+  box.innerHTML='';cap.innerHTML='';cap.title='';
+  let when0=null,hot=0,lowMoney=0;
+  L.forEach(function(l,i){
+    const kind=l.kind?String(l.kind):'',n=limNums(l),
+          a=agoTxt(agoS(l,m._got)),tail=limTail(l);
+    const when=a?'замер '+a:'время замера неизвестно';
+    if(when0===null&&a)when0=a;
+    const r=document.createElement('div');r.className='lim2';
+    const nmt=limName(l,i),lab=limLabel(l,n);
+    // Имя окна («5 часов», «неделя», «за сутки») из строки убрано —
+    // наказ Автора 2026-08-31 «и так понятно»: полоса+таймер+процент.
+    // Имя живёт в подсказке строки (t ниже) — наведите на полосу.
+    // Обратный таймер ПЕРЕД полосой (наказ 2026-08-27): когда окно
+    // обнулится. У баланса сброса нет — чипа нет.
+    const lf=l.resets_at?fmtLeft(l.resets_at):'';
+    if(lf){const e=document.createElement('span');e.className='eta';
+      e.textContent='↻'+lf;
+      e.title='до обнуления этого окна: '+lf+'\nмомент сброса: '+l.resets_at;
+      r.appendChild(e);}
+    // Подпись в подсказку идёт, только если она НЕ повторяет имя окна:
+    // сервер часто кладёт одно и то же в label и в name, и «5 ч / 5 ч»
+    // двумя строками читается как два разных факта.
+    const t=nmt+(lab&&lab!==nmt?'\n'+lab:'')+'\n'+when+tail;
+    const pc=document.createElement('span');pc.className='pc';
+    let b;
+    if(kind==='number'&&n.pct!=null){
+      b=document.createElement('div');b.className='bar';
+      const fill=document.createElement('i');
+      fill.style.width=n.pct.toFixed(1)+'%';
+      if(n.pct>=85){fill.className='hot';hot++}
+      b.appendChild(fill);
+      b.title='израсходовано '+n.pct.toFixed(1)+'%\n'+t;
+      pc.textContent=n.pct.toFixed(0)+'%';
+      if(n.pct>=85)pc.className='pc ref';
+    }else if(kind==='refusal'){
+      // Полосы нет намеренно, как и в одиночном случае: остатка не
+      // существует, известен только факт отказа и его время.
+      b=document.createElement('div');b.className='bar none';
+      b.title='◇ отказ по квоте — остаток неизвестен\n'+t;
+      pc.textContent='◇';pc.className='pc ref';
+    }else{
+      b=document.createElement('div');b.className='bar none';
+      b.title=(kind==='number'
+        ?(n.some?'число без потолка — шкалу не из чего строить'
+                :'канал объявил число, но сервер его не прислал')
+        :(kind==='none'?'остаток этот канал не сообщает'
+        :(kind==='unknown'||!kind?'замер этим окном ещё не сделан'
+        :'неизвестный вид лимита: '+kind)))+'\n'+t;
+      // Число без потолка (баланс Кими в USD) шкалой не рисуется, но
+      // ПОКАЗАТЬ его обязаны: раньше на виду стоял прочерк, а
+      // единственное живое число канала пряталось в подсказку — то есть
+      // правка со шкалами УХУДШИЛА видимость того, ради чего заведена
+      // (нашёл ревьюер дифа).
+      // Баланс меньше 2 USD — ярко-красным (наказ Автора 2026-09-01):
+      // деньги на исходе должны бить в глаза, а не ждать наведения.
+      // kind==='number' в условии ОБЯЗАТЕЛЕН: карточка другого вида с
+      // полем left получала бы денежную тревогу при «—» на экране
+      // (нашёл codex). Юнит — строго usd, число — через Number.
+      const leftN=Number(n.left);
+      const low=(kind==='number'&&isFinite(leftN)&&leftN<2&&
+        String(l.unit||'').trim().toLowerCase()==='usd');
+      pc.textContent=(kind==='number'&&n.some&&lab)?lab:'—';
+      if(kind==='number'&&n.some&&lab)
+        pc.className='pc num'+(low?' low':'');
+      if(low){lowMoney++;b.className='bar none low';
+        b.title='⚠ БАЛАНС МЕНЬШЕ 2 USD — канал скоро замолчит по '+
+        'деньгам\n'+b.title}
+    }
+    pc.title=b.title;
+    // Подсказка на ВСЕЙ строке: после скрытия имён окон навести на
+    // зазор между полосой и процентом значило увидеть общий текст
+    // панели вместо имени ЭТОГО окна (нашли codex и deepseek).
+    r.title=t;
+    r.appendChild(b);r.appendChild(pc);box.appendChild(r);
+  });
+  const anyRef=L.some(function(l){return String(l.kind)==='refusal'});
+  cap.textContent='окон: '+L.length+(hot?' · '+hot+' на исходе':'')+
+    (lowMoney?' · ⚠ деньги <2 USD':'')+
+    (anyRef?' · ◇ есть отказ':'')+
+    (when0?' · замер '+when0:'')+
+    (m.limit&&m.limit.stale_reason?' · ⚠ не обновилось':'');
+  // Один title: вторая безусловная строка затирала причину устаревания
+  // — значок был, объяснение мёртвое (нашли все четверо).
+  cap.title=(m.limit&&m.limit.stale_reason
+    ?'свежий замер не удался: '+m.limit.stale_reason+
+     '\nпоказан ПОСЛЕДНИЙ удачный — его возраст подписан рядом.\n\n':'')+
+    'у голоса несколько окон лимита, и каждое показано отдельно.'+
+    '\nСреднего между разными окнами не бывает: усреднить 5-часовое с '+
+    'недельным значит показать число, которого не сообщал никто.';
+}
+// Подписка CLI под шкалой (наказ Автора 2026-09-23: «проморгали»
+// Codex): дата и состояние — active / ending (<7 сут) / expired /
+// none (баланс) / unknown. Цвет — по состоянию, дата — как есть.
+function renderSub(row,m){
+  let el=row.querySelector('.sub');
+  if(!el){el=document.createElement('div');el.className='sub';
+    const cap=row.querySelector('.cap');cap.parentNode.insertBefore(el,cap.nextSibling)}
+  const s=(m&&m.limit&&m.limit.subscription)||{state:'unknown',note:'подписка ещё не запрошена (первый замер лимитов)'};
+  el.className='sub';el.textContent='';el.title='';el.hidden=false;
+  const d=s.until?String(s.until).slice(0,10):'';
+  let txt,cls='';
+  if(s.state==='none'){txt='подписка: нет'+(s.plan?' · '+s.plan:'')+(s.note&&/баланс/.test(s.note)?' (баланс)':'');cls='dim'}
+  else if(s.state==='expired'){txt='⛔ подписка ИСТЕКЛА'+(d?' '+d:'')+(s.plan?' · '+s.plan:'');cls='bad'}
+  else if(s.state==='ending'){txt='⚠ подписка до '+(s.estimated?'≈':'')+d+(s.plan?' · '+s.plan:'');cls='warn'}
+  else if(s.state==='active'){txt='подписка: '+(d?(s.estimated?'до ≈'+d:'до '+d):'активна')+(s.plan?' · '+s.plan:'');cls='ok'}
+  else if(s.state==='stale'){txt='подписка: жива по провайдеру, дата '+d+' прошла — снимок устарел';cls='warn'}
+  else{txt='подписка: неизвестно'+(s.plan?' · '+s.plan:'');cls='dim'}
+  el.classList.add(cls);el.textContent=txt;
+  el.title=[s.note||'',s.until_kind?'дата: '+s.until_kind:'',s.status?'статус: '+s.status:'',s.since?'с: '+s.since:'',
+    s.checked_at?'провайдер проверял: '+s.checked_at:'',s.source?'источник: '+s.source:'']
+    .filter(Boolean).join('\n')||txt;
+}
+function renderLim(row,m){
+  renderSub(row,m);
+  const L=limsOf(m);
+  // ЕДИНЫЙ вид для всех, у кого есть хоть одна шкала: Кими и DeepSeek
+  // с одинаковыми балансами рисовались по-разному (у одного строка-
+  // таблица, у другого пустая полоса с подписью внизу) — наказ Автора
+  // 2026-08-27 «показывать одинаково». Особые ветки ниже остаются
+  // только для карточек БЕЗ шкал (none/refusal/unknown).
+  if(L.some(function(l){
+      return ['number','refusal'].indexOf(String(l.kind||''))>=0}))
+    return renderMulti(row,m,L);
+  const box=row.querySelector('.limbox'),cap=row.querySelector('.capt');
+  const l=L.length?L[0]:null,kind=l&&l.kind?String(l.kind):'';
+  box.innerHTML='';cap.innerHTML='';cap.title='';
+  // Всё уточняющее — одной сборкой (limTail): источник, оговорки,
+  // окно, сброс, тариф, «значение из момента отказа». В подписи для
+  // этого места нет, а без него число в панели анонимно.
+  const tail=l?limTail(l):'';
+  const line=function(t){const b=document.createElement('div');
+    b.className='bar none';b.title=t;box.appendChild(b);return b};
+  if(!l||!kind||kind==='unknown'){
+    // Четыре разных «числа нет», и сливать их в одну подпись нельзя:
+    // замер ещё не сделан · сервер описал голос, но без лимита · голоса
+    // нет в ответе /voices · самого /voices нет. Только второе говорит
+    // что-то о канале, остальные — о нашем окне, и выдать их за
+    // свойство квоты значит соврать в поле (правило 8.5).
+    let t;
+    if(kind==='unknown')t='замер лимита этим окном ещё не сделан'+tail;
+    else if(m&&m._got)
+      t='лимит не сообщён: сервер не прислал поле limit для этого голоса'+tail;
+    else if(VOICES_SRC)t='этого голоса нет в ответе /voices — лимит неизвестен';
+    else t='лимиты не показаны: окно не получило /voices — это про окно, а не про квоту';
+    line(t);
+    if(kind==='unknown')cap.textContent='лимит ещё не измерен';
+    cap.title=t;return;
+  }
+  if(kind==='number'){
+    const n=limNums(l),lab=limLabel(l,n),a=agoTxt(agoS(l,m._got));
+    const when=a?'замер '+a:'время замера неизвестно';
+    if(n.pct==null){
+      // Полосу рисовать не из чего, и случая тут два — оба честнее
+      // назвать словами. Числа нет вовсе; либо число есть, а потолка
+      // нет: у предоплаченного баланса deepseek общего лимита не
+      // существует, и шкала выдумала бы его целиком.
+      const t=(n.some
+        ?'полосы нет: число без потолка — шкалу не из чего строить'
+        :'канал объявил число, но сервер его не прислал')+'\n'+when+tail;
+      line(t);
+      cap.textContent=(lab?lab+' · ':'')+
+        (n.some?when:'число объявлено, но не получено');
+      cap.title=t;return;
+    }
+    const b=document.createElement('div');b.className='bar';
+    const i=document.createElement('i');i.style.width=n.pct.toFixed(1)+'%';
+    if(n.pct>=85)i.className='hot';
+    b.appendChild(i);
+    b.title='израсходовано '+n.pct.toFixed(1)+'%\n'+when+tail;
+    box.appendChild(b);
+    cap.textContent=(lab?lab+' · ':'')+when;
+    cap.title=b.title;return;
+  }
+  if(kind==='refusal'){
+    // Полосы тут НЕТ намеренно: остатка не существует, известны лишь
+    // факт отказа и когда он был. Числа из момента отказа (у kimi они
+    // есть) идут в подсказку, а не в шкалу: шкала показывала бы
+    // позавчерашний расход как сегодняшний (правило 4).
+    const a=agoTxt(agoS(l,m._got)),pad=document.createElement('div');
+    pad.className='bar pad';box.appendChild(pad);   // держит высоту строки
+    const s=document.createElement('span');s.className='ref';
+    s.textContent='◇ отказ по квоте '+(a||'— когда, неизвестно');
+    cap.appendChild(s);
+    cap.appendChild(document.createTextNode(' · остаток неизвестен'));
+    cap.title='число было известно в момент отказа, сейчас — нет'+tail;
+    return;
+  }
+  const t=(kind==='none'
+    ?'остаток неизвестен: этот канал его не сообщает'
+    :'неизвестный вид лимита: '+kind)+
+    (l.caveat?'':'\nотсутствие записи об отказе не значит, что квота цела')+
+    tail;
+  line(t);
+  // У голоса без шкалы может быть тариф и конец оплаченного периода
+  // (grok) — обратный таймер к нему, раз уж чисел расхода не бывает.
+  const lim0=m.limit||{};
+  const pe=lim0.period_end?fmtLeft(lim0.period_end):'';
+  cap.textContent=(kind==='none'?'остаток неизвестен':'лимит: '+kind)+
+    (lim0.plan?' · '+lim0.plan:'')+(pe?' · период ↻'+pe:'');
+  cap.title=t;
+}
+function verr(name,text,isNote,title){
+  const row=VROW[name];if(!row)return;
+  const e=row.querySelector('.verr');
+  e.textContent=text||'';e.hidden=!text;
+  e.className='verr'+(isNote?' note':'');
+  e.title=title||'';
+  if(!text)delete row.dataset.oldenv;
+}
+function vplain(row){
+  // Строка, о которой /voices ничего не сказал: ручек нет, и подпись
+  // объясняет ПОЧЕМУ. «Данных нет» и «менять нельзя» — разные вещи, а
+  // пустая ячейка одинаково похожа на обе.
+  ['.mdl','.eff'].forEach(function(q){
+    const c=row.querySelector(q);
+    if(!c||c.contains(document.activeElement))return;
+    c.innerHTML='';
+    const s=document.createElement('span');
+    s.className='fix';s.textContent='—';
+    s.title=VOICES_SRC
+      ?'этого голоса нет в ответе /voices — модель и усилие неизвестны'
+      :'окно не получило /voices — модель и усилие не показаны';
+    c.appendChild(s);
+  });
+}
+function vrow(name,notVoice){
+  if(VROW[name])return VROW[name];
+  const d=document.createElement('div');
+  d.className='vrow';d.dataset.v=name;
+  if(notVoice)d.dataset.last='1';   // не голос (TypeSafe) — всегда последней строкой
+  d.innerHTML='<div class="vhead">'+
+    '<label class="vpick"><input type="checkbox" checked value="'+esc(name)+'">'+
+    '<span class="nm">'+esc(name)+'</span></label>'+
+    '<span class="cell mdl"></span><span class="cell eff"></span><span class="mem"></span></div>'+
+    '<div class="limbox"></div>'+
+    '<div class="cap"><span class="capt"></span>'+
+    '<span class="st" id="st-'+esc(name)+'"></span></div>'+
+    '<div class="verr" hidden></div>';
+  // голоса — перед строкой «не голоса», если она уже есть (гонка /state и /voices)
+  const box=document.getElementById('voices'); const lastRow=notVoice?null:box.querySelector('.vrow[data-last]');
+  if(lastRow)box.insertBefore(d,lastRow); else box.appendChild(d);
+  VROW[name]=d;
+  // Галочка сразу по набору вкладки, а не «отмечено» до первого
+  // /voices: картинка и оплачиваемый набор расходились (нашёл grok).
+  try{const pk=d.querySelector('.vpick input');
+    if(SCOPE!=='exec')pk.checked=!PICK_OFF[SCOPE].has(name);
+    else pk.disabled=true;   // пул кресел придёт с /voices — до него не кликать
+  }catch(_){}
+  if(!VMETA[name])VMETA[name]={name:name};
+  vplain(d);renderLim(d,VMETA[name]);
+  return d;
+}
+function fillCell(row,name,field,cur,list,settable,fixTitle,setTitle,mark,
+                  resettable,dflt,isDefault){
+  const cell=row.querySelector(field==='model'?'.mdl':'.eff');
+  // Не перерисовываем то, в чём сейчас рука: опрос раз в 15 с иначе
+  // схлопывал бы открытый список ровно в момент выбора.
+  if(cell.contains(document.activeElement))return;
+  cell.innerHTML='';
+  if(!settable){
+    const s=document.createElement('span');
+    s.className='fix'+(mark?' set':'');s.textContent=cur||'—';
+    // Значение первой строкой подсказки: рамка режет длинное имя
+    // многоточием, и «moonshotai/kimi-k3» иначе не прочитать целиком.
+    s.title=(cur?cur+'\n':'')+fixTitle
+      +(mark?'\n⚠ комната и раунды настроены по-разному':'');
+    cell.appendChild(s);return;
+  }
+  let el;
+  // prevVal — что вернуть селектору при отказе сервера: пустое, если
+  // стояло умолчание (пункт «X (умолчание)»), иначе заданное значение.
+  const prevVal=isDefault?'':(cur||'');
+  if(list&&list.length){
+    el=document.createElement('select');
+    const all=list.slice();
+    // Заданное значение обязано быть в списке, даже если сервер его туда
+    // не положил: иначе select молча покажет первый пункт, и панель
+    // соврёт, чем голос идёт на самом деле.
+    if(cur&&!isDefault&&all.indexOf(cur)<0)all.unshift(cur);
+    // Пункт умолчания ЯВНЫЙ: «opus (умолчание)», а не безымянное
+    // «(умолчание)» — наказ Автора 2026-09-02: «не понятно, какая модель
+    // и какое усилие». Значение пункта пустое: сервер понимает его как
+    // «вернуть умолчание канала». Пункт есть ВСЕГДА: после сброса без
+    // него селект молча показывал первый реальный (deepseek).
+    all.unshift('');
+    all.forEach(function(x){
+      const o=document.createElement('option');
+      o.value=x;o.textContent=x===''?((dflt||'—')+' (умолчание)'):x;
+      if(isDefault?x==='':x===cur)o.selected=true;
+      el.appendChild(o)});
+  }else{
+    el=document.createElement('input');el.className='free';
+    el.value=prevVal;
+    el.placeholder=dflt?(dflt+' (умолчание)'):(field==='model'?'модель':'усилие');
+  }
+  // Значение первой строкой — как у .fix: ячейка узкая, «deepseek-v4-…»
+  // без подсказки не отличить от «deepseek-v4-pro» (нашёл kimi).
+  el.title=(cur?cur+(isDefault?' (умолчание)':' (задано в окне)')+'\n':'')+
+    setTitle+(mark?'\n⚠ комната и раунды настроены по-разному':'');
+  if(mark)el.className=(el.className?el.className+' ':'')+'set';
+  // Область фиксируется ПРИ ОТРИСОВКЕ: ячейка с фокусом при смене
+  // вкладки не перерисовывается, и выбор из списка старой вкладки
+  // иначе уходил POST'ом в новую область (нашёл claude).
+  const scAt=SCOPE;
+  el.onchange=function(){
+    const v=String(el.value).trim();
+    if(v===''&&!resettable){
+      // Сбрасывать нечего — POST со сбросом был бы пустым событием-шумом.
+      el.value=prevVal;return;
+    }
+    push(name,field,v,el,prevVal,scAt)};
+  cell.appendChild(el);
+}
+// ── двигаемые границы ────────────────────────────────────────────────
+// Три границы: правая панель, высота поля ввода, ширина колонки кнопок.
+// Каждая — своя переменная CSS и своя запись в localStorage. Потолки
+// обязательны: без них панель утягивается в ноль или на весь экран, и
+// вернуть её мышью уже нечем (ручка уезжает за край).
+const GRIPS=[
+  {id:'grip-side', key:'rt-sidew', varn:'--sidew', axis:'x', def:'344px',
+   // 330, а не 220: в строке голоса две ячейки по 6.6rem, два зазора
+   // и имя от 4.2rem — на 220px контролы обрезались и появлялась
+   // горизонтальная прокрутка (посчитал codex).
+   min:330, max:function(){return Math.max(340,innerWidth-360)},
+   // Панель справа: тянем влево — ширина растёт.
+   calc:function(e){return innerWidth-e.clientX}},
+  {id:'grip-acts', key:'rt-actsw', varn:'--actsw', axis:'x', def:'17rem',
+   min:120, max:function(){
+     const bar=document.getElementById('bar');
+     return Math.max(140,bar.clientWidth-180)},
+   calc:function(e){
+     const bar=document.getElementById('bar').getBoundingClientRect();
+     return bar.right-e.clientX-12}},
+  {id:'grip-bar', key:'rt-barh', axis:'y',
+   // 130, а не 90: #msg сам не ниже 6rem плюс отступы — полоса просто
+   // не сожмётся, и нижние 40px хода ручки были обманом (нашёл grok).
+   min:130, max:function(){return Math.max(160,innerHeight-220)},
+   calc:function(e){return innerHeight-e.clientY}}
+];
+function sizeGrip(g,px){
+  // Применить размер БЕЗ записи: общая часть restore и resize.
+  if(narrow()&&g.axis!=='y'){
+    // На узком экране правая панель скрыта, а колонка кнопок занимает
+    // всю ширину — вертикальные ручки там ничем не управляют, но
+    // писали бы --actsw, отравляя десктопную настройку (нашёл grok).
+    return;
+  }
+  px=Math.max(g.min,Math.min(g.max(),px));
+  if(g.varn)document.documentElement.style.setProperty(g.varn,px+'px');
+  if(g.axis==='y')document.body.style.gridTemplateRows='1fr '+px+'px';
+}
+function narrow(){
+  try{return matchMedia('(max-width:760px)').matches}catch(_){return false}
+}
+function applyGrip(g,px){
+  if(px==null){
+    // removeProperty, а не подстановка '1fr auto': инлайн-стиль
+    // навсегда перебивал медиа-запрос, и на узком экране полоса
+    // застревала в заданной высоте (нашёл kimi).
+    if(g.varn)document.documentElement.style.removeProperty(g.varn);
+    if(g.axis==='y')document.body.style.removeProperty('grid-template-rows');
+    try{localStorage.removeItem(g.key)}catch(_){}
+    return;
+  }
+  // Высота полосы ввода живёт не в переменной, а в самой сетке: строка
+  // «auto» подстраивалась бы под содержимое и отменяла заданную высоту.
+  sizeGrip(g,px);
+  px=Math.max(g.min,Math.min(g.max(),px));
+  try{localStorage.setItem(g.key,String(px))}catch(_){}
+}
+GRIPS.forEach(function(g){
+  const el=document.getElementById(g.id);
+  if(!el)return;
+  // Восстановление НЕ пишет обратно: applyGrip клампит по текущему
+  // экрану и сохранил бы ужатое значение — открыл окно узким, и
+  // предпочтение «1240» стёрлось бы навсегда (нашёл grok).
+  try{const v=parseFloat(localStorage.getItem(g.key));
+    if(v>0)sizeGrip(g,v)}catch(_){}
+  el.addEventListener('pointerdown',function(ev){
+    // Второй pointerdown до отпускания (мультитач, потерянный up)
+    // вешал ВТОРОЙ комплект слушателей — они копились (нашёл kimi).
+    if(el.classList.contains('on'))return;
+    ev.preventDefault();
+    el.classList.add('on');document.body.classList.add('dragging');
+    document.body.style.cursor=g.axis==='x'?'col-resize':'row-resize';
+    // setPointerCapture: указатель, ушедший за пределы ручки (а он
+    // уходит сразу — ручка 8px), продолжает слать события ей.
+    try{el.setPointerCapture(ev.pointerId)}catch(_){}
+    // Слушатели на DOCUMENT, а не на ручке: если setPointerCapture
+    // бросил (а он бросает — старый Firefox, чужой pointerId), то
+    // pointerup вне восьми пикселей ручки до неё не дошёл бы, .on
+    // остался бы навсегда, и guard выше убил бы ручку насмерть
+    // (нашёл grok — на этой же правке, что guard и добавила).
+    const move=function(e){applyGrip(g,g.calc(e))};
+    const up=function(){
+      el.classList.remove('on');document.body.classList.remove('dragging');
+      document.body.style.cursor='';
+      document.removeEventListener('pointermove',move);
+      document.removeEventListener('pointerup',up);
+      document.removeEventListener('pointercancel',up);
+      el.removeEventListener('lostpointercapture',up);
+    };
+    document.addEventListener('pointermove',move);
+    document.addEventListener('pointerup',up);
+    document.addEventListener('pointercancel',up);
+    el.addEventListener('lostpointercapture',up);
+  });
+  // Двойной щелчок — вернуть умолчание: утащенную границу иначе
+  // возвращать на глаз.
+  el.addEventListener('dblclick',function(){applyGrip(g,null)});
+});
+// Окно сузили — сохранённый размер пересчитываем по новым потолкам, но
+// в localStorage НЕ пишем: предпочтение Автора («хочу 1240») переживает
+// временное сужение и вернётся, когда места снова хватит (нашёл codex).
+addEventListener('resize',function(){
+  GRIPS.forEach(function(g){
+    let want=NaN;
+    try{want=parseFloat(localStorage.getItem(g.key))}catch(_){}
+    if(!(want>0))return;
+    if(narrow()){
+      // Узкий экран: сетка возвращается к своим правилам, инлайн-стиль
+      // высоты снимается — иначе он переживал бы медиа-запрос.
+      document.body.style.removeProperty('grid-template-rows');
+      if(g.varn)document.documentElement.style.removeProperty(g.varn);
+      return;
+    }
+    sizeGrip(g,want);
+  });
+});
+
+document.getElementById('voices').addEventListener('change',async function(e){
+  const t=e.target;
+  if(!t||!t.dataset||t.type!=='checkbox')return;
+  const name=t.value;
+  if(SCOPE==='exec'&&!t.dataset.execpool){
+    // 🔧 до первого ответа /voices: галочка ещё не «пул» (метку ставит
+    // applyVoices), и клик иначе молча правил набор КОМНАТЫ (нашёл
+    // deepseek). Откатываем и говорим.
+    t.checked=!t.checked;
+    return acterr('список кресел ещё не загружен — секунду',true);
+  }
+  if(!t.dataset.execpool){
+    // 💬/🎼: набор вкладки, локально. Снятый — в списке, отмеченный — нет.
+    const sc=SCOPE==='rounds'?'rounds':'room';
+    if(t.checked)PICK_OFF[sc].delete(name);else PICK_OFF[sc].add(name);
+    pickSave(sc);
+    return;
+  }
+  try{
+    const r=await fetch('/voices',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({voice:name,scope:'exec',pool:t.checked})});
+    if(!r.ok){t.checked=!t.checked;
+      let j={};try{j=await r.json()}catch(_){}
+      acterr('пул: '+((j&&j.error)||('ошибка '+r.status)));}
+  }catch(err){t.checked=!t.checked;acterr('сервер не ответил: '+err)}
+});
+
+// ГАЛОЧКИ — СВОИ У КАЖДОЙ ВКЛАДКИ (наказ Автора 2026-09-02): 💬 — кому
+// уйдёт реплика и слепой ход, 🎼 — состав раунда и кандидаты жребия,
+// 🔧 — пул random кресел (его хранит сервер, см. execpool). Первые две
+// живут в localStorage списком СНЯТЫХ: новый голос по умолчанию
+// отмечен, и «пустое хранилище» значит «все», а не «никто».
+// Кнопки читают НЕ DOM, а набор СВОЕЙ вкладки: на 🔧 в строках стоит
+// пул кресел, и «Слепой ход», прочитавший его как адресатов, оплатил
+// бы не то, что отмечено (цена ошибки — ЧЬИ вызовы будут оплачены).
+const PICK_OFF={room:new Set(),rounds:new Set()};
+['room','rounds'].forEach(function(sc){
+  try{const v=JSON.parse(localStorage.getItem('rt-pick-off-'+sc)||'[]');
+    if(Array.isArray(v))v.forEach(function(n){PICK_OFF[sc].add(String(n))});
+  }catch(_){}
+});
+function pickSave(sc){
+  try{localStorage.setItem('rt-pick-off-'+sc,
+    JSON.stringify(Array.from(PICK_OFF[sc])))}catch(_){}
+}
+function picked(sc){
+  sc=(sc==='room'||sc==='rounds')?sc:(SCOPE==='rounds'?'rounds':'room');
+  const off=PICK_OFF[sc];
+  // Состав — по /state (живой список сервера), VMETA лишь запас:
+  // она помнит голоса навсегда (нашёл kimi).
+  const live=(window.STATE&&Array.isArray(window.STATE.voices))
+    ?window.STATE.voices:Object.keys(VMETA).filter(function(n){return !(VMETA[n]&&VMETA[n].not_voice)});   // TypeSafe — не голос (ревизия)
+  return live.filter(function(n){return !off.has(n)});
+}
+function vnote(text,isNote){
+  const n=document.getElementById('vnote');
+  if(!n)return;
+  n.hidden=!text;n.textContent=text||'';
+  n.style.color=isNote?'':'var(--err,#b3261e)';
+}
+// ⟳ модели: разведка у самих каналов, без модельных вызовов; отчёт —
+// строкой под списком, списки — перерисовкой карточек с сервера.
+document.getElementById('goal').addEventListener('input',function(){this.dataset.dirty='1'});
+// Доступ голосов (ACCESS.txt проекта, наказ Автора 2026-09-20): поле
+// читает файл проекта из поля «Проект» и пишет его кнопкой; отвергнутые
+// строки сервер называет поимённо — они видны здесь, а не в клетке.
+const accessTa=document.getElementById('access'), accessNote=document.getElementById('accessnote');
+accessTa.dataset.title0=accessTa.title;   // исходная подсказка — вернуть, когда отказов нет
+function accessShow(j){
+  const items=[].concat((j.ro||[]).map(function(p){return 'r '+p}),(j.rw||[]).map(function(p){return 'rw '+p}));
+  let s=(j.exists?('действует: '+(items.length?items.join('; '):'записей нет')):'ACCESS.txt в проекте нет — голосам открыт только сам проект');
+  if(j.rejects&&j.rejects.length)s+='\nОТВЕРГНУТО: '+j.rejects.join('\n');
+  accessNote.textContent=s; accessNote.hidden=false;
+  // Подсказка поля повторяет отказы: строка под кнопкой уезжает из вида,
+  // а наведение на поле — всегда под рукой (Автор 22.09).
+  const tip=(j.rejects&&j.rejects.length)?('ОТВЕРГНУТО (в клетку и в пакет не попадёт):\n'+j.rejects.join('\n')+'\n\nДействует: '+(items.length?items.join('; '):'записей нет')):accessTa.dataset.title0;
+  accessTa.title=tip.length>1500?tip.slice(0,1499)+'…':tip;   // подсказка не резиновая (kimi)
+}
+async function loadAccess(){
+  const project=document.getElementById('project').value.trim();
+  // Любой ранний выход возвращает исходную подсказку: иначе поле показывало
+  // бы отказы ПРЕЖНЕГО проекта (grok, ревизия 22.09).
+  accessTa.title=accessTa.dataset.title0;
+  if(!project){accessNote.textContent='проект не задан — доступ читать неоткуда';accessNote.hidden=false;return}
+  let r,j={};
+  try{r=await fetch('/access?project='+encodeURIComponent(project));j=await r.json();}
+  catch(e){accessNote.textContent='сервер не ответил: '+e;accessNote.hidden=false;return}
+  if(!r.ok){accessNote.textContent=(j&&j.error)||('ошибка '+r.status);accessNote.hidden=false;return}
+  if(!accessTa.dataset.dirty&&document.activeElement!==accessTa)accessTa.value=j.text||'';
+  accessShow(j);
+}
+accessTa.addEventListener('input',function(){this.dataset.dirty='1'});
+document.getElementById('project').addEventListener('change',function(){delete accessTa.dataset.dirty;loadAccess()});
+document.getElementById('accessbtn').onclick=async function(){
+  const project=document.getElementById('project').value.trim();
+  if(!project)return acterr('доступу нужен проект: укажите путь в поле «Проект»');
+  let r,j={};
+  try{r=await fetch('/access',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({project:project,text:accessTa.value})});j=await r.json();}
+  catch(e){return acterr('сервер не ответил: '+e)}
+  if(!r.ok)return acterr((j&&j.error)||('ошибка '+r.status));
+  delete accessTa.dataset.dirty; accessShow(j);
+  const why=(j.rejects&&j.rejects.length)?' — ОТВЕРГНУТО: '+j.rejects.join('; '):'';
+  acterr('ACCESS.txt записан (событие '+j.event+')'+(why.length>600?why.slice(0,599)+'…':why),true);
+};
+loadAccess();
+document.getElementById('goalbtn').onclick=async function(){
+  const g=document.getElementById('goal');
+  const text=g.value.trim();
+  delete g.dataset.dirty;
+  let r,j={};
+  try{r=await fetch('/goal',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({text:text})});j=await r.json();}
+  catch(e){return acterr('сервер не ответил: '+e)}
+  if(!r.ok)return acterr((j&&j.error)||('ошибка '+r.status));
+  acterr(text?'цель задана (событие '+j.event+')':'цель снята',true);
+};
+document.getElementById('mrefresh').onclick=async function(){
+  const b=document.getElementById('mrefresh');
+  b.disabled=true;vnote('обновляю списки моделей у всех голосов…',true);
+  let r;
+  try{
+    r=await fetch('/models_refresh',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:'{}'});
+  }catch(e){b.disabled=false;return vnote('сервер не ответил: '+e)}
+  let j={};try{j=await r.json()}catch(_){}
+  b.disabled=false;
+  if(!r.ok)return vnote('не обновилось: '+((j&&j.error)||('ошибка '+r.status)));
+  const rep=j.report||{};
+  const parts=Object.keys(rep).map(function(n){const x=rep[n]||{};
+    return n+': '+(x.ok?(x.models+' моделей'):('✗ '+(x.error||'?')))});
+  vnote('обновлено '+new Date().toLocaleTimeString()+' — '+parts.join(' · '),true);
+  if(Array.isArray(j.voices))applyVoices(j.voices,true);
+};
+document.getElementById('lrefresh').onclick=async function(){
+  const b=this;
+  b.disabled=true;b.textContent='⟳ замер…';
+  vnote('обновляю лимиты у всех голосов…',true);
+  try{
+    const r=await fetch('/limits_refresh',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:'{}',signal:AbortSignal.timeout(10000)});
+    if(!r.ok)throw new Error('ошибка '+r.status);
+    const deadline=Date.now()+60000;
+    let pollFailed=false;
+    while(Date.now()<deadline){
+      const j=await loadVoices();
+      pollFailed=!j;
+      if(j&&!j.limits_refreshing){
+        if(j.limits_error)throw new Error('сбор лимитов завершился ошибкой; сохранён прежний замер');
+        vnote('замер лимитов завершён — '+new Date().toLocaleTimeString()+
+          '; доступность источников указана в карточках',true);
+        return;
+      }
+      await new Promise(resolve=>setTimeout(resolve,1000));
+    }
+    vnote(pollFailed?'не удалось проверить завершение замера; карточки обновятся автоматически':
+      'замер ещё идёт; карточки обновятся автоматически',true);
+  }catch(e){vnote('обновление лимитов: '+e.message)}
+  finally{b.disabled=false;b.textContent='⟳ лимиты'}
+};
+function setScope(v){
+  SCOPE=v;
+  try{localStorage.setItem('rt-scope',v)}catch(_){}
+  document.getElementById('sc-room').className='scopetab'+(v==='room'?' on':'');
+  document.getElementById('sc-rounds').className='scopetab'+(v==='rounds'?' on':'');
+  document.getElementById('sc-exec').className='scopetab'+(v==='exec'?' on':'');
+  // Стандартные кнопки диалога (Сказать, Слепой ход, Раунд, Быстрый
+  // вопрос) стоят внизу ВСЕГДА; блок правок живёт в правой панели под
+  // жребием и виден только на 🔧 (наказ Автора 2026-09-02: «на этом
+  // месте ожидаю стандартные кнопочки диалога, а Правка/Ревизия/
+  // Принять/Adopt — во вкладку Кодер, ниже Бросить/Раскрыть»).
+  try{
+    document.getElementById('vhead3').textContent=
+      v==='exec'?'Голоса · кресла (🔧 coder)'
+      :v==='rounds'?'Голоса · состав раунда (🎼)':'Голоса · кому уйдёт (💬)';
+    document.getElementById('msg').placeholder=
+      v==='exec'?'Задание исполнителю (кнопка «Правка» в правой панели); кнопки диалога внизу работают как прежде'
+      :v==='rounds'?'Вопрос раунда одной строкой (кнопка «Раунд стола»); Enter — реплика в комнату'
+      :'Реплика в комнату (@имя — адресно; Enter — отправить, Alt+Enter — перенос)';
+    document.getElementById('coderblk').hidden=(v!=='exec');
+  }catch(_){}
+  // Перерисовка БЕЗ обновления _got: замера не было, и подделывать его
+  // свежесть нельзя (тот же довод, что у прежнего тумблера).
+  applyVoices(Object.keys(VMETA).map(function(k){return VMETA[k]}),false);
+}
+document.getElementById('sc-room').onclick=function(){setScope('room')};
+document.getElementById('sc-rounds').onclick=function(){setScope('rounds')};
+document.getElementById('sc-exec').onclick=function(){setScope('exec')};
+// Восстановленная область должна быть ВИДНА сразу: подсветка вкладок
+// живёт в разметке, а SCOPE — в localStorage, и без этой строки они
+// расходились до первого клика.
+setScope(SCOPE);
+function applyVoices(list,fresh){
+  // fresh=false — локальная перерисовка (тумблер вкладок): _got трогать
+  // нельзя, иначе возраст замера лжёт «только что» без нового опроса
+  // (нашёл codex).
+  if(fresh===undefined)fresh=true;
+  list.forEach(function(raw){
+    const m=(typeof raw==='string')?{name:raw}:(raw||{});
+    const name=m.name||m.voice||m.id;
+    if(!name)return;
+    if(fresh)m._got=Date.now();
+    VMETA[name]=m;
+    const row=vrow(name,!!m.not_voice);
+    if(m.not_voice){
+      // TypeSafe: не голос — галочка серая и не включается, модель/усилие
+      // «—» со словами почему; живёт только шкала счёта (решение Автора)
+      try{const pick=row.querySelector('.vpick input'),vp=row.querySelector('.vpick'),nm=row.querySelector('.nm');
+        pick.checked=false; pick.disabled=true; pick.dataset.notvoice='1'; vp.title=m.why||'не голос'; if(nm&&m.label)nm.textContent=m.label;
+        ['.mdl','.eff'].forEach(function(q){const c=row.querySelector(q); if(!c)return; c.innerHTML=''; const sp=document.createElement('span'); sp.className='fix'; sp.textContent='—'; sp.title=m.why||'не голос'; c.appendChild(sp)});
+        const mem=row.querySelector('.mem'); if(mem)mem.innerHTML='';
+      }catch(_){}
+      renderLim(row,m); return;
+    }
+    const mdl=Array.isArray(m.models)?m.models:[];
+    const set=m.set_in_window||{};
+    const sc=SCOPE;
+    // Карточки вкладок — ОТ СЕРВЕРА (m.tabs): одинаковое наполнение у
+    // трёх вкладок, у каждой свои действующее значение, заданное в
+    // окне, явное умолчание с хранителем и рычаги (наказ Автора
+    // 2026-09-02). tabs.exec===null — кресла нет (gemini).
+    const tabs=m.tabs||{};
+    const t=(tabs[sc]&&!tabs[sc].error)?tabs[sc]:null;
+    const terr=tabs[sc]&&tabs[sc].error?tabs[sc].error:'';
+    const ex=(tabs.exec&&!tabs.exec.error)?tabs.exec:null;
+    // Галочка строки: 💬/🎼 — набор вкладки (локально), 🔧 — пул random
+    // кресел (сервер). У голоса без кресла галочка гаснет; дорогой
+    // (kimi) в random не входит независимо от галочки — она disabled.
+    try{
+      const pick=row.querySelector('.vpick input');
+      const vp=row.querySelector('.vpick');
+      if(vp.dataset.origTitle===undefined)vp.dataset.origTitle=vp.title||'';
+      if(sc==='exec'){
+        pick.disabled=!ex||!!(ex&&ex.costly);
+        pick.checked=!!(ex&&ex.pool&&!ex.costly);
+        pick.dataset.execpool='1';
+        vp.title=!ex?'кресла нет: только ревьюер'
+          :(ex.costly?'дорогой — в random не входит, зовите явно'
+            :'галочка = участие в random-пуле кресел (POST /voices scope=exec)');
+      }else{
+        delete pick.dataset.execpool;
+        pick.disabled=false;
+        pick.checked=!PICK_OFF[sc].has(name);
+        vp.title=(sc==='rounds'
+          ?'галочка = участие в раунде и в жребии ведущего (вкладка 🎼)'
+          :'галочка = кому уйдёт реплика и слепой ход (вкладка 💬)')+
+          (vp.dataset.origTitle?'\n'+vp.dataset.origTitle:'');
+      }
+    }catch(_){}
+    const tabName=sc==='room'?'комната (💬)':sc==='exec'?'кресло (🔧 coder)':'раунды (🎼)';
+    if(!t){
+      // Слова вместо прочерка (Автор прочёл прочерки как поломку): на
+      // 🔧 это честное «кресла нет», иначе — сервер без карточки вкладки.
+      const why=terr?('сервер: '+terr):sc==='exec'
+        ?'кресла нет: '+name+' — только ревьюер, файлов не видит'
+        :'сервер не прислал карточку вкладки '+tabName;
+      const word=terr?'ошибка карточки':sc==='exec'?'нет кресла':'';
+      fillCell(row,name,'model',word,[],false,why,'',false,false,null,false);
+      fillCell(row,name,'effort',word,[],false,why,'',false,false,null,false);
+      renderLim(row,m);
+      return;
+    }
+    const efl=Array.isArray(t.efforts)?t.efforts:[];
+    // Жёлтая рамка = «комната и раунды ЗАДАНЫ по-разному» (наказ Автора
+    // 2026-08-31: рамка только там, где есть разница). Сравниваются
+    // ЗАДАННЫЕ значения; умолчания вкладок могут различаться и без
+    // рамки — об этом подсказка ячейки. Рамка не зависит от вкладки.
+    const rmS=set.room||{},rdS=set.rounds||{};
+    const diffM=(rmS.model||null)!==(rdS.model||null);
+    const diffE=(rmS.effort||null)!==(rdS.effort||null);
+    const diffNote=function(d,f){return (d?'\n⚠ области различаются: '+
+      '💬 '+((rmS[f])||'(умолчание)')+' · 🎼 '+((rdS[f])||'(умолчание)'):'')+
+      '\nжёлтая рамка = комната и раунды ЗАДАНЫ по-разному; умолчания '+
+      'вкладок могут различаться и без рамки'};
+    const src=t.default_src||'';
+    const mtitle='модель · '+tabName+
+      '\nсейчас: '+(t.model||'—')+(t.set_model?' (задано в окне)':' (умолчание)')+
+      '\nумолчание: '+(t.default_model||'не объявлено')+
+      (src?'\nхранитель умолчания: '+clip(src,240):'')+
+      (m.models_source?'\nсписок моделей: '+clip(m.models_source,200):'')+
+      diffNote(diffM,'model')+'\nсмена уходит POST /voices';
+    const etitle='усилие · '+tabName+
+      '\nсейчас: '+(t.effort||'—')+(t.set_effort?' (задано в окне)':' (умолчание)')+
+      '\nумолчание: '+(t.default_effort||'не объявлено')+
+      (src?'\nхранитель умолчания: '+clip(src,240):'')+
+      (efl.length?'\nступени этой модели: '+efl.join(', '):'')+
+      diffNote(diffE,'effort')+'\nсмена уходит POST /voices';
+    // Без рычага — словами, не прочерком: «нет рычага» и подсказка ПОЧЕМУ.
+    const mshow=t.model||(t.can_model?'':'нет рычага');
+    const eshow=t.effort||(t.can_effort?'':'нет рычага');
+    fillCell(row,name,'model',mshow,mdl,!!t.can_model,
+      clip((t.why_model||'из окна не меняется')+(src?'\n'+src:''),300),
+      mtitle,sc==='exec'?false:diffM,!!t.set_model,t.default_model,!t.set_model);
+    fillCell(row,name,'effort',eshow,efl,!!t.can_effort,
+      clip((t.why_effort||'рычага усилия у этого канала нет')+(src?'\n'+src:''),300),
+      etitle,sc==='exec'?false:diffE,!!t.set_effort,t.default_effort,!t.set_effort);
+    // «память» — только у голоса без сессии CLI (deepseek-http) на 💬:
+    // комната собирает ему нить из ленты каждый ход (POST /voices memory)
+    const memc=row.querySelector('.mem');
+    if(memc&&!memc.contains(document.activeElement)&&!memc.dataset.busy){
+      memc.innerHTML='';
+      if(sc==='room'&&t.can_memory){
+        const lb=document.createElement('label');lb.className='memlab';
+        lb.title='Память нити из ленты: у '+name+' нет сессии CLI, каждый ход стартует с нуля. Галочка — комната шлёт ему всю нить проекта с её начала (свои реплики помечены «Вы», потолок '+(t.memory_cap||60000)+' симв., обрезка называется). Без галочки — только устав и дельта с курсора. Платится входом; DeepSeek кэширует повторяющийся префикс — «вход N+M кэш» в строке хода.';
+        const cb=document.createElement('input');cb.type='checkbox';cb.checked=!!t.memory;cb.className='memck';
+        cb.onchange=async function(ev){
+          ev.stopPropagation();          // не в делегат #voices: тот пишет набор вкладки (grok)
+          const want=cb.checked;
+          // без disabled: он снимает фокус, и опрос /voices пересобрал бы
+          // галочку из старого t.memory до ответа сервера (grok)
+          memc.dataset.busy='1';
+          let r,j={};
+          try{r=await fetch('/voices',{method:'POST',headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({voice:name,scope:'room',memory:want})});j=await r.json();}
+          catch(e){cb.checked=!want;delete memc.dataset.busy;return acterr('сервер не ответил: '+e)}
+          delete memc.dataset.busy;
+          if(!r.ok){cb.checked=!want;return acterr((j&&j.error)||('ошибка '+r.status))}
+          if(t)t.memory=want;
+        };
+        const tx=document.createElement('span');tx.textContent='память';
+        lb.appendChild(cb);lb.appendChild(tx);
+        memc.appendChild(lb);
+      }
+      // «резерв API» — у Кими (подписка Kimi Code первой линией, ключи
+      // moonshotai* резервом): одна галочка на комнату и раунды
+      if((sc==='room'||sc==='rounds')&&t.can_reserve){
+        const lb=document.createElement('label');lb.className='memlab';
+        lb.title='Резерв по ключам API: первая линия '+name+' — подписка Kimi Code'+(t.plan_line?'':' (вход не сделан: kimi login)')+'. Галочка — при исчерпании квоты подписки тот же ход сразу уходит ключевой линии (платно, с баланса; в ленте — «⇄ … линия»). Без галочки — только подписка: квота кончилась — отказ канала.';
+        const cb=document.createElement('input');cb.type='checkbox';cb.checked=!!t.reserve;cb.className='memck';
+        cb.onchange=async function(ev){
+          ev.stopPropagation();
+          const want=cb.checked;
+          memc.dataset.busy='1';
+          let r,j={};
+          try{r=await fetch('/voices',{method:'POST',headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({voice:name,scope:sc,reserve:want})});j=await r.json();}
+          catch(e){cb.checked=!want;delete memc.dataset.busy;return acterr('сервер не ответил: '+e)}
+          delete memc.dataset.busy;
+          if(!r.ok){cb.checked=!want;return acterr((j&&j.error)||('ошибка '+r.status))}
+          if(t)t.reserve=want;
+        };
+        const tx=document.createElement('span');tx.textContent='резерв API';
+        lb.appendChild(cb);lb.appendChild(tx);
+        memc.appendChild(lb);
+      }
+    }
+    renderLim(row,m);
+  });
+}
+async function push(name,field,val,el,prev,sc){
+  const m=VMETA[name]||{},body={voice:name,scope:sc||SCOPE};
+  // Шлём ТОЛЬКО изменённое поле: сервер хранит вторую половину пары
+  // сам, а досылка «текущего» значения из комнаты в область раундов
+  // протаскивала бы чужую пару (поймано при сборке тумблера областей).
+  body[field]=val;
+  verr(name,'');
+  let r;
+  try{
+    r=await fetch('/voices',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  }catch(e){el.value=prev;verr(name,'сервер не ответил: '+e);return}
+  let j={};try{j=await r.json()}catch(e){j={}}
+  if(!r.ok){
+    // Возврат к прежнему значению обязателен: иначе селектор показывает
+    // то, чего сервер не принял, — панель врёт, каким голос пойдёт.
+    // Ошибка — у строки, а не alert'ом: alert перекрывает ленту и стоит
+    // Автору набранной реплики.
+    el.value=prev;
+    // Сервер отказывает С РАЗБОРОМ (allowed/known/also_ok/why) — и это
+    // самое полезное в отказе: без списка допустимых человек будет
+    // тыкать наугад. Длинное «почему» уходит в подсказку.
+    let t=(j&&j.error)||('ошибка '+r.status);
+    if(j&&j.allowed&&j.allowed.length)t+=' — можно: '+j.allowed.join(', ');
+    else if(j&&j.allowed)t+=' — допустимых ступеней сервер не знает';
+    if(j&&j.known&&j.known.length)t+=' — известные: '+j.known.join(', ');
+    verr(name,t,false,
+      [(j&&j.why)||'',(j&&j.also_ok)?'или по шаблону: '+j.also_ok:'',
+       (j&&j.source)?'список ступеней: '+j.source:'']
+      .filter(Boolean).join('\n'));
+    return;
+  }
+  // Что стоит на самом деле — берём из ответа сервера, а не из своего
+  // клика: просьбу могли не принять как есть, и показать надо принятое.
+  if(j&&j.voice&&j.voice.name)applyVoices([j.voice]);
+  else loadVoices();
+  // Ход, запущенный ДО смены, идёт со старым окружением — сказать это
+  // вслух, иначе «поменял и тут же спросил» прочтётся как ответ новой
+  // модели (сервер пишет ту же оговорку в ленту событием voice_config).
+  const old=(j&&j.running_with_old_env)||[];
+  if(old.length){
+    verr(name,'идущий ход запущен ещё со старым окружением',true);
+    const row=VROW[name];if(row)row.dataset.oldenv='1';
+  }
+}
+function acterr(text,isNote){
+  // Одна строка под кнопками на все отказы отправки. Почему не alert:
+  // alert перекрывает ленту, требует второго клика и снимается вслепую
+  // тем же Enter, которым отправляют, — то есть отказ можно закрыть, не
+  // прочитав. Заметка (не ошибка) идёт приглушённым цветом.
+  const e=document.getElementById('acterr');if(!e)return;
+  e.textContent=text||'';e.hidden=!text;e.className=isNote?'note':'';
+}
+function syncQuick(names){
+  // Список для быстрого вопроса — из ТЕХ ЖЕ имён, что и галочки слева.
+  // Второй, самостоятельный источник имён разошёлся бы с первым молча,
+  // и окно предлагало бы спросить голос, которого у комнаты нет.
+  if(!qsel||!Array.isArray(names))return;
+  const want=[''].concat(names);
+  const have=[].map.call(qsel.options,function(o){return o.value});
+  if(have.length===want.length&&have.every(function(v,i){return v===want[i]}))return;
+  const cur=qsel.value;
+  qsel.innerHTML='';
+  want.forEach(function(v){
+    const o=document.createElement('option');
+    o.value=v;o.textContent=v||'случайно';
+    if(v===cur)o.selected=true;qsel.appendChild(o)});
+  if(want.indexOf(cur)<0)qsel.value='';   // выбранный голос исчез — назад к «случайно»
+}
+async function loadVoices(){
+  let r;
+  try{r=await fetch('/voices',{signal:AbortSignal.timeout(10000)})}catch(e){return}   // нет — панель живёт на /state
+  if(!r.ok)return;
+  let j;try{j=await r.json()}catch(e){return}
+  const list=Array.isArray(j)?j:(j&&Array.isArray(j.voices)?j.voices:null);
+  if(!list||!list.length)return;
+  LIM_AGE=(j&&typeof j.limits_age_s==='number')?j.limits_age_s:null;
+  VOICES_SRC=true;applyVoices(list);
+  return j;
+}
+loadVoices();setInterval(loadVoices,15000);
+
+async function state(){
+  const s=await(await fetch('/state')).json();
+  // «Думает» — по СВОЕМУ акту: у акта с заметкой word_to берутся
+  // только реально позванные, у акта без неё (слепой ход, раунд) —
+  // его список целиком.
+  const busy={};
+  s.running.forEach(function(r){
+    const set=r.id?SPEAK.get(r.id):null;
+    (set?Array.from(set):r.voices).forEach(v=>busy[v]=r.for_s);
+  });
+  // Записи умерших актов не копятся: карта чистится по живому списку.
+  const alive=new Set(s.running.map(r=>r.id).filter(Boolean));
+  SPEAK.forEach(function(_,k){if(!alive.has(k))SPEAK.delete(k)});
+  LAST_RUN=Array.isArray(s.running)?s.running:[];
+  // Поле modes объявляет сервер. Отсутствия поля НЕ достаточно, чтобы
+  // сказать «режима нет» — достаточно, чтобы окно не полагалось на него.
+  if(Array.isArray(s.modes))MODES=s.modes;
+  window.STATE=s;   // страница читает s.edit_voices и прочие поля
+  // Действующая цель — из ленты; поле не трогаем, пока в нём рука.
+  try{const g=document.getElementById('goal');
+    // Черновик не трогаем: пока Автор набирает (флаг dirty по input),
+    // опрос не затирает поле, даже если фокус ушёл (нашли gemini, claude).
+    if(typeof s.goal==='string'&&!g.dataset.dirty&&document.activeElement!==g&&g.value!==s.goal)g.value=s.goal;
+  }catch(_){}
+  try{renderActs()}catch(_){}
+  syncQuick(Array.isArray(s.voices)?s.voices:[]);
+  // Строку голоса заводит ЛЮБОЙ из двух источников — /voices (модель,
+  // усилие, лимит) или /state (одни имена). Второй запасной намеренно:
+  // серверной части /voices может не быть вовсе, и панель обязана
+  // остаться рабочей, а не пустой — галочки «кому уйдёт» важнее
+  // селекторов.
+  s.voices.forEach(v=>{
+    const row=vrow(v);
+    // О ком /voices сказал (_got), тот перерисовывается своим опросом.
+    // Об остальных подпись зависит от того, отвечает ли /voices вообще,
+    // — а это меняется на ходу (второй агент дописывает обработчик).
+    if(!(VMETA[v]||{})._got){vplain(row);renderLim(row,VMETA[v])}
+  });
+  s.voices.forEach(v=>{
+    // Заметка «идущий ход со старым окружением» живёт ровно пока идёт
+    // тот ход: висящая дольше, она через минуту врала бы о положении
+    // дел не хуже выдуманной полосы.
+    const row=VROW[v];
+    if(row&&row.dataset.oldenv&&busy[v]===undefined)verr(v,'');
+    const el=document.getElementById('st-'+v);
+    if(!el)return;
+    if(busy[v]!==undefined){el.textContent='думает '+busy[v]+'с';el.className='st busy'}
+    else{el.textContent='';el.className='st'}});
+  // «Стоп» показываем, только когда идёт раунд: кнопка, которая всегда
+  // на месте, но обычно ничего не делает, учит не доверять кнопкам.
+  // Имя берём из поля round, подпись — только запасной путь.
+  const rnd=s.running.find(r=>(r.label||'').startsWith('round: ')&&r.auto);
+  const sb=document.getElementById('stop');
+  if(rnd){const nm=rnd.round||rnd.label.slice(7).split(' ')[0];
+    sb.hidden=false;sb.dataset.round=nm;
+    sb.textContent='Стоп: '+nm+(rnd.auto?' (авто)':'');}
+  else{sb.hidden=true;delete sb.dataset.round;sb.textContent='Стоп';}
+  // «Прервать всё» видна ровно пока есть что прерывать — тот же довод,
+  // что у «Стоп»: кнопка, которая всегда на месте, но обычно ничего не
+  // делает, учит не доверять кнопкам.
+  const ab=document.getElementById('abort');
+  if(ab)ab.hidden=!LAST_RUN.length;
+  const lb=document.getElementById('lotbox');
+  if(s.lot){lb.innerHTML=s.lot.conductor
+    ?'дирижёр: <b>'+esc(s.lot.conductor)+'</b><br><span class="hint">видно только вам — раскройте, когда вопрос закрыт</span>'
+    :'commit '+esc(s.lot.commit)+'…<br>ждём drand-раунд '+s.lot.target;}
+  else if(!lb.dataset.err)lb.textContent='не брошен';
+}
+setInterval(state,2000);state();
+async function send(blind){
+  // «#кресло …» первым словом — это задание, не реплика: Enter иначе
+  // рассылал бы его веером всем отмеченным голосам (ревьюер вкладок вывода)
+  if(/^#кресло(?:\s+|$)/iu.test(msg.value.trim()))return sendQuick();
+  const text=msg.value.trim(); if(!text)return acterr('пустая реплика',true);
+  const project=document.getElementById('project').value.trim();
+  acterr('');
+  let r;
+  // Отказ показываем строкой под кнопками, а не alert'ом — по тому же
+  // доводу, что и у строки голоса: alert перекрывает ленту и стоит
+  // Автору набранной реплики, если снять его вслепую.
+  const sentA=ANCHOR;
+  try{
+    r=await fetch('/act',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({text,blind,voices:picked('room'),project,brief:briefOn(),thoughts:thoughtsOn(),
+        peer:peerOn(),anchor:sentA?sentA.addr:''})});
+  }catch(e){return acterr('сервер не ответил: '+e)}
+  let j={};try{j=await r.json()}catch(_){}
+  if(r.ok){msg.value='';anchorSent(sentA)}
+  else acterr((j&&j.error)||('ошибка '+r.status));
+}
+// ── БЫСТРЫЙ ВОПРОС: один голос, без протокола ───────────────────────
+// Наказ Автора 2026-08-25: «четвертый вариант отправки: быстрый вопрос,
+// рядышком подменющечка: модель(рандом по умолчанию)».
+//
+// Контракт (серверную часть пишет второй агент): POST /act с
+// mode:"quick" и voice — именем голоса или null для случайного.
+//
+// ОСТОРОЖНОСТЬ ПРИ null НЕ ПЕРЕСТРАХОВКА, А ЦЕНА ОШИБКИ. Старый
+// обработчик /act поля mode не знает: он смотрит только blind и
+// voices, а запрос БЕЗ voices рассылает ВЕЕРОМ на все шесть голосов.
+// То есть «мелкий вопрос одному» на несогласованном сервере молча
+// стал бы шестью оплаченными вызовами — ровно то, от чего в /act уже
+// стоит проверка «не выбран ни один голос». Поэтому:
+//   • выбран конкретный голос → шлём и voice, и voices:[voice];
+//     на новом сервере это тот же голос, на старом — say ему одному,
+//     что по смыслу и есть быстрый вопрос;
+//   • выбрано «случайно», а сервер режим quick НЕ объявил (/state.modes)
+//     → голос тянет само окно и говорит об этом строкой под кнопками.
+//     Это НЕ жребий drand (правило 11 — про ведущего, не про мелочь), и
+//     называть его жребием нельзя.
+// Как только сервер объявит modes, случайный выбор уходит серверу
+// целиком, а окно перестаёт тянуть его само.
+async function sendQuick(){
+  // «#кресло …» первым словом (наказ Автора 2026-09-06; раунд
+  // вкладки-вывода-v1 — только первый токен, иначе цитата чужого текста
+  // угонит реплику в кресло): текст уходит ЗАДАНИЕМ случайному из умеющих,
+  // как с галочкой «coder», префикс срезается. Подтверждение остаётся тем
+  // же, что у галочки: стол разделился 3:3, а кресло платное.
+  const orig=msg.value.trim(); let text=orig;
+  const pm=text.match(/^#кресло(?:\s+|$)/iu); const viaPrefix=!!pm;   // и голый префикс — не вопрос
+  if(pm)text=text.slice(pm[0].length).trim();
+  if(!text)return acterr('пустая реплика',true);
+  // Этап 4: галочка превращает быстрый вопрос в выдачу кресла тому же
+  // голосу. Голос без рук (не умеет правки) — кресло случайному из
+  // умеющих, и подмена называется в подтверждении, а не после.
+  if(document.getElementById('qexec').checked||viaPrefix){
+    const project=document.getElementById('project').value.trim();
+    if(!project)return acterr('правке нужен проект: укажите путь к репозиторию');
+    // Список умеющих — ОТ СЕРВЕРА (/state.edit_voices): копия в JS
+    // разошлась бы молча при расширении пула (та же причина, по которой
+    // модели голосов не переписываются в окне). Фолбэк — на случай
+    // старого сервера.
+    const known=window.STATE&&window.STATE.edit_voices;
+    const CAN=known||['codex','claude','grok','deepseek'];
+    const want=viaPrefix?'':(qsel.value||'');   // префикс = случайный исполнитель
+    const voice=CAN.indexOf(want)>=0?want:null;
+    // Без списка от сервера НЕ утверждаем «не умеет» — фолбэк мог
+    // отстать от пула, и подпись лгала бы (нашёл deepseek).
+    const who=voice||(want?(known?('случайному из умеющих (выбранный «'+
+      want+'» правки не умеет)'):'случайному из умеющих (окно не знает '+
+      'полного списка — решит сервер)'):'случайно');
+    if(!confirm('ОН ЖЕ ИСПОЛНИТЕЛЬ: текст уйдёт заданием на ПРАВКУ — '+
+        (voice?voice:who)+'.\nПроект: '+project+
+        '\n\nЭто кресло с правом записи в worktree, платный агентный вызов.'))
+      return acterr('правка отменена',true);
+    acterr('');
+    let r;
+    try{
+      r=await fetch('/edit',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({task:text,voice:voice,project:project,thoughts:thoughtsOn()})});
+    }catch(e){return acterr('сервер не ответил: '+e)}
+    let j={};try{j=await r.json()}catch(_){}
+    if(!r.ok)return acterr('правка не открыта: '+((j&&j.error)||('ошибка '+r.status)));
+    if(!j||!j.act)return acterr('сервер ответил 200 без акта — поле не чищу');
+    if(msg.value.trim()===orig)msg.value='';   // сравнение с исходником: после среза префикса поле иначе не чистилось (grok)
+    try{document.getElementById('actid').value=j.act}catch(_){}
+    acterr('кресло выдано: акт '+j.act+' ['+(j.voice||'?')+']'+
+      (voice?'':' — исполнителя выбрал сервер')+', ветка act/'+j.act,true);
+    return;
+  }
+  const project=document.getElementById('project').value.trim();
+  let voice=qsel.value||null,here=false;
+  if(!voice&&!(MODES&&MODES.indexOf('quick')>=0)){
+    const pool=picked('room').length?picked('room')
+      :[].map.call(qsel.options,function(o){return o.value}).filter(Boolean);
+    if(!pool.length)return acterr('некого спросить: ни одного голоса в списке');
+    voice=pool[Math.floor(Math.random()*pool.length)];here=true;
+  }
+  const sentA=ANCHOR;
+  const body={text:text,mode:'quick',voice:voice,project:project,
+              brief:briefOn(),thoughts:thoughtsOn(),anchor:sentA?sentA.addr:''};
+  if(voice)body.voices=[voice]; else body.pool=picked('room');   // «случайно» — из отмеченных
+  acterr('');
+  let r;
+  try{
+    r=await fetch('/act',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(body)});
+  }catch(e){return acterr('сервер не ответил: '+e)}
+  let j={};try{j=await r.json()}catch(_){}
+  if(!r.ok)return acterr('быстрый вопрос не ушёл: '+
+    ((j&&j.error)||('ошибка '+r.status)));
+  msg.value='';anchorSent(sentA);
+  acterr(here?'голос выбрало окно: '+voice+
+    ' — сервер режим quick пока не объявил':'',true);
+}
+document.getElementById('say').onclick=()=>send(false);
+document.getElementById('blind').onclick=()=>send(true);
+document.getElementById('quick').onclick=()=>sendQuick();
+// ── ВКЛАДКИ ВЫВОДА: 🎼 дирижёр · 🔧 исполнитель · ⚡ быстрый ответ ──────
+// Наказ Автора 2026-09-06: видеть работу стола «как в терминале», а не
+// ждать. Раунд вкладки-вывода-v1 (шесть голосов): опрос хвоста лога акта
+// по смещению (GET /act_log), не SSE; у каждой вкладки свой акт и своё
+// смещение; переподключение — продолжить с того же места; мысли модели —
+// галочкой «💭 мысли» (Автор: «самое интересное»), умолчание включено.
+// Что показано — подписано словами (правило 17): печать процесса,
+// поток событий CLI, сводки рассуждений от провайдера.
+(function(){
+  const feed0=document.getElementById('feed'), top0=document.getElementById('feedtop');
+  if(!feed0||!top0||!document.createElement||!document.createDocumentFragment)return; // заглушка DOM в смоке
+  try{
+  const VIEWS=[['feed','💬 лента','Лента комнаты (как прежде)'],
+    ['cond','🎼 дирижёр','Стенограмма раунда или хода комнаты, как в терминале: вопрос, кого вызвал и какой командой, поток каждого голоса (мысли, инструменты, ответ), итоги. В слепой фазе вживую — только обезличенный счётчик; потоки и поимённые строки ложатся по закрытии фазы (правило 8.5).'],
+    ['chair','🔧 исполнитель','Вывод CLI в кресле исполнителя по мере работы: вызовы инструментов, правки, мысли (если канал их отдаёт).'],
+    ['quick','⚡ быстрый ответ','Стенограмма быстрого вопроса: вопрос, кто отвечает и какой командой, поток CLI или HTTP-адаптера по мере прихода (мысли модели — если галочка «мысли» стояла при отправке), итог.'],
+    ['sec','📜 секретарь','Решения Автора (дословно, с датой и кто записал), очередь работ и отчёты агента-посредника — события ленты decision / queue / report (SECRETARY.md). Пишет их chamber/secretary.py; роль передаваемая: новый агент начинает с «secretary.py tail».']];
+  const KINDS={cond:['round','room'],chair:['chair','review'],quick:['quick'],sec:['secretary']};
+  // род лога — по роду АКТА, не вкладки: ревизия дифа живёт во вкладке
+  // исполнителя, но её вывод — печать обёртки merge_gate (kind=act);
+  // раунд, ход комнаты и быстрый вопрос — стенограмма (raw), а пока её
+  // нет (старый акт, ход ещё не начался) сервер отдаёт лог акта
+  function logKind(a){if(!a)return 'act'; const k=a.kind||(a.edit?'chair':''); return k==='chair'?'chair':k==='review'?'act':'raw'}
+  const EMPTY={cond:'актов раунда или комнаты пока нет',
+    sec:'ходов секретаря пока нет — напишите ему выше',
+    chair:'актов кресла пока нет',
+    quick:'актов быстрого ответа пока нет. Быстрый вопрос с галочкой «coder» — это кресло: его вывод во вкладке 🔧 исполнитель'};
+  const css=document.createElement('style');
+  css.textContent='#viewtabs{display:flex;gap:.4rem;margin:.45rem 0 0}'
+   +'.vtab{background:var(--bg);border:1px solid var(--rule);color:var(--dim);border-radius:.4rem;padding:.2rem .6rem;cursor:pointer;font:inherit}'
+   +'.vtab:hover{border-color:var(--acc)}.vtab.on{background:var(--panel);color:var(--ink);border-color:var(--acc)}'
+   +'#feed.term>.ev{display:none}#termwrap{margin-top:.6rem}'
+   +'#secwrap{margin-top:.6rem}#secwrap h4{margin:.5rem 0 .3rem;font-size:.95rem}#secwrap .row{border-top:1px solid var(--rule);padding:.3rem 0;font-size:.9rem;white-space:pre-wrap;word-break:break-word}'
+   +'#secwrap .m{color:var(--dim);font-size:.82rem}#secwrap .me{background:var(--panel)}#sectok{width:22ch;font:inherit;font-family:ui-monospace,monospace;background:var(--bg);color:var(--ink);border:1px solid var(--rule);border-radius:.3rem;padding:0 .3rem}#secwrap .st{display:inline-block;min-width:6ch;color:var(--acc)}#secwrap .done{color:var(--dim);text-decoration:line-through}#secwrap .dropped{color:var(--dim)}'
+   +'#termhead{display:flex;gap:.6rem;align-items:center;flex-wrap:wrap;color:var(--dim);font-size:.86rem;margin-bottom:.4rem}'
+   +'#termact{max-width:38ch;font:inherit;background:var(--bg);color:var(--ink);border:1px solid var(--rule);border-radius:.3rem}'
+   +'#term{white-space:pre-wrap;word-break:break-word;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.84rem;line-height:1.35;background:var(--bg);border:1px solid var(--rule);border-radius:.4rem;padding:.6rem .8rem;max-height:calc(100vh - 14rem);overflow:auto;margin:0}'
+   +'#term .think{color:var(--acc)}#term .tool{color:var(--me)}#term .meta{color:var(--dim)}#term .err{color:var(--err)}'
+   +'#term .q{color:var(--me);font-weight:600}#term .head{display:block;color:var(--ink);font-weight:600;border-top:1px solid var(--rule);margin-top:.35rem;padding-top:.35rem}#term .cmd{color:var(--dim)}'
+   +'#term.nothink .think{display:none}'
+   +'#termid{width:14ch;font:inherit;font-family:ui-monospace,monospace;background:var(--bg);color:var(--ink);border:1px solid var(--rule);border-radius:.3rem;padding:0 .3rem}'
+   +'#termcopy,#termnew{font:inherit;background:var(--bg);color:var(--ink);border:1px solid var(--rule);border-radius:.3rem;padding:0 .45rem;cursor:pointer}'
+   +'#termbox{position:relative}#termnew{position:absolute;right:.9rem;bottom:.7rem;background:var(--panel);border-color:var(--acc)}'
+   +'#termpend{color:var(--acc)}'
+   +'#gatecard{margin-top:.6rem;border:1px solid var(--rule);border-radius:.4rem;padding:.6rem .8rem;font-size:.9rem}'
+   +'#gatecard h4{margin:0 0 .4rem;font-size:.95rem}#gatecard .row{display:flex;gap:.5rem;flex-wrap:wrap;align-items:center;margin:.3rem 0}'
+   +'#gatecard button{font:inherit;background:var(--bg);color:var(--ink);border:1px solid var(--rule);border-radius:.3rem;padding:.15rem .6rem;cursor:pointer}'
+   +'#gatecard button:hover{border-color:var(--acc)}#gatecard details{margin:.3rem 0}#gatecard summary{cursor:pointer;color:var(--dim)}'
+   +'#gatecard pre{white-space:pre-wrap;word-break:break-word;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.8rem;background:var(--bg);border:1px solid var(--rule);border-radius:.3rem;padding:.5rem .7rem;max-height:60vh;overflow:auto;margin:.3rem 0}'
+   +'#gatecard .ok{color:#7fc97f}#gatecard .no{color:var(--err)}#gatecard .dim{color:var(--dim)}'
+   +'#gatecard .controw{margin-top:.5rem;border-top:1px solid var(--rule);padding-top:.4rem}#gatecard .controw textarea{width:100%;box-sizing:border-box;font:inherit;background:var(--bg);color:var(--ink);border:1px solid var(--rule);border-radius:.3rem;padding:.3rem .5rem;resize:vertical}';
+  (document.head||document.body||feed0).appendChild(css);
+  const feed=document.getElementById('feed'), top=document.getElementById('feedtop');
+  const qb=document.getElementById('quickbar');
+  // галочка «мысли»
+  const tl=document.createElement('label'); tl.id='thoughtslab';
+  tl.title='Мысли модели: thinking-блоки Claude, сводки рассуждений Codex, reasoning_content DeepSeek, thought summaries Gemini — там, где канал их отдаёт. Поставлена (умолчание) — адаптеры и CLI зовутся с их печатью, вкладки показывают. Снята — вкладки прячут мысли, адаптеры DeepSeek и Gemini их не печатают; у claude поток событий (stream-json) включён всегда, галочка решает только показ. Это печать канала, не «внутренний монолог»: что именно показано, подписано в строке.';
+  const tc=document.createElement('input'); tc.type='checkbox'; tc.id='thoughts';
+  try{tc.checked=(localStorage.getItem('rt-thoughts')||'1')==='1'}catch(_){tc.checked=true}
+  tc.onchange=function(){try{localStorage.setItem('rt-thoughts',tc.checked?'1':'0')}catch(_){}
+    const t=document.getElementById('term'); if(t)t.className=tc.checked?'':'nothink'};
+  tl.appendChild(tc); tl.appendChild(document.createTextNode(' 💭 мысли'));
+  if(qb)qb.appendChild(tl);
+  // МОНИТОР ОКОН (наказ Автора 2026-09-10): какие окна стола живы, где
+  // запущены, на каком порту; открыть или остановить. Останавливать можно
+  // только чужое окно этого пользователя, сигналом SIGTERM.
+  // Кнопка — в конце ряда вкладок, список — ВЫПАДАЮЩИЙ, вне потока
+  // (position:absolute): первая версия вставляла панель в ту же
+  // flex-строку, что переключатели и вкладки, и строка растягивалась на
+  // высоту списка (Автор 2026-09-14: «съезжает форматирование»).
+  const wb=document.createElement('button'); wb.textContent='🪟 окна ▾'; wb.className='vtab'; wb.id='winbtn';
+  wb.title='Окна стола этого пользователя: pid, порт, проект, время запуска. «Открыть» — ссылка на окно; «Остановить» — SIGTERM (окно погасит свои акты и выйдет). Список выпадает поверх ленты; закрыть — клик мимо или Esc.';
+  const wp=document.createElement('div'); wp.id='winpanel'; wp.hidden=true;
+  const ww=document.createElement('div'); ww.id='winwrap';
+  css.textContent+='#winbtn{margin-left:auto}#winwrap{position:relative;display:flex;flex:1;justify-content:flex-end}'
+    +'#winpanel{position:absolute;right:0;top:calc(100% + .3rem);z-index:20;width:max-content;max-width:calc(100vw - var(--sidew) - 3rem);max-height:60vh;overflow:auto;background:var(--panel);border:1px solid var(--rule);border-radius:.4rem;padding:.4rem .7rem;font-size:.86rem;box-shadow:0 .4rem 1.2rem rgba(0,0,0,.35)}'
+    +'#winpanel .row{display:flex;gap:.6rem;align-items:center;flex-wrap:wrap;padding:.15rem 0;border-top:1px solid var(--rule)}#winpanel .row:first-child{border-top:0}'
+    +'#winpanel button{font:inherit;background:var(--bg);color:var(--ink);border:1px solid var(--rule);border-radius:.3rem;padding:.05rem .5rem;cursor:pointer}'
+    +'#winpanel .me{color:var(--acc)}#winpanel .dim{color:var(--dim)}#winpanel .path{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:22rem;display:inline-block;vertical-align:bottom}';
+  function shortPath(p){if(!p)return '—'; const parts=String(p).split('/').filter(Boolean); return parts.length?parts[parts.length-1]:p}
+  // Время — ЛОКАЛЬНОЕ: карточка окна хранит UTC-ISO, окно без карточки —
+  // локальную строку из ps; резать часы из ISO значило показать UTC без
+  // зоны (ревьюер дифа 2026-09-14). Полная метка сервера — в title.
+  function shortTime(t){if(!t)return ''; const d=new Date(t); if(isNaN(d))return String(t);
+    const now=new Date(), same=!TS_FULL&&d.toDateString()===now.toDateString();
+    return (same?'':d.toLocaleDateString('ru-RU', TS_FULL?{year:'numeric',month:'2-digit',day:'2-digit'}:{day:'2-digit',month:'2-digit'})+' ')+d.toLocaleTimeString('ru-RU', {hour:'2-digit',minute:'2-digit'})}
+  // Поколение запроса: два перекрывающихся loadWindows (закрыть-открыть
+  // до ответа) чистили панель ДО await и оба дописывали строки — список
+  // вдвое (codex, deepseek, субагент). Рисует только последний.
+  let wgen=0;
+  async function loadWindows(){const g=++wgen; let j=null;
+    try{const r=await fetch('/windows'); j=await r.json()}catch(_){if(g===wgen){wp.innerHTML=''; wp.textContent='сервер не ответил'}return}
+    if(g!==wgen)return;
+    wp.innerHTML='';
+    (j.windows||[]).forEach(function(w){const row=document.createElement('div'); row.className='row';
+      const lab=document.createElement('span'); lab.className=w.self?'me':'';
+      const proj=w.project||w.cwd||'';
+      lab.textContent='pid '+w.pid+(w.port?' · :'+w.port:' · порт неизвестен')+' · ';
+      const ps=document.createElement('span'); ps.className='path'; ps.textContent=shortPath(proj); ps.title=proj||'проект неизвестен'; lab.appendChild(ps);
+      const tail=document.createElement('span'); tail.className='dim';
+      tail.textContent=(w.started?' · с '+shortTime(w.started):'')+(w.self?' · это окно':'')+(w.unregistered?' · без карточки (старый код)':''); tail.title=w.started||''; lab.appendChild(tail);
+      row.appendChild(lab);
+      const okPort=Number.isInteger(w.port)&&w.port>0&&w.port<65536;   // карточка — данные с диска: порт только числом (grok)
+      if(okPort&&!w.self){const a=document.createElement('a'); a.href='http://127.0.0.1:'+w.port+'/'; a.target='_blank'; a.textContent='открыть'; row.appendChild(a)}
+      if(!w.self){const b=document.createElement('button'); b.textContent='остановить'; b.onclick=async function(){
+        if(!confirm('Остановить окно pid '+w.pid+' ('+(proj||'?')+')? Его идущие акты будут прерваны.'))return;
+        b.disabled=true;                          // второй клик — второй SIGTERM и шум «процесса нет»
+        try{const r=await fetch('/windows/stop',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pid:w.pid})}); const jj=await r.json();
+          tail.textContent+=' · '+(r.ok?(jj.note||'остановлено'):(jj.error||('ошибка '+r.status))); if(r.ok)row.classList.add('dim')}catch(_){tail.textContent+=' · сервер не ответил'; b.disabled=false}
+        // Список не перерисовывается сам: ответ сервера остаётся в строке,
+        // свежий список — при следующем открытии меню.
+        }; row.appendChild(b)}
+      wp.appendChild(row)});
+    if(!(j.windows||[]).length)wp.textContent='окон не найдено'}
+  function closeWins(){wp.hidden=true}
+  wb.onclick=function(){wp.hidden=!wp.hidden; if(!wp.hidden)loadWindows()};
+  // Закрытие — по ЦЕЛИ клика (мимо кнопки и меню), а не stopPropagation:
+  // клик по «остановить» с confirm и всё, что внутри, меню не гасит (grok:
+  // нативный диалог может отдать клик документу).
+  document.addEventListener('click',function(e){if(!wp.hidden&&!ww.contains(e.target))closeWins()});
+  // Esc — на фазе захвата и только при открытом меню: иначе Esc в поле
+  // реплики закрывал меню И звал abortAll с confirm «прервать ВСЕ ходы».
+  document.addEventListener('keydown',function(e){if(e.key==='Escape'&&!wp.hidden){closeWins(); e.stopPropagation(); e.preventDefault()}},true);
+  // вкладки
+  const bar=document.createElement('div'); bar.id='viewtabs'; const TABS=[];
+  VIEWS.forEach(function(v){const b=document.createElement('button'); b.className='vtab'+(v[0]==='feed'?' on':'');
+    b.setAttribute('data-view',v[0]); b.textContent=v[1]; b.title=v[2]; b.onclick=function(){setView(v[0])}; bar.appendChild(b); TABS.push([v[0],b])});
+  ww.appendChild(wb); ww.appendChild(wp); bar.appendChild(ww);
+  if(top)top.appendChild(bar);
+  const secwrap=document.createElement('div'); secwrap.id='secwrap'; secwrap.hidden=true;
+  // ящик чата секретаря — строится один раз; токен кресла — из localStorage
+  // токен в браузере — ПОД КЛЮЧОМ ПРОЕКТА (sec_key из /state): тот же порт
+  // после перезапуска на другом проекте не шлёт чужой токен (ревизия: grok)
+  function secKey(){const k=window.STATE&&window.STATE.sec_key; return k?('rtSecToken:'+k):'rtSecToken'}
+  function secTok(){try{return localStorage.getItem(secKey())||''}catch(_){return ''}}
+  const secbox=document.createElement('div'); secbox.className='row';
+  (function(){
+    const ta=document.createElement('textarea'); ta.id='sectext'; ta.rows=3; ta.placeholder='реплика секретарю (Enter — отправить, Shift+Enter — перенос)'; ta.style.cssText='width:100%;font:inherit;background:var(--bg);color:var(--ink);border:1px solid var(--rule);border-radius:.3rem;padding:.3rem';
+    const bt=document.createElement('button'); bt.id='secsend'; bt.textContent='секретарю'; bt.style.cssText='font:inherit;background:var(--bg);color:var(--ink);border:1px solid var(--acc);border-radius:.3rem;padding:.2rem .6rem;cursor:pointer;margin:.3rem .5rem 0 0';
+    const tok=document.createElement('input'); tok.id='sectok'; tok.type='password'; tok.placeholder='токен кресла'; tok.value=secTok();
+    tok.title='Токен кресла секретаря: постоянный, свой у каждого проекта (~/.cache/choir/rt-windows/sec-token.<проект>; печатается в терминале при старте). Ввести один раз — переживает перезапуск окна. Нужен, потому что кресло работает с полными правами Автора, а окно доступно голосам из клетки по 127.0.0.1. Хранится в этом браузере.';
+    tok.addEventListener('input',function(){try{localStorage.setItem(secKey(),tok.value.trim())}catch(_){}});   // сразу, не по уходу из поля (ревизия)
+    // «сменить токен» (наказ Автора 2026-10-08): новый случайный, прежний перестаёт
+    // действовать во всех окнах; новый сразу кладётся в этот браузер
+    const rot=document.createElement('button'); rot.type='button'; rot.textContent='сменить токен'; rot.style.cssText='font:inherit;font-size:.85em;background:var(--bg);color:var(--ink);border:1px solid var(--rule);border-radius:.3rem;padding:.1rem .5rem;cursor:pointer;margin:.3rem .5rem 0 0';
+    rot.title='Новый случайный токен кресла ЭТОГО ПРОЕКТА (у каждого проекта свой). Прежний перестаёт действовать во всех окнах этого проекта; окна других проектов не затрагиваются. Новый сам попадёт во вкладки этого окна. Нужен действующий токен.';
+    rot.onclick=async function(){const tv=(tok.value||'').trim()||secTok(); const stx=secbox.querySelector('#secstate');
+      if(!tv){if(stx)stx.textContent=' сначала введите действующий токен'; tok.focus(); return}
+      if(!confirm('Сменить токен кресла этого проекта? Прежний перестанет действовать в окнах этого проекта.'))return;
+      rot.disabled=true; let r,jj={};
+      try{r=await fetch('/secretary/token',{method:'POST',headers:{'Content-Type':'application/json','X-RT-Token':tv},body:'{}'}); jj=await r.json()}catch(e){if(stx)stx.textContent=' сервер не ответил'; rot.disabled=false; return}
+      rot.disabled=false;
+      if(!r.ok||!jj.token){if(stx)stx.textContent=' '+((jj&&jj.error)||('ошибка '+r.status)); return}
+      tok.value=jj.token; try{localStorage.setItem(secKey(),jj.token)}catch(_){}
+      if(stx)stx.textContent=' токен проекта сменён: новый сохранён для этого окна'};
+    // 3: вкладка того же окна сменила токен — поле здесь обновляется само,
+    // иначе проверка шла бы по новому из браузера, а отправка — по старому из поля
+    window.addEventListener('storage',function(e){if(e.key===secKey()&&typeof e.newValue==='string'&&document.activeElement!==tok)tok.value=e.newValue});
+    const st=document.createElement('span'); st.className='m'; st.id='secstate';
+    // ВЕНДОР СЕКРЕТАРЯ (решение Автора 2026-10-08): список из GET /secretary
+    // (agents: кто умеет, чем пойдёт — модель/усилие вкладки «комната»);
+    // смена агента = новая нить с передачей роли (хвост диалога из ленты)
+    const ag=document.createElement('select'); ag.id='secagent'; ag.style.cssText='font:inherit;background:var(--bg);color:var(--ink);border:1px solid var(--rule);border-radius:.3rem;margin:.3rem .5rem 0 0';
+    ag.title='Кто сидит в кресле секретаря. Модель и усилие — те, что выбраны для этого голоса во вкладке «комната» (💬). Смена вендора начинает новую нить: новому секретарю уходит преамбула роли и последние реплики диалога из ленты (передача роли). gemini кресла не имеет — файлов не видит, команд не выполняет.';
+    // выбор Автора в ЭТОМ окне сильнее нити; без выбора — агент нити (другое
+    // окно могло сменить его), localStorage — лишь когда нити ещё нет (ревизия)
+    ag.addEventListener('change',function(){window.SEC_AGENT_USER=ag.value; try{localStorage.setItem('rtSecAgent',ag.value)}catch(_){}});
+    async function sendSec(){const text=ta.value.trim(); if(!text)return; const tv=(tok.value||'').trim()||secTok(); if(!tv){st.textContent=' введите токен кресла (терминал окна)'; tok.focus(); return}
+      bt.disabled=true; st.textContent=' отправляю…';
+      const sentA=(typeof ANCHOR!=='undefined')?ANCHOR:null;      // «продолжить отсюда» → секретарю
+      const agent=ag.value||'claude';
+      let r,jj={}; try{r=await fetch('/secretary',{method:'POST',headers:{'Content-Type':'application/json','X-RT-Token':tv},body:JSON.stringify({text:text,anchor:sentA?sentA.addr:'',agent:agent})}); jj=await r.json()}catch(e){st.textContent=' сервер не ответил'; bt.disabled=false; return}
+      if(!r.ok){st.textContent=' '+((jj&&jj.error)||('ошибка '+r.status)); bt.disabled=false; return}
+      try{if(typeof anchorSent==='function')anchorSent(sentA)}catch(_){}
+      ta.value=''; window.SEC_DRAFT=''; st.textContent=' секретарь ('+agent+') отвечает (акт '+jj.act+')…'; noteAct(jj.act,'секретарь: ['+agent+'] '+text.slice(0,60)+(sentA?' [от '+sentA.addr+']':''),{running:true}); SEC_AT=0; TERM.id=null; startTerm(jj.act)}
+    bt.onclick=sendSec;
+    ta.addEventListener('keydown',function(e){if(e.key==='Enter'&&!e.shiftKey&&!e.altKey){e.preventDefault();sendSec()}});
+    ta.addEventListener('input',function(){window.SEC_DRAFT=ta.value});
+    try{if(window.SEC_DRAFT)ta.value=window.SEC_DRAFT}catch(_){}
+    // СТРОКА ДЛЯ ТЕРМИНАЛА (решение Автора 2026-10-11: «команда, а не запуск»):
+    // продолжить нить секретаря в своём терминале; окно ничего не запускает
+    const rbox=document.createElement('div'); rbox.id='secresume'; rbox.style.cssText='margin:.4rem 0 0;font-size:.85em';
+    const rlab=document.createElement('span'); rlab.className='m'; rlab.textContent='в терминале: ';
+    const rin=document.createElement('input'); rin.id='secresumecmd'; rin.readOnly=true; rin.style.cssText='width:60%;font:inherit;background:var(--bg);color:var(--ink);border:1px solid var(--rule);border-radius:.3rem;padding:.1rem .3rem';
+    rin.title='Команда продолжает ту же нить секретаря в вашем терминале, в папке проекта. Окно её только показывает. Агент в терминале сам кладёт каждый обмен в ленту (secretary.py dialogue), и разговор виден здесь.';
+    const rcp=document.createElement('button'); rcp.type='button'; rcp.textContent='⎘ скопировать'; rcp.style.cssText='font:inherit;margin-left:.4rem;cursor:pointer;background:var(--bg);color:var(--ink);border:1px solid var(--rule);border-radius:.3rem;padding:0 .4rem';
+    const rnote=document.createElement('span'); rnote.className='m'; rnote.id='secresumenote';
+    rcp.onclick=async function(){const v=rin.value; if(!v)return; let ok=false; try{await navigator.clipboard.writeText(v);ok=true}catch(_){try{rin.select();ok=!!document.execCommand('copy')}catch(__){ok=false}} rnote.textContent=ok?' скопировано':' выделите строку и Ctrl+C'; rnote.dataset.copied='1'; setTimeout(function(){delete rnote.dataset.copied},10000)};
+    rbox.appendChild(rlab); rbox.appendChild(rin); rbox.appendChild(rcp); rbox.appendChild(rnote);
+    secbox.appendChild(ta); secbox.appendChild(ag); secbox.appendChild(bt); secbox.appendChild(tok); secbox.appendChild(rot); secbox.appendChild(st); secbox.appendChild(rbox);
+  })();
+  // список агентов: перестраивается только при изменении состава/подписей,
+  // выбор — из localStorage, иначе текущий агент нити, иначе claude
+  let SEC_AGENTS_KEY='';
+  function fillSecAgents(j){const ag=document.getElementById('secagent'); if(!ag||!Array.isArray(j.agents))return;
+    const key=JSON.stringify([j.agent,window.SEC_AGENT_USER||'',j.agents.map(function(a){return [a.name,a.can,a.model,a.effort]})]);
+    if(key===SEC_AGENTS_KEY&&ag.options.length)return; SEC_AGENTS_KEY=key;
+    let want=window.SEC_AGENT_USER||j.agent||''; if(!want){try{want=localStorage.getItem('rtSecAgent')||''}catch(_){}} if(!want)want='claude';
+    ag.innerHTML='';
+    j.agents.forEach(function(a){const o=document.createElement('option'); o.value=a.name;
+      o.textContent=a.name+(a.can?(a.model||a.effort?' · '+(a.model||'модель CLI')+(a.effort?'/'+a.effort:''):''):' — нет кресла');
+      o.disabled=!a.can; o.title=a.can?('модель и усилие — из вкладки «комната»'+(a.name===j.agent?'; текущая нить проекта':'')):(a.why||'кресла нет');
+      ag.appendChild(o)});
+    const okv=j.agents.some(function(a){return a.name===want&&a.can}); ag.value=okv?want:'claude';
+    if(ag.dataset.title0===undefined)ag.dataset.title0=ag.title;
+    ag.title=(j.agent&&j.agent!==ag.value)?('Кто сидит в кресле секретаря. Нить проекта сейчас у «'+j.agent+'»: выбор другого — ПЕРЕДАЧА РОЛИ (новая нить с хвостом диалога).'):ag.dataset.title0}
+  // вкладка секретаря: рендер из GET /secretary; обновляется по таймеру и
+  // при событиях decision/queue/report в ленте (см. add ниже)
+  let SEC_AT=0, SEC_GEN=0, SEC_T=null;
+  // один запрос в полёте и поколение ответа: залп событий при реконнекте
+  // SSE не плодит параллельных /secretary, поздний ответ не затирает новый
+  function pokeSec(){clearTimeout(SEC_T); SEC_T=setTimeout(function(){SEC_AT=0; loadSec(true)},300)}
+  async function loadSec(force){if(VIEW!=='sec')return; if(!force&&Date.now()-SEC_AT<15000)return; SEC_AT=Date.now();
+    const gen=++SEC_GEN;
+    let j=null; try{const fv=((document.getElementById('sectok')||{}).value||'').trim()||secTok(); const r=await fetch('/secretary?n=50',{headers:fv?{'X-RT-Token':fv}:{}}); j=await r.json(); if(gen!==SEC_GEN)return; if(!r.ok){secwrap.textContent=(j&&j.error)||('ошибка '+r.status);return}}
+    catch(e){if(gen!==SEC_GEN)return; secwrap.textContent='сервер не ответил';return}
+    if(VIEW!=='sec')return;
+    // ящик чата (secbox) из DOM не вынимается — иначе падал бы фокус и
+    // каретка при каждом обновлении (ревизия); перерисовывается остальное
+    try{fillSecAgents(j)}catch(_){}
+    try{const rv=j.resume||{}; const ri=document.getElementById('secresumecmd'), rn=document.getElementById('secresumenote');
+      const rt=rv.error?(' '+rv.error):(rv.note?(' '+rv.note):(rv.agent?(' нить '+rv.agent+(rv.session?' '+rv.session:'')):''));
+      if(ri&&document.activeElement!==ri){const ch=ri.value!==(rv.cmd||''); ri.value=rv.cmd||''; if(rn&&(ch||!rn.dataset.copied))rn.textContent=rt; if(ch&&rn)delete rn.dataset.copied}}catch(_){}
+    try{const tf=document.getElementById('sectok'); if(tf&&!tf.value&&document.activeElement!==tf)tf.value=secTok()}catch(_){}   // ключ проекта пришёл с /state позже построения ящика
+    const keep=secbox.parentNode===secwrap;
+    Array.from(secwrap.childNodes).forEach(function(n){if(n!==secbox)secwrap.removeChild(n)});
+    function h(t){const x=document.createElement('h4'); x.textContent=t; return x}
+    function row(cls,meta,text){const d=document.createElement('div'); d.className='row'+(cls?' '+cls:''); const m=document.createElement('span'); m.className='m'; m.textContent=meta+' '; d.appendChild(m); d.appendChild(document.createTextNode(text||'')); return d}
+    // длинный текст (ответ секретаря, отчёт) — свёрнут до первой строки,
+    // кнопка разворачивает (наказ Автора 2026-10-08: «выпадающие по
+    // кнопочке»); реплики Автора — целиком
+    // раскрытые строки помнятся по ключу: вкладка перестраивается по
+    // таймеру и на каждое событие, и без памяти текст схлопывался бы под
+    // рукой читателя (ревизия); тело — последним элементом (d._body),
+    // чтобы пометки « · права полные», «⚓» и кнопка якоря шли в строку меты
+    const SEC_OPEN=window.SEC_OPEN||(window.SEC_OPEN=new Set());
+    function foldRow(cls,meta,text,key){text=text||''; const lines=text.split('\n'); const long=text.length>280||lines.length>3;
+      if(!long)return row(cls,meta,text);
+      const first=(lines.find(function(l){return l.trim()})||'').trim(); const head=first.slice(0,200)+(first.length>200?'…':'');
+      const d=row(cls,meta,''); const body=document.createElement('div'); body.style.whiteSpace='pre-wrap';
+      const b=document.createElement('button'); b.type='button'; b.style.cssText='font:inherit;font-size:.8em;margin-left:.5rem;cursor:pointer;background:var(--bg);color:var(--ink);border:1px solid var(--rule);border-radius:.3rem;padding:0 .4rem';
+      function paint(){const open=!!(key&&SEC_OPEN.has(key)); body.textContent=open?text:head; b.textContent=open?'свернуть':('развернуть ('+text.length+' симв.)')}
+      b.onclick=function(){if(!key)return; if(SEC_OPEN.has(key))SEC_OPEN.delete(key); else SEC_OPEN.add(key); paint()};
+      paint(); d.appendChild(b); d.appendChild(body); d._body=body; return d}
+    // ЧАТ С СЕКРЕТАРЁМ (решение Автора 2026-10-08): реплика → акт
+    // secretary_turn.py, поток работы — в стенограмме акта ниже (termwrap),
+    // итог — событием sec; диалог — события sec проекта. Ящик ввода
+    // строится один раз (secbox) и не пересобирается — иначе каждый
+    // перерисовка роняла бы фокус и возвращала отправленный черновик (ревизия)
+    const headEl=h('Секретарь'); secwrap.insertBefore(headEl, keep?secbox:null);
+    const dlg=document.createElement('div'); dlg.id='secdlg';
+    (j.dialogue||[]).forEach(function(e){const tv=tsView(e.ts); const who=e.author==='arr'?'Автор':'секретарь'+(e.agent?' ('+e.agent+(e.model?' · '+e.model:'')+')':'');
+      // реплики Автора и отказы — целиком (причина отказа в свёртке пряталась бы); ответы — свёрнуты
+      const whole=e.author==='arr'||e.status==='error';
+      // «задним числом»: время события — момент записи, не разговора (ревизия: grok)
+      const src=(e.channel==='terminal'?' · из терминала':'')+(e.late?' · задним числом':'');
+      const d=whole?row(e.author==='arr'?'me':'', '#'+e.id+' · '+tv.short+' · '+who+src+(e.status==='error'?' · ОТКАЗ':''), (e.text||'')+(e.detail?'\n— '+e.detail:''))
+        :foldRow('', '#'+e.id+' · '+tv.short+' · '+who+src, e.text||'', 'sec:'+e.id);
+      if(e.rights==='full'){const k=document.createElement('span'); k.className='m'; k.title='кресло секретаря вне клетки, с правами Автора (SECRETARY.md)'; k.textContent=' · права полные'; d.appendChild(k)}
+      if(e.anchor&&e.anchor.addr){const k=document.createElement('span'); k.className='m'; k.textContent=' · ⚓ от '+e.anchor.addr; d.appendChild(k)}
+      if(anchorable(e)){try{d.appendChild(anchorButton('live:'+e.id,anchorAuthor(e),anchorText(e).length,'sectext'))}catch(_){}}
+      if(d._body)d.appendChild(d._body);     // тело — последним, пометки в строке меты
+      dlg.appendChild(d)});
+    secwrap.insertBefore(dlg, keep?secbox:null);
+    if(!keep)secwrap.appendChild(secbox);
+    const bt=secbox.querySelector('#secsend'), st=secbox.querySelector('#secstate');
+    const running=(j.running&&j.running.length)?j.running[0]:null;
+    st.textContent=running?(' секретарь отвечает (акт '+running+')…'):(j.token_ok===false&&secTok()?' токен не принят окном':'');
+    bt.disabled=!!running;
+    // идущий ход показываем в стенограмме, только если Автор сам ничего не выбрал
+    if(running&&!TERM.id){noteAct(running,'секретарь: …',{running:true}); startTerm(running)}
+    secwrap.appendChild(h('Решения Автора'));
+    const dec=(j.decisions||[]).slice().reverse();
+    if(!dec.length)secwrap.appendChild(row('','','(решений в ленте нет — записываются командой secretary.py decision)'));
+    dec.forEach(function(e){const tv=tsView(e.ts); secwrap.appendChild(row('','#'+e.id+' · '+tv.short+' · '+(e.author||'?')+(e.recorded_by?' (записал '+e.recorded_by+')':'')+(e.about?' · '+e.about:''),e.text))});
+    secwrap.appendChild(h('Очередь работ'));
+    const qa=(j.queue_all||[]).slice().reverse();
+    if(!qa.length)secwrap.appendChild(row('','','(очередь пуста)'));
+    qa.forEach(function(i){const d=row(i.status==='done'?'done':i.status==='dropped'?'dropped':'', '['+i.item+']', i.text+(i.note?' — '+i.note:'')); const s=document.createElement('span'); s.className='st'; s.textContent=i.status+' '; d.insertBefore(s,d.firstChild); secwrap.appendChild(d)});
+    // НАКОПИТЕЛЬ ДОПОЛНЕНИЙ (решение Автора 2026-10-08: «своя идея — что, по-твоему,
+    // остальные пропустили; они все теряются»): Jev — ценность 0–4 и «дошло ли до
+    // свода»; потерянные ценные сверху; в работу — только кнопкой «в очередь»
+    const iv=j.ideas||{items:[],fresh:[]};
+    secwrap.appendChild(h('Дополнения голосов'+(iv.total?(' — всего '+iv.total+', ценных и не попавших в свод '+(iv.lost||0)+', стоящих '+(iv.worthy||0)+', взято '+(iv.taken||0)):'')));
+    if(iv.error)secwrap.appendChild(row('','','(накопитель не собрался: '+iv.error+')'));
+    function ideaRow(it){const d=document.createElement('div'); d.className='row';
+      const sv=(it.value!=null?it.value:it.score); const n=document.createElement(it.worthy?'b':'span'); n.textContent='['+(sv==null?'?':Number(sv).toFixed(1))+'] '; d.appendChild(n);
+      if(it.lost){const l=document.createElement('b'); l.textContent='⟂ не в своде '; d.appendChild(l)}
+      const m=document.createElement('span'); m.className='m'; m.textContent=(it.voice||'?')+' · раунд «'+(it.round||'')+'»'+(it.stale?' · сверено с прежним сводом':'')+(it.partial?' · оценка неполная':'')+' · '; d.appendChild(m);
+      d.appendChild(document.createTextNode(it.text||''));
+      const b=document.createElement('button'); b.type='button'; b.textContent='в очередь'; b.title='Перенести дополнение в очередь работ. Само оно никуда не идёт — только этой кнопкой.';
+      b.style.cssText='font:inherit;font-size:.8em;margin-left:.5rem;cursor:pointer;background:var(--bg);color:var(--ink);border:1px solid var(--rule);border-radius:.3rem;padding:0 .4rem';
+      b.onclick=async function(){const tv=((document.getElementById('sectok')||{}).value||'').trim()||secTok(); b.disabled=true;
+        let r,jj={}; try{r=await fetch('/secretary/idea',{method:'POST',headers:{'Content-Type':'application/json','X-RT-Token':tv},body:JSON.stringify({id:it.id})}); jj=await r.json()}catch(e){b.disabled=false; b.textContent='сервер не ответил'; return}
+        if(r.ok){b.textContent='в очереди: пункт '+jj.item; SEC_AT=0; pokeSec()} else {b.disabled=false; b.textContent=(jj&&jj.error)||('ошибка '+r.status)}};
+      d.appendChild(b); return d}
+    if(!(iv.items||[]).length&&!(iv.fresh||[]).length)secwrap.appendChild(row('','','(оценённых дополнений нет — оценка Jev идёт после удачного свода; прошлые раунды: python3 chamber/ideas.py backfill)'));
+    (iv.items||[]).forEach(function(it){secwrap.appendChild(ideaRow(it))});
+    if((iv.fresh||[]).length){const fh=document.createElement('div'); fh.className='dim'; fh.textContent='свежие (последние раунды, любой ступени):'; secwrap.appendChild(fh);
+      iv.fresh.forEach(function(it){secwrap.appendChild(ideaRow(it))})}
+    secwrap.appendChild(h('Отчёты'));
+    const rep=(j.reports||[]).slice().reverse();
+    if(!rep.length)secwrap.appendChild(row('','','(отчётов нет)'));
+    rep.forEach(function(e){const tv=tsView(e.ts); secwrap.appendChild(foldRow('','#'+e.id+' · '+tv.short+' · '+(e.author||'?')+(e.about?' · '+e.about:''),e.text,'rep:'+e.id))});
+  }
+  const wrap=document.createElement('div'); wrap.id='termwrap'; wrap.hidden=true;
+  const head=document.createElement('div'); head.id='termhead';
+  const sel=document.createElement('select'); sel.id='termact'; sel.title='Какой акт показывать: идущие — первыми, потом завершённые (лог акта переживает окно)';
+  const pulse=document.createElement('span'); pulse.id='termpulse';
+  const fl=document.createElement('label'); const fc=document.createElement('input'); fc.type='checkbox'; fc.id='termfollow'; fc.checked=true;
+  fl.title='Следить за новым выводом (как терминал): отмотали вверх — слежение само выключается, вернулись к последней строке — включается. End — к концу, Home — к началу.'; fl.appendChild(fc); fl.appendChild(document.createTextNode(' следить'));
+  // идентификатор — текстом, который выделяется и копируется (из списка
+  // выпадашки скопировать нельзя — Автор, 2026-09-06)
+  const idbox=document.createElement('input'); idbox.id='termid'; idbox.readOnly=true;
+  idbox.title='Идентификатор: у кресла — номер правки (его ждёт поле «акт» на вкладке 🔧), у остальных — номер акта. Выделяется; кнопка ⎘ копирует.';
+  const cp=document.createElement('button'); cp.id='termcopy'; cp.textContent='⎘'; cp.title='Скопировать идентификатор';
+  cp.onclick=async function(){const v=idbox.value; if(!v)return; let ok=false;
+    try{await navigator.clipboard.writeText(v);ok=true}catch(_){try{idbox.select();ok=!!document.execCommand('copy')}catch(__){ok=false}}
+    pulse.textContent=ok?('скопировано: '+v):'скопировать не вышло — выделите поле и Ctrl+C'};
+  const what=document.createElement('span'); what.id='termwhat'; what.className='meta';
+  head.appendChild(sel); head.appendChild(idbox); head.appendChild(cp); head.appendChild(pulse); head.appendChild(fl); head.appendChild(what);
+  const pre=document.createElement('pre'); pre.id='term'; pre.tabIndex=0; if(!tc.checked)pre.className='nothink';
+  const newer=document.createElement('button'); newer.id='termnew'; newer.hidden=true; newer.title='Новые строки ниже — перейти к ним';
+  const box=document.createElement('div'); box.id='termbox'; box.appendChild(pre); box.appendChild(newer);
+  const pend=document.createElement('span'); pend.id='termpend'; pend.title='Закрытые акты кресла, ждущие вашего решения: принять или снять. Клик — список'; pend.style.cursor='pointer'; head.appendChild(pend);
+  const pendlist=document.createElement('div'); pendlist.id='termpendlist'; pendlist.hidden=true; pendlist.style.cssText='margin:4px 0 6px;padding:6px 10px;border:1px solid #666;border-radius:6px;font-size:12px;line-height:1.5';
+  pend.onclick=function(){pendlist.hidden=!pendlist.hidden; fillPend()};
+  function fillPend(){const rows=(window.STATE||{}).pending_acts; pendlist.textContent='';
+    if(!Array.isArray(rows)){pendlist.textContent='список не собрался — см. stderr окна'; return}
+    if(!rows.length){pendlist.textContent='никто не ждёт'; return}
+    const isDead=function(r){return r.empty===true||r.stage==='crashed'}; const live=rows.filter(function(r){return !isDead(r)}), dead=rows.filter(isDead);
+    function row(r){const d=document.createElement('div'); d.style.cursor='pointer';
+      const tally=(r.approvals&&r.approvals.length?'за: '+r.approvals.join(', '):'')+(r.refused&&r.refused.length?(r.approvals&&r.approvals.length?' · ':'')+'против: '+r.refused.join(', '):'');
+      const state=r.stage==='lost'?'ветка потеряна':(r.empty===true||r.stage==='crashed')?'правок нет (упал или ничего не изменил)':(tally||'ревизии нет');
+      d.textContent=(r.ts||'').slice(0,10)+'  '+(r.voice||'?')+'  '+(r.act||'').slice(0,12)+'  '+(r.task||'')+'  — '+state;
+      d.title='открыть акт'; d.onclick=function(){try{const k=Object.keys(SEEN).find(function(k){return SEEN[k].edit===r.act&&SEEN[k].kind==='chair'}); if(k){sel.value=k; startTerm(k)} else {d.title='действие этого акта в окне не найдено (старое окно?)'}}catch(e){}}; return d}
+    if(live.length){const h=document.createElement('div'); h.style.cssText='color:#888;margin-bottom:4px'; h.textContent='Ждут приёмки (клик по строке открывает акт и кнопки гейта):'; pendlist.appendChild(h); live.forEach(function(r){pendlist.appendChild(row(r))})}
+    if(dead.length){const h2=document.createElement('div'); h2.style.cssText='color:#888;margin:6px 0 4px'; h2.textContent='Упали без правок (принимать нечего: продолжить или снять):'; pendlist.appendChild(h2); dead.forEach(function(r){pendlist.appendChild(row(r))})}}
+  // КАРТОЧКА АКТА ПРАВКИ (наказ Автора 2026-09-10: «на вкладке исполнитель
+  // ожидаю увидеть дифы прямо в окне, выбрав акт, и рядом кнопку
+  // принять — ровно тот блок, что во вкладке coder»): стадия, кворум,
+  // кнопки гейта по стадии, вердикты ревьюеров с полными текстами, диф.
+  const gate=document.createElement('div'); gate.id='gatecard'; gate.hidden=true;
+  wrap.appendChild(head);
+  // список приёмки — под шапкой, в DOM после неё (ревизия 06.10: раньше
+  // вставка шла до появления родителя и валила всю вкладку)
+  wrap.appendChild(pendlist); wrap.appendChild(box); wrap.appendChild(gate);
+  const GATE={edit:'',timer:null,open:{},draft:{}};
+  function el(tag,cls,text){const e=document.createElement(tag); if(cls)e.className=cls; if(text!==undefined)e.textContent=text; return e}
+  function gateBtn(row,label,fn){const b=el('button','',label); b.onclick=fn; row.appendChild(b); return b}
+  function renderGate(v){const sig=JSON.stringify(v); if(gate.dataset.sig===sig)return; gate.dataset.sig=sig; // не срывать клик и прокрутку дифа перестройкой (ревьюер)
+    gate.innerHTML='';
+    const isRev=SEEN[TERM.id]&&SEEN[TERM.id].kind==='review';
+    const h=el('h4','',(isRev?'ревизия правки ':'правка ')+v.act+' ['+(v.voice||'?')+(v.seat&&v.seat!==v.voice?'/'+v.seat:'')+'] · '+({opening:'открыт',working:'в работе',closed:'закрыт',crashed:'вылет',adopted:'adopt',dropped:'отброшен',merged:'принят',lost:'ветка потеряна'}[v.stage]||v.stage||'?'));
+    gate.appendChild(h);
+    if(v.task)gate.appendChild(el('div','dim','задание: '+String(v.task).slice(0,300)));
+    if(v.close)gate.appendChild(el('div',v.close.status==='done'?'':'no','закрытие: '+(v.close.text||'')+(v.close.autocommit?' · коммит сделала обёртка':'')+(v.close.excluded&&v.close.excluded.length?' · вне коммита: '+v.close.excluded.join(', '):'')));
+    if(v.crash)gate.appendChild(el('div','no','вылет: '+(v.crash.text||'')));
+    if(v.merge)gate.appendChild(el('div','ok','принят: '+(v.merge.result_sha||'').slice(0,12)));
+    if(v.checks&&v.checks.canary)gate.appendChild(el('div',v.checks.canary.status==='clean'?'ok':'no','🐤 '+(v.checks.canary.text||'')));
+    if(v.checks&&v.checks.jail)gate.appendChild(el('div',v.checks.jail==='none'?'no':'dim','🔒 клетка кресла: '+({bwrap:'bwrap — корень ro, запись только в worktree и ветку акта',own:'своя песочница CLI (writable_roots)',none:'НЕТ — запись была возможна во весь диск'}[v.checks.jail]||v.checks.jail)+(v.close&&v.close.jail_sha?' · jail_sha '+v.close.jail_sha:'')));
+    if(v.checks&&v.checks.canary_review_broken&&v.checks.canary_review_broken.length)v.checks.canary_review_broken.forEach(function(t){gate.appendChild(el('div','no','🐤 '+t))});
+    if(v.checks&&v.checks.reasons_soft&&v.checks.reasons_soft.length)v.checks.reasons_soft.forEach(function(t){if(!/канарейка/.test(t))gate.appendChild(el('div','no','⚠ '+t))});
+    const c=v.checks||{}; const ap=(c.approvals||[]).length, q=c.quorum||2, ref=(c.refused||[]).length;
+    const st=el('div',c.ok?'ok':'', 'гейт: '+(c.ok?'открыт — можно принимать':'закрыт')+' · одобрений '+ap+'/'+q+(ref?' · ОТКАЗ: '+c.refused.join(', '):'')+(c.stale_base?' · main уехал, нужен rebase':''));
+    gate.appendChild(st);
+    if(c.reasons&&c.reasons.length&&!c.ok)gate.appendChild(el('div','dim',c.reasons.join('; ')));
+    const row=el('div','row'); const a=v.act;
+    // те же условия, что у панели coder: гейт при merge сам делает rebase,
+    // поэтому «Принять» — по кворуму и отсутствию отказов, не по c.ok
+    if(v.stage==='closed'||v.stage==='adopted'){
+      if(!ref&&ap<q){const rb=gateBtn(row,c.stale_base?'Rebase + ревизия':'Ревизия',function(){if(!confirm('Ревизия акта '+a+': платный веер всем, кроме исполнителя.'+(c.stale_base?' main уехал — гейт сперва перенесёт ветку на него (rebase), потом разошлёт новую голову.':'')+' Пускаем?'))return;
+        gatePost('/edit_review',{act:a},function(){return 'ревизия '+a+' запущена — вердикты придут в ленту'})});
+        rb.title=(c.stale_base?'main уехал с момента открытия акта: гейт сперва перенесёт ветку акта на текущий main (git rebase; конфликт — честный отказ и заметка в ленте), затем ':'')+'разошлёт диф ветки всем голосам, кроме исполнителя (платный веер). Каждый ответ — событие edit_review в ленте с вердиктом первой строкой, по закрытии веера — итог со счётом. Кворум '+q+' одобрения и ни одного отказа на текущей голове открывают «Принять в main».'}
+      if(ap>=q&&!ref){const mb=gateBtn(row,'Принять в main',function(){if(!confirm('Принять акт '+a+' в main? Кворум '+ap+'/'+q+(c.stale_base?'; main уехал — гейт сделает rebase; если патч акта не изменился, вердикты остаются в силе, иначе понадобится ревизия дельты':'')+'. Ветка сольётся, main сдвинется.'))return;
+        gatePost('/edit_merge',{act:a},function(j){return 'принято: '+(j.result_sha||'').slice(0,12)})});
+        mb.title='Перенести ветку акта в main (fast-forward под замком гейта): кворум набран, отказов на этой голове нет. Если main уехал — гейт сперва сделает rebase; патч не изменился — вердикты в силе и приёмка идёт сразу, изменился — понадобится ревизия дельты. После приёмки перезапустите окно, чтобы код из ветки заработал.'}}
+    if(v.stage==='crashed'){const ab=gateBtn(row,'Adopt',function(){if(!confirm('Adopt акта '+a+': рассмотреть вылетевшую работу из карантина?'))return;
+      gatePost('/edit_adopt',{act:a},function(){return 'adopt: '+a})});
+      ab.title='Акт вылетел (исполнитель умер, не закрыв аренду). Adopt — ваше явное решение рассмотреть работу из карантина: событие edit_adopt снимает условие закрытой аренды, дальше ревизия и приёмка как обычно.'}
+    gateBtn(row,'⟳',function(){loadGate(true)}).title='Обновить карточку сейчас (сама она обновляется раз в 6 с, пока акт не принят)';
+    gate.appendChild(row);
+    // ПРОДОЛЖИТЬ (наказ Автора 2026-09-14: «продолжить — семантически,
+    // чтобы продолжала текущую ветвь обсуждений»): тот же исполнитель,
+    // та же ветка, в задании — прежнее задание, замечания ревизии и
+    // эти слова. ОТБРОСИТЬ — ветка удаляется, история остаётся.
+    if(v.stage==='closed'||v.stage==='adopted'||v.stage==='crashed'||v.stage==='lost'){
+      const cw=el('div','controw'); const cr=el('div','row');
+      if(v.stage!=='lost'){   // ветки нет — продолжать нечего (ревьюеры)
+        const ta=document.createElement('textarea'); ta.rows=2; ta.placeholder='продолжить: что доработать, что ответить на замечания, куда двигаться дальше — исполнителю уйдёт прежнее задание, замечания ревизии на этой голове и эти слова';
+        ta.value=GATE.draft[a]||''; ta.oninput=function(){GATE.draft[a]=ta.value}; cw.appendChild(ta);
+        const cb=gateBtn(cr,'Продолжить',function(){const t=(ta.value||'').trim(); if(!t){vnote&&vnote('продолжение пустое: скажите, что доработать');ta.focus();return}
+          if(!confirm('Продолжить правку '+a+' тем же исполнителем ['+(v.voice||'?')+'] на той же ветке?\n\nИсполнитель получит прежнее задание, замечания ревизии на этой голове дословно и ваш текст. Когда он закончит, стол проверит правку заново (счёт одобрений начнётся с нуля).'))return;
+          gatePost('/edit',{continue:a,text:t,thoughts:thoughtsOn()},function(j){GATE.draft[a]=''; return 'продолжение '+a+' ушло исполнителю ['+j.voice+'], эпоха '+j.epoch})});
+        cb.title='Тот же акт, та же ветка и рабочее дерево, тот же исполнитель (галочки пула не спрашиваются), новая эпоха аренды. Исполнитель получит прежнее задание, замечания ревизии на текущей голове дословно и ваш текст; ревьюерам прежние вердикты не показываются.'}
+      const db=gateBtn(cr,'Отбросить',function(){const why=prompt('Отбросить правку '+a+'? Ветка и рабочее дерево удаляются (коммиты остаются под refs/rt-dropped/act/'+a+'), в ленте — запись с головой ветки. Причина (в ленту):',''); if(why===null)return;
+        gatePost('/edit_drop',{act:a,why:why},function(j){return 'правка '+a+' отброшена'})});
+      db.title='Удалить ветку act/'+a+' и рабочее дерево; коммиты остаются под страховочным ref refs/rt-dropped/act/'+a+'. История акта (интент, закрытие, ревизии) остаётся в ленте, плюс запись edit_drop.';
+      cw.appendChild(cr); gate.appendChild(cw)}
+    if(v.reviews&&v.reviews.length){const rv=el('div','','ревизии:'); gate.appendChild(rv);
+      v.reviews.forEach(function(r){const k='r'+r.ts+'|'+r.voice; const d=document.createElement('details'); d.open=!!GATE.open[k];
+        d.ontoggle=function(){GATE.open[k]=d.open};
+        const sm=document.createElement('summary'); sm.textContent=(r.voice||'?')+': '+(r.verdict||'?')+' ('+(r.status||'?')+(r.elapsed_s?', '+r.elapsed_s+' с':'')+')'+(v.head&&r.sha&&r.sha!==v.head?' · на прежней голове':'')+(r.jail==='none'?' · БЕЗ клетки':r.jail==='bwrap'?' · 🔒':'');
+        sm.className=r.verdict==='approve'?'ok':r.verdict==='refuted'?'no':'dim'; d.appendChild(sm);
+        d.appendChild(el('pre','',r.full_text||r.text||'(текста нет)')); rv.appendChild(d)})}
+    const dd=document.createElement('details'); dd.open=!!GATE.open.diff; dd.ontoggle=function(){GATE.open.diff=dd.open};
+    const ds=document.createElement('summary'); ds.textContent='диф ветки'+(v.head?' '+String(v.head).slice(0,12):'')+(v.diff_truncated?' (обрезан)':'')+(v.diff_error?' — '+v.diff_error:''); dd.appendChild(ds);
+    dd.appendChild(el('pre','',v.diff||'(диф пуст)')); gate.appendChild(dd)}
+  async function loadGate(force){clearTimeout(GATE.timer); const e=GATE.edit; if(!e||gate.hidden)return;
+    if(document.hidden){GATE.timer=setTimeout(function(){loadGate(false)},3000);return}
+    let done=false;
+    try{const r=await fetch('/act_view?act='+encodeURIComponent(e)); const j=await r.json();
+      if(GATE.edit!==e)return; if(!r.ok){gate.dataset.sig='';gate.textContent=(j&&j.error)||('ошибка '+r.status)} else {renderGate(j); done=(j.stage==='merged'||j.stage==='lost'||j.stage==='dropped')}}
+    catch(_){gate.dataset.sig='';gate.textContent='карточка акта: сервер не ответил'}
+    if(done)return;   // терминальная стадия: меняться нечему, кнопка ⟳ обновит вручную
+    GATE.timer=setTimeout(function(){loadGate(false)},force?2000:6000)}
+  function showGate(edit){GATE.edit=edit||''; clearTimeout(GATE.timer); gate.hidden=!edit; gate.innerHTML=''; gate.dataset.sig='';
+    if(edit){gate.textContent='…'; loadGate(true)}}
+  // СЛЕЖЕНИЕ КАК В ТЕРМИНАЛЕ (наказ Автора 2026-09-06): отмотал вверх —
+  // автопрокрутка выключена и не мешает читать; довёл до последней
+  // строки — включена снова. Новые строки при выключенном слежении
+  // считаются кнопкой «↓ новое: N строк».
+  let FOLLOW=true, PENDING=0;
+  function atBottom(){return pre.scrollTop+pre.clientHeight>=pre.scrollHeight-8}
+  function toBottom(){pre.scrollTop=pre.scrollHeight; FOLLOW=true; fc.checked=true; PENDING=0; newer.hidden=true}
+  pre.addEventListener('scroll',function(){if(atBottom()){if(!FOLLOW){FOLLOW=true;fc.checked=true} PENDING=0; newer.hidden=true}
+    else if(FOLLOW){FOLLOW=false;fc.checked=false}});
+  fc.onchange=function(){if(fc.checked)toBottom(); else FOLLOW=false};
+  newer.onclick=toBottom;
+  pre.addEventListener('keydown',function(e){if(e.key==='End'){e.preventDefault();toBottom()} else if(e.key==='Home'){e.preventDefault();pre.scrollTop=0}});
+  try{if(top.parentNode===feed&&feed.insertBefore)feed.insertBefore(wrap,top.nextSibling); else feed.appendChild(wrap)}catch(_){feed.appendChild(wrap)}
+  try{if(wrap.parentNode)wrap.parentNode.insertBefore(secwrap,wrap); else feed.appendChild(secwrap)}catch(_){feed.appendChild(secwrap)}
+  // акты: из ленты (act_status) и из /state.running
+  const SEEN={}; let VIEW='feed'; const TERM={id:null,edit:'',next:0,timer:null,lastByte:0,lastSize:0,quiet:0,gen:0,source:'',done:false,head:false,headFor:null};
+  function classify(label){label=label||'';
+    if(/^round:/.test(label))return 'round'; if(/^edit:/.test(label))return 'chair';
+    if(/^review:/.test(label))return 'review';
+    if(/^секретарь:/.test(label))return 'secretary';
+    if(/^быстрый:/.test(label))return 'quick'; return 'room'}
+  function noteAct(id,label,extra){if(!id)return; const o=SEEN[id]||(SEEN[id]={id:id,ts:Date.now()});
+    if(label&&!o.label){o.label=label;o.kind=classify(label)} if(extra&&extra.edit)o.edit=extra.edit;
+    if(extra&&extra.at&&!o.at)o.at=extra.at;   // время события (не момент, когда окно его увидело) — для списка
+    if(extra&&extra.status)o.status=extra.status; if(extra&&extra.running!==undefined)o.running=extra.running}
+  const add0=add;
+  add=function(ev){try{if(ev&&(ev.kind==='decision'||ev.kind==='queue'||ev.kind==='report'||ev.kind==='sec')&&VIEW==='sec'&&!(ev.id&&seen.has(ev.id)))pokeSec()}catch(_){}
+    try{if(ev&&ev.kind==='act_status'&&ev.act_id){
+      const m=/^act [0-9a-f]+ (?:принят|done|error|прерван|отвязан|abort)[^:]*: (.*)$/s.exec(ev.text||'');
+      noteAct(ev.act_id,m?m[1].split('\n')[0]:'',{edit:ev.edit,status:ev.status,running:ev.status==='accepted',at:ev.status==='accepted'?ev.ts:undefined})}}catch(_){}
+    return add0(ev)};
+  function syncRunning(){const r=(window.STATE&&window.STATE.running)||[]; const live={};
+    r.forEach(function(t){live[t.id]=1; noteAct(t.id,t.label,{edit:t.edit,running:true})});
+    Object.keys(SEEN).forEach(function(id){if(!live[id]&&SEEN[id].running&&window.STATE)SEEN[id].running=false})}
+  // Акты — у сервера, из ВСЕЙ ленты проекта: хвост SSE в 80 событий
+  // терял раунды, и вкладка «дирижёр» пустела (Автор, 2026-09-10)
+  let ACTS_AT=0;
+  async function loadActs(force){if(!force&&Date.now()-ACTS_AT<20000)return; ACTS_AT=Date.now();
+    try{const r=await fetch('/acts'); const j=await r.json(); (j.acts||[]).forEach(function(a){
+      const o=SEEN[a.id]||(SEEN[a.id]={id:a.id,ts:a.ts?Date.parse(a.ts)||Date.now():Date.now()});
+      if(a.ts&&!isNaN(Date.parse(a.ts))){o.at=a.ts; o.ts=Date.parse(a.ts)}   // время СТАРТА акта от сервера — сильнее момента, когда окно его увидело (ревизия)
+      if(a.label&&!o.label){o.label=a.label;o.kind=classify(a.label)} if(a.edit)o.edit=a.edit; if(a.status)o.status=a.status; o.running=!!a.running})}catch(_){}}
+  function actsFor(view){syncRunning(); const ks=KINDS[view]||[];
+    return Object.keys(SEEN).map(function(k){return SEEN[k]}).filter(function(a){return ks.indexOf(a.kind)>=0})
+      .sort(function(a,b){return (b.running?1:0)-(a.running?1:0)||b.ts-a.ts})}
+  // галочка «дата»: перерисовать диалог секретаря и список актов; список —
+  // только не на ленте (там fillActs с пустым набором стирал бы стенограмму)
+  window.applyTsFull=function(){try{pokeSec()}catch(_){} try{if(VIEW!=='feed')fillActs()}catch(_){} try{if(!wp.hidden)loadWindows()}catch(_){}};
+  function fillActs(){let acts=actsFor(VIEW); const cur=sel.value; sel.innerHTML='';
+    if(VIEW==='chair'){
+      // кресло и ревизии одной правки — одна группа: кресло первым, его
+      // ревизии с отступом под ним (Автор: «не плодить лишних записей,
+      // но и разделять»); карточка правки у них общая
+      const byEdit={}; const order=[];
+      acts.forEach(function(a){const k=a.edit||a.id; if(!byEdit[k]){byEdit[k]=[];order.push(k)} byEdit[k].push(a)});
+      acts=[]; order.forEach(function(k){const g=byEdit[k]; g.sort(function(x,y){return (x.kind==='chair'?0:1)-(y.kind==='chair'?0:1)||x.ts-y.ts});
+        g.forEach(function(a,i){a._sub=(i>0); acts.push(a)})})}
+    acts.forEach(function(a){const o=document.createElement('option'); o.value=a.id;
+      // время акта в списке (наказ Автора 2026-10-08): с датой по галочке «дата»
+      // время старта акта (событие «принят» или сводка сервера); без него —
+      // «~» и момент, когда окно впервые увидело акт — не выдаём за старт
+      const when=a.at?tsView(a.at).short:(a.ts?'~'+tsView(new Date(a.ts).toISOString()).short:'');
+      o.textContent=(a._sub?'   ↳ ':'')+(a.running?'● ':'■ ')+(when?when+' · ':'')+a.id+' · '+(a.label||'').slice(0,40); sel.appendChild(o)});
+    if(acts.length&&acts.some(function(a){return a.id===cur}))sel.value=cur;
+    const pick=sel.value||(acts[0]&&acts[0].id)||null;
+    if(!pick){if(TERM.id!==null||pre.textContent||!pulse.textContent)startTerm(null);return}
+    if(pick!==TERM.id)startTerm(pick)}
+  function startTerm(id){clearTimeout(TERM.timer); TERM.head=!!(id&&TERM.headFor===id); TERM.headDone=false; TERM.id=id; showGate(id&&SEEN[id]&&SEEN[id].edit&&SEEN[id].edit!=='batch'?SEEN[id].edit:''); TERM.edit=(SEEN[id]&&SEEN[id].edit)||''; TERM.next=0; TERM.lastByte=0; TERM.lastSize=0; TERM.quiet=0; TERM.gen++; TERM.source=''; TERM.done=false;
+    pre.textContent=''; what.textContent=''; inThink=false; afterHead=false; inVoice=false; PENDING=0; newer.hidden=true; FOLLOW=!TERM.head; fc.checked=FOLLOW;
+    idbox.value=id?(TERM.edit||id):''; idbox.title=(id?('акт '+id+(TERM.edit?' · правка '+TERM.edit:'')+'. '):'')+'Выделяется; кнопка ⎘ копирует.';
+    pulse.textContent=id?'…':(EMPTY[VIEW]||'актов этого рода пока нет');
+    if(id)tick()}
+  sel.onchange=function(){startTerm(sel.value)};
+  function line(cls,text){const s=document.createElement('span'); if(cls)s.className=cls; s.textContent=text+'\n'; return s}
+  let inThink=false;   // сбрасывается в startTerm: стиль мыслей не должен утекать в следующий акт
+  let afterHead=false, inVoice=false;   // стенограмма: после шапки идёт «$ команда»; внутри потока голоса ❯ — его вывод
+  let GROKRUN=null;   // текущая строка дельт grok (мысли или текст), см. render
+  // строка дельт grok жива, если она уже в #term ИЛИ в фрагменте ЭТОГО
+  // вызова render (isConnected у узла во фрагменте ложен — ревизия: в одной
+  // порции каждая дельта становилась отдельным куском без переводов строк)
+  function grokOpen(frag){return !!(GROKRUN&&(GROKRUN.el.isConnected||GROKRUN.frag===frag))}
+  function grokClose(frag){if(grokOpen(frag)&&!GROKRUN.el.textContent.endsWith('\n'))GROKRUN.el.textContent+='\n'; GROKRUN=null}
+  function render(text){const frag=document.createDocumentFragment();
+    text.split('\n').forEach(function(l,i,arr){if(i===arr.length-1&&l==='')return;
+      // любая строка, кроме дельты мысли/текста grok, закрывает текущую строку дельт
+      // (раньше ранние return шапок и итогов голоса оставляли её открытой)
+      if(GROKRUN&&!(l.startsWith('{"type":"thought"')||l.startsWith('{"type":"text"')))grokClose(frag);
+      // строки дирижёра из стенограммы: вопрос, шапка хода «→ голос · …»,
+      // команда «$ …» сразу после шапки (строже, чем «первый символ»:
+      // pty grok рисует ❯, вывод codex содержит «$ …» — ревьюер)
+      const wasHead=afterHead; afterHead=false;
+      if(l.slice(0,2)==='❯ '&&!inVoice){frag.appendChild(line('q',l));return}
+      if(/^→ [a-z][a-z0-9_-]* · /.test(l)){inThink=false;inVoice=true;afterHead=true;frag.appendChild(line('head',l));return}
+      if(wasHead&&l.slice(0,2)==='$ '){frag.appendChild(line('cmd',l));return}
+      if(/^[●○✗] [a-z]+ +[0-9.]+ с /.test(l)){inVoice=false;frag.appendChild(line('meta',l));return}
+      if(l.charAt(0)==='{'){let d=null; try{d=JSON.parse(l)}catch(_){}
+        if(d&&d.type){
+          // codex exec --json: пункты целиком (reasoning — мысли, agent_message — ответ, command_execution — инструмент)
+          if(d.type==='item.completed'&&d.item){const it=d.item;
+            if(it.type==='reasoning')frag.appendChild(line('think','💭 '+(it.text||'')));
+            else if(it.type==='agent_message')frag.appendChild(line('','📝 '+(it.text||'')));
+            else if(it.type==='command_execution')frag.appendChild(line('tool','🔧 $ '+(it.command||'')+(it.exit_code!==undefined&&it.exit_code!==null?' → код '+it.exit_code:'')+(it.aggregated_output?'\n'+String(it.aggregated_output).slice(0,600):'')));
+            else if(it.type==='file_change')frag.appendChild(line('tool','✎ правка файлов: '+JSON.stringify(it.changes||[]).slice(0,300)));
+            else if(it.type==='mcp_tool_call')frag.appendChild(line('tool','🔧 '+(it.server||'')+'/'+(it.tool||'')));
+            else if(it.type==='web_search')frag.appendChild(line('tool','🔎 '+(it.query||'')));
+            else if(it.type==='error')frag.appendChild(line('err','✗ '+(it.message||'')));
+            else frag.appendChild(line('meta','· '+it.type));
+            return}
+          if(d.type==='item.started'||d.type==='item.updated'||d.type==='turn.started')return;   // пункт ещё пишется — покажем целиком
+          if(d.type==='thread.started'){frag.appendChild(line('meta','· нить codex '+(d.thread_id||'')));return}
+          if(d.type==='turn.completed'){const u=d.usage||{}; frag.appendChild(line('meta','■ ход codex завершён · токены: вход '+(u.input_tokens||0)+' (кэш '+(u.cached_input_tokens||0)+'), выход '+(u.output_tokens||0)+', рассуждение '+(u.reasoning_output_tokens||0)));return}
+          if(d.type==='turn.failed'){frag.appendChild(line('err','✗ ход codex не удался: '+((d.error||{}).message||'')));return}
+          if(d.type==='error'&&d.message!==undefined){frag.appendChild(line('err','✗ '+d.message));return}
+          // claude --output-format stream-json
+          if(d.type==='assistant'&&d.message&&d.message.content){(d.message.content||[]).forEach(function(b){
+            if(b.type==='thinking')frag.appendChild(line('think','💭 '+(b.thinking||'')));
+            else if(b.type==='text')frag.appendChild(line('','📝 '+(b.text||'')));
+            else if(b.type==='tool_use')frag.appendChild(line('tool','🔧 '+b.name+' '+JSON.stringify(b.input||{}).slice(0,300)))});return}
+          if(d.type==='user'&&d.message&&d.message.content){(d.message.content||[]).forEach(function(b){
+            if(b.type==='tool_result'){const c=typeof b.content==='string'?b.content:JSON.stringify(b.content||''); frag.appendChild(line('meta','↩ результат инструмента, '+c.length+' симв.'))}});return}
+          if(d.type==='result'){frag.appendChild(line('meta','■ итог'+(d.is_error?' (ошибка)':'')+(d.total_cost_usd!==undefined?' · $'+Number(d.total_cost_usd).toFixed(4):'')+(d.duration_ms?' · '+Math.round(d.duration_ms/1000)+' с':'')));return}
+          if(d.type==='system'){frag.appendChild(line('meta','· '+(d.subtype||'system')+(d.model?' '+d.model:'')));return}
+          // grok --output-format streaming-json: дельты мыслей и текста — по
+          // токену на строку; склеиваем подряд идущие одного рода в одну строку
+          if((d.type==='thought'||d.type==='text')&&typeof d.data==='string'){const kind=d.type;
+            if(grokOpen(frag)&&GROKRUN.kind===kind){GROKRUN.el.textContent+=d.data;return}
+            grokClose(frag);
+            const sp=document.createElement('span'); if(kind==='thought')sp.className='think'; sp.textContent=(kind==='thought'?'💭 ':'📝 ')+d.data; frag.appendChild(sp);
+            GROKRUN={kind:kind,el:sp,frag:frag}; return}
+          if(d.type==='tool_call'){frag.appendChild(line('tool','🔧 '+(d.toolName||d.title||'')+' '+JSON.stringify(d.rawInput||{}).slice(0,300)));return}
+          if(d.type==='tool_call_update'){if(d.status==='failed')frag.appendChild(line('err','✗ инструмент не удался'));return}
+          if(d.type==='error'){frag.appendChild(line('err','✗ grok: '+String(d.message||d.error||'')));return}
+          if(d.type==='available_commands'||d.type==='usage')return;
+          if(d.type==='end'){const u=d.usage||{}; frag.appendChild(line('meta','■ ход grok завершён ('+(d.stopReason||'?')+') · токены: вход '+(u.input_tokens||0)+' (кэш '+(u.cache_read_input_tokens||0)+'), выход '+(u.output_tokens||0)+', рассуждение '+(u.reasoning_tokens||0)+(d.total_cost_usd!==undefined?' · $'+Number(d.total_cost_usd).toFixed(4):'')));return}
+        }}
+      if(/^💭 мысли модели/.test(l)){inThink=true;frag.appendChild(line('think',l));return}
+      if(/^💭 конец мыслей/.test(l)){inThink=false;frag.appendChild(line('think',l));return}
+      if(inThink){frag.appendChild(line('think',l));return}
+      if(/^(Traceback|Error|ошибка|✗)/.test(l))frag.appendChild(line('err',l)); else frag.appendChild(line('',l))});
+    return frag}
+  async function tick(){if(VIEW==='feed'||!TERM.id)return; const gen=TERM.gen; const id=TERM.id;
+    if(document.hidden){if(!(TERM.done&&TERM.quiet>2))TERM.timer=setTimeout(tick,3000);return}
+    let j=null;
+    const lk=logKind(SEEN[id]);
+    try{const r=await fetch('/act_log?id='+encodeURIComponent(id)+'&kind='+lk+'&since='+TERM.next+((lk==='chair'&&TERM.edit)?'&edit='+encodeURIComponent(TERM.edit):'')+(TERM.head?'&head=1':''));
+      j=await r.json(); if(!r.ok){pulse.textContent=(j&&j.error)||('ошибка '+r.status); TERM.timer=setTimeout(tick,r.status===404?3000:5000); return}}
+    catch(e){pulse.textContent='сервер не ответил'; TERM.timer=setTimeout(tick,3000); return}
+    if(gen!==TERM.gen||id!==TERM.id)return;
+    if(TERM.source&&j.source!==TERM.source){ // источник сменился (лог акта → сырой): читать заново
+      TERM.source=j.source;TERM.next=0;pre.textContent='';TERM.timer=setTimeout(tick,10);return}
+    TERM.source=j.source;
+    if(j.reset){pre.textContent='';TERM.next=0;PENDING=0;newer.hidden=true}
+    if(j.skipped&&!pre.textContent){pre.appendChild(line('meta','… начало лога пропущено (показан хвост 256 КиБ)'));
+      // «показать с начала»: тот же акт заново, с head=1 — сервер не
+      // пропускает голову (Автор 2026-10-06: у раунда с мыслями ~900 КБ,
+      // хвост показывал один свод, «внутри актов пусто»)
+      const b=document.createElement('button'); b.className='meta'; b.textContent='показать с начала'; b.style.cssText='font:inherit;background:var(--bg);color:var(--ink);border:1px solid var(--rule);border-radius:.3rem;padding:0 .45rem;cursor:pointer;margin:0 0 .3rem';
+      b.onclick=function(){TERM.headFor=TERM.id; startTerm(TERM.id)}; pre.appendChild(b); pre.appendChild(document.createTextNode('\n'))}
+    if(j.text){const n=(j.text.match(/\n/g)||[]).length; pre.appendChild(render(j.text)); TERM.lastByte=Date.now(); TERM.quiet=0;
+      // режим «с начала»: голова докачивается порциями — это не новые
+      // строки и не повод прокручивать к хвосту (codex, grok, субагент);
+      // дочитали — стоим в начале
+      if(TERM.head&&!TERM.headDone){if(!j.more){TERM.headDone=true;pre.scrollTop=0}}
+      else if(FOLLOW)pre.scrollTop=pre.scrollHeight; else {PENDING+=n; newer.textContent='↓ новое: '+PENDING+' строк'; newer.hidden=false}}
+    TERM.next=j.next; TERM.lastSize=j.size; TERM.done=!!j.done;
+    const src={act:'печать процесса акта (стенограммы у этого акта нет)',raw:'стенограмма акта',chair:'вывод CLI в кресле'}[j.source]||j.source;
+    what.textContent='показано: '+src+' · '+Math.round(j.size/1024)+' КБ'+(TERM.head?' · с начала':'');
+    const ago=TERM.lastByte?Math.round((Date.now()-TERM.lastByte)/1000):null;
+    pulse.textContent=(j.done?'■ завершён':'● идёт')+(ago!==null?' · последний байт '+ago+' с назад':'');
+    if(j.more){TERM.timer=setTimeout(tick,50);return}
+    if(j.done){TERM.quiet++; if(TERM.quiet>2)return}   // дочитали: опрос останавливается
+    TERM.timer=setTimeout(tick,j.done?1000:1500)}
+  // Прокрутка ленты переживает уход во вкладку вывода: события ленты на
+  // время прячутся, высота схлопывается и позиция терялась — возврат
+  // отбрасывал в самый верх (Автор, 2026-09-06). Запоминаем позицию и
+  // «был ли внизу»: внизу — остаёмся внизу (с новыми событиями), иначе —
+  // ровно туда, где читали.
+  let FEED_POS={top:0,stick:true};
+  function setView(v){
+    if(VIEW==='feed'&&v!=='feed')FEED_POS={top:feed.scrollTop,stick:feed.scrollHeight-feed.scrollTop-feed.clientHeight<60};
+    VIEW=v; clearTimeout(TERM.timer);
+    TABS.forEach(function(t){t[1].className='vtab'+(t[0]===v?' on':'')});
+    feed.className=(feed.className||'').replace(/\bterm\b/g,'').trim()+(v!=='feed'?' term':''); wrap.hidden=(v==='feed'); secwrap.hidden=(v!=='sec');
+    if(v==='sec'){TERM.id=null;showGate('');loadSec(true);fillActs();loadActs(true).then(function(){if(VIEW===v)fillActs()})}
+    else if(v!=='feed'){TERM.id=null;fillActs();loadActs(true).then(function(){if(VIEW===v)fillActs()})}
+    else{showGate(''); const go=function(){feed.scrollTop=FEED_POS.stick?feed.scrollHeight:FEED_POS.top};
+      if(window.requestAnimationFrame)requestAnimationFrame(go); else go()}}
+  window.setView=setView;
+  setInterval(function(){if(VIEW==='sec')loadSec(false);
+    if(VIEW!=='feed'){loadActs(false);const before=sel.value;fillActs();if(sel.value!==before&&!TERM.id)startTerm(sel.value)}
+    const st=window.STATE||{}; const n=st.pending_reviews, q=st.review_queue;
+    const rows=Array.isArray(st.pending_acts)?st.pending_acts:null; const dead=rows?rows.filter(function(r){return r.empty===true||r.stage==='crashed'}).length:0; const n2=rows?rows.length-dead:n;
+    pend.textContent=(VIEW==='chair'&&typeof n2==='number'&&(n2>0||dead>0))?('ждут приёмки: '+n2+(dead?' · упали без правок: '+dead:'')+(q?' · в очереди на веер: '+q:'')):''; if(!pendlist.hidden)fillPend()},2500);
+  }catch(e){try{console.error('вкладки вывода не построены: '+e)}catch(_){}}
+})();
+
+// ── ПРЕРВАТЬ ВСЁ ─────────────────────────────────────────────────────
+// Подтверждение обязательно и на кнопке, и на Esc: Автор ждал этого
+// именно от Esc, а Esc жмут не думая — чтобы убрать фокус, закрыть
+// список, отменить выделение. Прерывание же ломает уже ОПЛАЧЕННЫЕ
+// вызовы, и восстановить их нечем. Поэтому цена нажатия названа в
+// самом вопросе, вместе с перечислением того, что сейчас идёт.
+async function abortAll(){
+  acterr('');   // прошлая заметка про «нечего прерывать» уже неверна
+  if(!LAST_RUN.length)return acterr('прерывать нечего: идущих ходов нет',true);
+  const what=LAST_RUN.map(function(r){
+    return '· '+(r.label||'ход')+' ('+(r.for_s||0)+'с, '+
+      ((r.voices||[]).join(', ')||'голоса не названы')+')'}).join('\n');
+  if(!confirm('Прервать ВСЕ идущие ходы?\n\n'+what+
+    '\n\nЗаписанное в ленте останется. Ответы слепой фазы идущего раунда '+
+    'лежат только в памяти дирижёра и пропадут вместе с оплатой — для них '+
+    'мягче кнопка «Стоп». Отменить прерывание нечем.'))return;
+  acterr('');
+  let r;
+  try{
+    r=await fetch('/abort',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:'{}'});
+  }catch(e){return acterr('сервер не ответил: '+e)}
+  let j={};try{j=await r.json()}catch(_){}
+  if(!r.ok)return acterr('прервать не вышло: '+
+    ((j&&j.error)||('ошибка '+r.status))+
+    (r.status===404?' — сервер этого пути ещё не знает':''));
+  // Что именно снято, скажет лента и /state: окно не пересказывает
+  // ответ сервера своими словами и не рисует «прервано» само.
+  acterr('запрос на прерывание ушёл — смотрите ленту',true);
+}
+document.getElementById('abort').onclick=()=>abortAll();
+// Правило имени — копия серверного ROUND_RE, но записанная ЧЕРЕЗ \p{L}:
+// в JS \w это только ASCII, и дословный перенос `[\w][\w.-]{0,59}` отверг
+// бы «переезд-v1» и «патент-v1» — то есть почти все имена этого стола,
+// которые сервер принимает без разговоров (питоновский \w — юникодный).
+const RE_ROUND=/^[\p{L}\p{N}_][\p{L}\p{N}_.\-]{0,59}$/u;
+// «Развить тему» (2026-09-20): родитель нового раунда. Живёт до запуска
+// или до ✕ — иначе следующий, никак не связанный раунд ушёл бы со
+// сводом чужого родителя в вопросе.
+let DEVELOP=null;
+// «ПРОДОЛЖИТЬ ОТСЮДА» (раунд prodolzhit-lyuboe-v1, 2026-09-22; решения
+// Автора 2026-09-23): одно сообщение журнала — дословно, как контекст
+// следующего вопроса; уходит с «Сказать», «Слепой», быстрым вопросом и
+// раундом. Окно шлёт только АДРЕС (live:<id> | room:<id>), текст
+// вставляет сервер из журнала (правило 8.5). Полоска с ✕ по образцу
+// «Развить тему»; галочки нет — «открытого сообщения» в окне не бывает.
+// Живёт до отправки или до ✕. Потолок ANCHOR_CAP — отказ, не обрезка.
+let ANCHOR=null;
+function anchorCap(){return (window.STATE&&window.STATE.anchor_cap)||6000}   // от сервера; 6000 — запас на старый сервер
+const ANCHOR_BAD_FALLBACK=['error','timeout','stalled','quota','dropped','empty','missing','busy','auth','crash','aborted','interrupted','unknown','upstream_error','outcome_unknown'];
+function anchorBadStatus(st){st=String(st||''); if(!st)return false; const bad=(window.STATE&&window.STATE.anchor_bad_status)||ANCHOR_BAD_FALLBACK; return bad.indexOf(st)>=0||st.indexOf('refused_')===0}
+// Текст якоря — то же правило, что anchor.live_text на сервере: у edit_review
+// полный текст в full_text; у review_note итог — text; у jev — строка плюс
+// вопросы/состояние/ответы; иначе text. Длина для потолка считается по нему.
+function anchorText(ev){const k=ev.kind;
+  if(k==='edit_review')return String(ev.full_text||ev.text||'').trim();
+  const t=String(ev.text||'').trim();
+  if(k==='jev'){const parts=[t]; [['вопросы','questions'],['состояние','state'],['ответы','answers']].forEach(function(p){const v=ev[p[1]]; if(v===undefined||v===null||v===''||(typeof v==='object'&&Object.keys(v).length===0))return; parts.push(p[0]+': '+(typeof v==='string'?v:JSON.stringify(v)))}); return parts.filter(Boolean).join('\n').trim()}
+  return t}
+function anchorAuthor(ev){const a=ev.author||'?'; return ((a==='chamber'||a==='choir'||a==='roundtable')&&ev.voice)?String(ev.voice):a}
+function anchorable(ev){return !!(ev&&ev.id&&ev.kind!=='pass'&&ev.kind!=='error'&&!anchorBadStatus(ev.status)&&anchorText(ev))}
+function anchorButton(addr,author,n,focusId){
+  const b=document.createElement('button');b.type='button';b.className='anc';
+  b.textContent='продолжить отсюда';
+  b.title='Следующий вопрос — от этого сообщения: оно уйдёт голосам или секретарю дословно ('+n+' симв.), '+
+    'нить голоса начнётся заново; мысли модели в якорь не входят — только итог';
+  if(n>anchorCap()){b.disabled=true;b.title='якорь '+n+' симв. — больше потолка '+anchorCap()+': обрезки нет, выделите фрагмент и вставьте его в вопрос сами'}
+  b.onclick=function(){anchorFrom(addr,author,n,focusId)};
+  return b;
+}
+const SEC_PH='реплика секретарю (Enter — отправить, Shift+Enter — перенос)';
+function anchorSecPh(ph){try{const sx=document.getElementById('sectext'); if(sx)sx.placeholder=ph}catch(_){}}
+function anchorFrom(addr,author,n,focusId){
+  ANCHOR={addr:addr,author:author,n:n};
+  let strip=document.getElementById('ancstrip');
+  if(!strip){strip=document.createElement('div');strip.id='ancstrip';
+    strip.style.cssText='font:.74rem ui-monospace,monospace;color:var(--dim);padding:2px 0';
+    document.getElementById('roundrow').insertAdjacentElement('afterend',strip)}
+  strip.innerHTML='';
+  strip.appendChild(document.createTextNode('⚓ продолжить от '+addr+' ('+author+', '+n+' симв.): уйдёт дословно, без мыслей модели; нить голоса — заново '));
+  const x=document.createElement('button');x.type='button';x.textContent='✕';x.title='снять якорь — обычная реплика';
+  // ✕ возвращает обе подсказки: поля комнаты и поля секретаря (ревизия: иначе
+  // поле секретаря обещало якорь, которого уже нет)
+  x.onclick=function(){ANCHOR=null;strip.remove();if(!DEVELOP)msg.placeholder=MSG_PH;anchorSecPh(SEC_PH)};
+  strip.appendChild(x);
+  msg.placeholder='Вопрос от сообщения '+addr+' ('+author+') — «Сказать», быстрый вопрос, «Раунд» или реплика секретарю';
+  anchorSecPh('реплика секретарю от сообщения '+addr+' ('+author+')');
+  const f=focusId?document.getElementById(focusId):null; (f||msg).focus();
+}
+function anchorSent(sent){
+  // чистим только ТО, что ушло: пока ждали ответ, Автор мог выбрать другой якорь
+  if(sent&&ANCHOR===sent){ANCHOR=null;const st=document.getElementById('ancstrip');if(st)st.remove();if(!DEVELOP)msg.placeholder=MSG_PH;
+    anchorSecPh(SEC_PH)}
+}
+// BigInt — суффикс не теряет точность; длина — в пределах ROUND_RE (60),
+// база при нужде режется (codex)
+function nextRoundName(n){const m=/^(.*)-(\d+)$/.exec(n);
+  let base=m?m[1]:n,suf=m?String(BigInt(m[2])+1n):'2';
+  base=base.slice(0,Math.max(1,60-1-suf.length));return base+'-'+suf}
+function developRound(parent,sumLen){
+  DEVELOP={parent:parent,name:nextRoundName(parent)};
+  let strip=document.getElementById('devstrip');
+  // ПОСЛЕ строки раунда, не внутрь: #roundrow — flex без переноса, и
+  // полоска внутри схлопывала кнопку «Раунд» до нуля (субагент)
+  if(!strip){strip=document.createElement('div');strip.id='devstrip';
+    strip.style.cssText='font:.74rem ui-monospace,monospace;color:var(--dim);padding:2px 0';
+    document.getElementById('roundrow').insertAdjacentElement('afterend',strip)}
+  strip.innerHTML='';
+  strip.appendChild(document.createTextNode('развитие раунда «'+parent+'»: свод'+(sumLen?' ('+sumLen+' симв.)':'')+' уйдёт в вопрос дословно; имя «'+DEVELOP.name+'» '));
+  const x=document.createElement('button');x.textContent='✕';x.title='отменить развитие — обычный раунд';
+  x.onclick=function(){DEVELOP=null;strip.remove();msg.placeholder=MSG_PH};
+  strip.appendChild(x);
+  msg.placeholder='Новый вопрос по итогам раунда «'+parent+'» — что развить, что оспорить (Alt+Enter — перенос)';
+  msg.focus();
+}
+const MSG_PH=msg.placeholder;
+document.getElementById('round').onclick=async()=>{
+  const question=msg.value.trim();
+  if(!question){alert(DEVELOP?'новый вопрос по итогам раунда «'+DEVELOP.parent+'» — в поле реплики':'вопрос раунда — в поле реплики');return}
+  // Проверяем ЗДЕСЬ, а не по 400 с сервера: имя спрашивают уже после
+  // набранного вопроса, и отказ после prompt() стоил бы Автору второго
+  // ввода — а вопрос к тому моменту ещё висит в поле и легко теряется.
+  let name='';
+  for(;;){
+    name=(prompt('Имя раунда (буквы/цифры/точка/дефис, до 60):',DEVELOP?DEVELOP.name:'')||'').trim();
+    if(!name)return;
+    if(RE_ROUND.test(name))break;
+    alert('так нельзя: первый символ — буква или цифра, дальше буквы, '+
+          'цифры, точка, дефис, подчёркивание; до 60 символов');
+  }
+  const auto=document.getElementById('auto').checked;
+  const rebuts=+document.getElementById('rebuts').value;
+  // Состав раунда — галочки вкладки 🎼 (не текущей!): на 💬 они значат
+  // адресатов реплики, на 🔧 — пул кресел. Меньше двух — не раунд.
+  const rvoices=picked('rounds');
+  if(rvoices.length<2){alert('раунд — минимум два голоса: отметьте их на '+
+    'вкладке 🎼 раунды (если список голосов ещё не загрузился — '+
+    'подождите секунду)');return}
+  // Подтверждение только для авто: это единственный режим, где после
+  // нажатия человека больше не спрашивают, а вызовы шести голосов
+  // платные. По шагам подтверждать нечего — такт сам встанет.
+  if(auto&&!confirm('Автопрогон «'+name+'»: pick → expand → ask → rebut ×'+
+      rebuts+' → summarize, без остановки. Голоса: '+rvoices.join(', ')+
+      ' — платно. Пускаем?'))return;
+  const sent=DEVELOP;            // что ушло: ответ чистит только ЭТО (codex)
+  const sentA=ANCHOR;
+  if(sent&&sentA){alert('якорь и развитие раунда вместе не бывают: снимите одно из двух (✕ на полоске)');return}
+  const r=await fetch('/round',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({question,name,auto,rebuts,brief:briefOn(),thoughts:thoughtsOn(),
+                         voices:rvoices,canary:(document.getElementById('canary')||{}).value||'',
+                         project:document.getElementById('project').value.trim(),
+                         parent:sent?sent.parent:'',anchor:sentA?sentA.addr:''})});
+  if(r.ok){
+    // пока ждали ответ, Автор мог выбрать другую карточку и набрать
+    // новый вопрос — его не стираем
+    if(msg.value.trim()===question)msg.value='';
+    if(DEVELOP===sent){DEVELOP=null;const st=document.getElementById('devstrip');if(st)st.remove();msg.placeholder=MSG_PH}
+    anchorSent(sentA);
+  } else alert((await r.json()).error||'ошибка');
+};
+document.getElementById('stop').onclick=async()=>{
+  const name=document.getElementById('stop').dataset.round;
+  if(!name)return;
+  if(!confirm('Остановить раунд «'+name+'»? Флаг увидит дирижёр между '+
+              'шагами: текущий вызов голоса доживёт до конца.'))return;
+  const r=await fetch('/stop',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({round:name})});
+  if(!r.ok)alert((await r.json()).error||'ошибка');
+};
+// Перенос строки — Alt+Enter (наказ Автора 2026-08-25). Браузер сам
+// его не вставляет: по Alt+Enter в textarea не происходит НИЧЕГО, в
+// отличие от Shift+Enter, который перенос делает по умолчанию. Поэтому
+// вставляем руками — и через setRangeText, а не склейкой value:
+// склейка стирает историю отмены (Ctrl+Z) и уводит каретку в конец,
+// то есть посреди набранного абзаца текст молча перемешается.
+// Shift+Enter оставлен рабочим намеренно: привычное не отбирают, но в
+// подсказках и плейсхолдере называется Alt+Enter.
+function nl(){
+  const a=msg.selectionStart,b=msg.selectionEnd;
+  if(typeof msg.setRangeText==='function')msg.setRangeText('\n',a,b,'end');
+  else{msg.value=msg.value.slice(0,a)+'\n'+msg.value.slice(b);
+       msg.selectionStart=msg.selectionEnd=a+1}
+  msg.scrollTop=msg.scrollHeight;
+}
+msg.addEventListener('keydown',e=>{
+  if(e.key==='Escape'){e.preventDefault();abortAll();return}
+  if(e.key!=='Enter')return;
+  if(e.altKey){e.preventDefault();nl();return}
+  if(e.shiftKey)return;                 // перенос делает сам браузер
+  e.preventDefault();send(false)});
+document.getElementById('lot').onclick=async()=>{
+  const lb=document.getElementById('lotbox');delete lb.dataset.err;
+  const r=await fetch('/lot',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({candidates:picked('rounds')})});
+  const j=await r.json();
+  if(r.ok)lb.innerHTML='commit опубликован — имя появится через ~'+j.wait_s+'с';
+  else{lb.dataset.err=1;
+    lb.innerHTML='<span style="color:var(--err)">'+esc(j.error)+'</span>'}
+};
+document.getElementById('reveal').onclick=async()=>{
+  const r=await fetch('/reveal',{method:'POST'});
+  if(r.ok)document.getElementById('lotbox').textContent='раскрыт — см. ленту';
+};
+</script></body></html>"""
+
+
+def sweep_orphan_acts() -> int:
+    """Закрыть действия, оставшиеся без итога после гибели окна.
+
+    SIGKILL, паника, отключённое питание — и в ленте навсегда висит
+    `accepted` без финала, а дети живут в своей сессии и продолжают
+    писать реплики: в журнале появляются ответы «после» действия, у
+    которого нет конца (нашёл ревьюер дифа). Правило 4 требует записать
+    отказ как факт, поэтому на старте помечаем такие акты `unknown` —
+    честнее, чем оставить вечное «принято».
+    """
+    try:
+        rows = [json.loads(l) for l in
+                FEED.read_text(encoding="utf-8").splitlines() if l.strip()]
+    except (OSError, json.JSONDecodeError):
+        return 0
+    opened, closed = {}, set()
+    for d in rows:
+        if not isinstance(d, dict) or d.get("kind") != "act_status":
+            continue
+        aid, st = d.get("act_id"), d.get("status")
+        if st == "accepted":
+            opened[aid] = d                     # событие целиком: нужен его проект
+        # `detached` — ОКОНЧАТЕЛЬНЫЙ статус ответственности окна: такт
+        # пережил его и доигрывает сам, а reap был daemon-нитью умершего
+        # процесса и финал уже не запишет. Не считать detached закрытым
+        # значит дописывать поверх честного статуса ложный `unknown`
+        # (нашёл codex).
+        elif st in ("done", "error", "interrupted", "unknown", "detached",
+                    # `aborted` — такой же окончательный итог, как
+                    # остальные. Без него каждый честно прерванный акт
+                    # получал при следующем старте окна второй, ложный
+                    # финал «судьба неизвестна» — два итога у одного
+                    # act_id (нашли grok и kimi независимо).
+                    "aborted"):
+            closed.add(aid)
+    stale = [a for a in opened if a and a not in closed]
+    for aid in stale:
+        # Финал наследует проект акта, а не проект ЭТОГО окна: иначе
+        # осиротевший акт чужого проекта «переезжал» бы в ленту того окна,
+        # которое случилось запустить первым (поймано HTTP-тестом).
+        feed_append("act_status",
+                    f"act {aid} судьба неизвестна: окно было перезапущено, "
+                    f"итог не записан",
+                    act_id=aid, status="unknown",
+                    **({"project": opened[aid]["project"]} if opened[aid].get("project") else {}))
+    return len(stale)
+
+
+def _last_run() -> dict:
+    try:
+        return json.loads(LAST_RUN.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+# ── МОНИТОР ОКОН (наказ Автора 2026-09-10) ───────────────────────────
+# Каждое окно при старте пишет карточку в реестр (pid, порт, проект,
+# каталог, время) и снимает её при выходе; окна старого кода без карточки
+# находятся по /proc. Остановить можно только чужое окно этого же
+# пользователя с roundtable.py в командной строке — сигналом SIGTERM, чтобы
+# его finally погасил свои акты.
+WINDOWS_DIR = Path(os.environ.get("CHOIR_RT_WINDOWS")
+                   or Path.home() / ".cache" / "choir" / "rt-windows")
+# ТОКЕН КРЕСЛА СЕКРЕТАРЯ (2026-10-08, ревизия кресла: deepseek, grok,
+# субагент). POST /secretary запускает агента с ПОЛНЫМИ правами Автора, а
+# сеть у клетки общая: голос мог бы послать «реплику Автора» на
+# 127.0.0.1 и получить оболочку. Первая редакция делала токен случайным
+# на процесс окна — просто как самое дешёвое: секрет не лежал на диске
+# дольше жизни окна. Угроза от этого не зависит (голос в клетке не видит
+# реестр окон ни так, ни так), а цена — ввод после каждого перезапуска;
+# с 2026-10-08 токен постоянный, смена — кнопкой (rotate_sec_token).
+# CHOIR_RT_SEC_TOKEN задаёт свой (стенды).
+def _sec_token_file() -> Path:
+    """Файл токена ЭТОГО проекта: sec-token.<sha пути проекта> (наказ Автора
+    2026-10-08: «то во всех окнах, то не во всех — токен на каждый проект
+    отдельный»). Окна одного проекта делят токен, разные проекты — нет;
+    смена кнопкой действует ровно на окна этого проекта. Окно без проекта
+    — это стол (каталог roundtable.py): у него токен проекта RoundTable."""
+    import hashlib
+    proj = str(Path(PROJECT or _HERE).resolve())
+    return WINDOWS_DIR / f"sec-token.{hashlib.sha1(proj.encode()).hexdigest()[:12]}"
+
+
+def _sec_token() -> str:
+    """Токен кресла — ПОСТОЯННЫЙ, свой у проекта (наказы Автора 2026-10-08:
+    «кнопочка обновить токен» — после каждого перезапуска окна токен
+    менялся; «токен на каждый проект отдельный»). Файл _sec_token_file()
+    0600 (реестр окон скрыт от клетки); нет — создаётся. Сменить — кнопкой
+    во вкладке (rotate_sec_token). CHOIR_RT_SEC_TOKEN — стенды."""
+    env = os.environ.get("CHOIR_RT_SEC_TOKEN")
+    if env:
+        return env
+    f = _sec_token_file()
+    # ОБЩИЙ ФАЙЛ утренней редакции (sec-token без суффикса) НЕ раздаётся
+    # проектам: иначе «свой у проекта» до первой смены был бы одним и тем
+    # же секретом, а сменённый (утёкший) жил бы во всех будущих проектах
+    # (ревизия). Он удаляется; каждый проект получает свой новый токен —
+    # ввести один раз на проект (печатается в терминале его окна).
+    try:
+        (WINDOWS_DIR / "sec-token").unlink(missing_ok=True)
+    except OSError:
+        pass
+
+    def _read() -> str | None:
+        try:
+            raw = f.read_text(encoding="utf-8")
+        except OSError:
+            return None
+        tok = raw.strip()
+        # любой токен в одну строку из печатных символов (Автор может вписать
+        # свой); пустой или многострочный — мусор, об этом вслух
+        if tok and "\n" not in tok and re.fullmatch(r"[\x21-\x7e]{8,128}", tok):
+            try:
+                os.chmod(f, 0o600)          # режим при создании не чинит старый файл
+            except OSError:
+                pass
+            return tok
+        print(f"токен кресла: файл {f} не похож на токен (одна строка 8–128 печатных символов) — "
+              f"заменён новым", file=sys.stderr)
+        return None
+    tok = _read()
+    if tok:
+        return tok
+    new = secrets.token_hex(16)
+    try:
+        WINDOWS_DIR.mkdir(parents=True, exist_ok=True)
+        f.unlink(missing_ok=True)
+        # O_EXCL: два окна при первом старте не перепишут друг друга — проигравший перечитает
+        fd = os.open(f, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(new + "\n")
+        return new
+    except FileExistsError:
+        return _read() or new
+    except OSError as e:
+        print(f"токен кресла: файл не записался ({e}) — токен только на этот запуск", file=sys.stderr)
+        return new
+
+
+# на импорте — только токен из среды (стенды); файловый берёт main() после
+# разбора --project (иначе файл считался бы для каталога запуска)
+SEC_TOKEN = os.environ.get("CHOIR_RT_SEC_TOKEN") or ""
+_SEC_TOK_LAST: dict = {"tok": None}
+_SEC_TOK_LOCK = threading.Lock()
+
+
+def _sec_token_current() -> str:
+    """Действующий токен: файл реестра, читается при каждой проверке (файл в
+    сорок байт, проверки — на POST и раз в 15 с вкладкой) под замком — без
+    кэша по mtime, который пропускал правку на месте и между потоками мог
+    на миг принять отменённый токен (ревизия). Смена кнопкой в одном окне
+    сразу действует во всех окнах этого проекта. Файл пропал или испорчен — ПОСЛЕДНИЙ годный,
+    прочитанный из файла (не токен старта: тот мог быть уже отменён), без
+    прочитанного — токен старта."""
+    if os.environ.get("CHOIR_RT_SEC_TOKEN"):
+        return os.environ["CHOIR_RT_SEC_TOKEN"]
+    with _SEC_TOK_LOCK:
+        try:
+            tok = _sec_token_file().read_text(encoding="utf-8").strip()
+        except OSError:
+            tok = ""
+        if re.fullmatch(r"[\x21-\x7e]{8,128}", tok or ""):
+            _SEC_TOK_LAST["tok"] = tok
+        return _SEC_TOK_LAST["tok"] or SEC_TOKEN
+
+
+def rotate_sec_token(presented: str | None = None) -> str:
+    """Новый токен кресла: атомарно (временный файл 0600 + rename) в тот же
+    файл проекта; старый перестаёт действовать во всех окнах проекта. Зовёт
+    только POST /secretary/token с действующим токеном. Смены СЕРИЙНЫ
+    между окнами (flock), и предъявленный токен сверяется ещё раз под
+    замком: две одновременные смены иначе обе прошли бы, и браузер
+    проигравшей сохранил бы токен, которого в файле уже нет (ревизия: grok)."""
+    if os.environ.get("CHOIR_RT_SEC_TOKEN"):
+        raise RuntimeError("токен задан средой окна (CHOIR_RT_SEC_TOKEN) — кнопкой не меняется")
+    import fcntl
+    WINDOWS_DIR.mkdir(parents=True, exist_ok=True)
+    with open(_sec_token_file().with_name("." + _sec_token_file().name + ".lock"), "w") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        if presented is not None and not _sec_token_ok(presented):
+            raise PermissionError("токен уже сменён другим окном — введите действующий")
+        return _rotate_locked()
+
+
+def _rotate_locked() -> str:
+    new = secrets.token_hex(16)
+    tmp = WINDOWS_DIR / f".sec-token.{os.getpid()}.{secrets.token_hex(4)}"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(new + "\n")
+        os.replace(tmp, _sec_token_file())
+    except OSError:
+        tmp.unlink(missing_ok=True)
+        raise
+    return new
+
+
+_SEC_RESERVED: set[str] = set()     # резерв хода секретаря между проверкой и spawn (под RUN_LOCK)
+_SEC_REFUSED_AT: dict[str, float] = {}
+
+
+def _sec_token_ok(raw) -> bool:
+    import hmac
+    # байтами: str с не-ASCII (кириллица в заголовке) compare_digest не
+    # принимает — TypeError ронял обработчик вместо 403 (поймал тест)
+    cur = _sec_token_current()
+    return bool(raw) and bool(cur) and hmac.compare_digest(str(raw).encode("utf-8", "surrogateescape"),
+                                                           cur.encode("utf-8", "surrogateescape"))
+
+
+def _proc_start(pid: int):
+    """Метка запуска процесса (starttime из /proc/<pid>/stat): переиспользованный
+    pid её не повторит — карточка мёртвого окна не примет чужой процесс за
+    своё (ревизия: codex, deepseek, gemini)."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+        return int(stat.rsplit(")", 1)[1].split()[19])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _window_card() -> dict:
+    return {"pid": os.getpid(), "port": PORT, "project": PROJECT or None,
+            "cwd": os.getcwd(), "started": _now(), "start_tick": _proc_start(os.getpid())}
+
+
+def register_window() -> None:
+    try:
+        WINDOWS_DIR.mkdir(parents=True, exist_ok=True)
+        card = WINDOWS_DIR / f"{os.getpid()}.json"
+        card.write_text(json.dumps(_window_card(), ensure_ascii=False), encoding="utf-8")
+        # ТОКЕН КРЕСЛА — не в карточке: карточки уходят через GET /windows
+        # любому на 127.0.0.1. С 2026-10-08 он свой у проекта — файл
+        # sec-token.<проект> (см. _sec_token); второго файла на pid нет
+    except OSError as e:
+        print(f"реестр окон: {e}", file=sys.stderr)
+
+
+def unregister_window() -> None:
+    try:
+        (WINDOWS_DIR / f"{os.getpid()}.json").unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _proc_cmdline(pid: int) -> str:
+    try:
+        return Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+def _is_window_pid(pid: int) -> bool:
+    """Живой процесс окна ЭТОГО пользователя (не наш собственный): исполняемый
+    файл — python, а roundtable.py — его СКРИПТ (аргумент), не подстрока где-то
+    в командной строке: иначе `vim roundtable.py` или `tail -f …/roundtable.py`
+    попали бы в монитор и получили SIGTERM (kimi, grok)."""
+    if pid <= 1 or pid == os.getpid():
+        return False
+    try:
+        if os.stat(f"/proc/{pid}").st_uid != os.getuid():
+            return False
+        exe = os.path.basename(os.readlink(f"/proc/{pid}/exe"))
+    except OSError:
+        return False
+    if not exe.startswith("python"):
+        return False
+    args = [a for a in _proc_cmdline(pid).split(" ") if a]
+    return any(os.path.basename(a) == "roundtable.py" for a in args[1:3])
+
+
+def list_windows() -> list[dict]:
+    out: dict[int, dict] = {}
+    try:
+        for f in WINDOWS_DIR.glob("*.json"):
+            try:
+                card = json.loads(f.read_text(encoding="utf-8"))
+                pid = int(card.get("pid") or 0)
+            except (ValueError, OSError, TypeError):
+                continue
+            same = card.get("start_tick") in (None, _proc_start(pid))
+            if pid == os.getpid() or (_is_window_pid(pid) and same):
+                card["alive"] = True
+                out[pid] = card
+            else:
+                f.unlink(missing_ok=True)           # умершее окно без finally / pid переиспользован
+    except OSError:
+        pass
+    # окна без карточки (старый код): по /proc, порт неизвестен
+    try:
+        for d in Path("/proc").iterdir():
+            if not d.name.isdigit():
+                continue
+            pid = int(d.name)
+            if pid in out or not (pid == os.getpid() or _is_window_pid(pid)):
+                continue
+            try:
+                started = time.strftime("%Y-%m-%d %H:%M", time.localtime(d.stat().st_mtime))
+                cwd = os.readlink(f"/proc/{pid}/cwd")
+            except OSError:
+                started, cwd = "", ""
+            out[pid] = {"pid": pid, "port": None, "project": None, "cwd": cwd,
+                        "started": started, "alive": True, "unregistered": True}
+    except OSError:
+        pass
+    for pid, card in out.items():
+        card["self"] = (pid == os.getpid())
+    return sorted(out.values(), key=lambda c: c["pid"])
+
+
+def stop_window(pid: int) -> str:
+    if pid == os.getpid():
+        raise ValueError("это окно — закройте его само")
+    # pidfd берётся ДО проверки: между проверкой и сигналом pid мог бы
+    # достаться чужому процессу (codex, deepseek); с дескриптором сигнал
+    # уходит ровно тому процессу, который проверяли
+    try:
+        fd = os.pidfd_open(pid)
+    except (ProcessLookupError, OSError) as e:
+        raise ValueError(f"pid {pid}: процесса нет ({e})")
+    try:
+        if not _is_window_pid(pid):
+            raise ValueError(f"pid {pid} — не окно стола этого пользователя")
+        signal.pidfd_send_signal(fd, signal.SIGTERM)
+    finally:
+        os.close(fd)
+    return "SIGTERM отправлен — окно погасит свои акты и выйдет"
+
+
+def _remember_run(project: str) -> None:
+    """Запомнить каталог этого запуска — ради `-c`.
+
+    Молча: не сумели записать — окно всё равно работает, а `-c` в
+    следующий раз честно скажет, что помнить нечего.
+    """
+    try:
+        LAST_RUN.parent.mkdir(parents=True, exist_ok=True)
+        # Через временный файл и rename: два окна, запущенных разом,
+        # иначе оставили бы полуписаный json, и следующий `-c` не смог бы
+        # его прочитать (замечание deepseek). rename на одной ФС атомарен.
+        tmp = LAST_RUN.with_name(LAST_RUN.name + f".{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(
+            {"project": project, "when": _now()}, ensure_ascii=False),
+            encoding="utf-8")
+        tmp.replace(LAST_RUN)
+    except OSError:
+        pass
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    ap = argparse.ArgumentParser(
+        prog="roundtable",
+        description="Окно в комнату стола: лента, реплики, раунды.")
+    ap.add_argument("--project", default=None, metavar="ПУТЬ",
+                    help=f"каталог, о котором идёт разговор "
+                         f"(умолчание — текущий: {PROJECT})")
+    ap.add_argument("-c", "--continue", dest="cont", action="store_true",
+                    help="продолжить с каталогом прошлого запуска, "
+                         "а не с текущим")
+    ap.add_argument("--port", type=int, default=None,
+                    help=f"порт окна (умолчание {PORT})")
+    ap.add_argument("--init-project", action="store_true",
+                    help="создать каркас проекта в каталоге запуска, даже "
+                         "если он не пуст: ссылку .roundtable на стол и "
+                         "PROJECT.md (пустой каталог получает их сам)")
+    ap.add_argument("--no-project", action="store_true",
+                    help="открыть окно без проекта: поле в панели пустое")
+    return ap.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    global PROJECT, PORT, SEC_TOKEN
+    a = parse_args(argv)
+    if a.port is not None:
+        # `if a.port:` глотал --port 0 молча, а помощь его обещает
+        # (0 = «любой свободный», у сокета это законное значение).
+        PORT = a.port
+    # Порядок намеренный: явный --project сильнее `-c`, `-c` сильнее
+    # текущего каталога. Иначе флаг, набранный руками, молча проигрывал бы
+    # памяти прошлого запуска — а это ровно тот случай, когда человек
+    # уверен, что задал путь, и не понимает, почему стол смотрит не туда.
+    if a.no_project:
+        PROJECT = ""
+    elif a.project:
+        PROJECT = str(Path(a.project).expanduser())
+    # resolve() ОДИН раз и здесь: /act всё равно делает p.resolve(), и
+    # без этого поле показывало `./foo` или путь через симлинк, а голоса
+    # читали другой каталог — панель и механика расходились (нашли grok
+    # и kimi независимо).
+    if PROJECT:
+        try:
+            PROJECT = str(Path(PROJECT).resolve())
+        except OSError:
+            pass
+    elif a.cont:
+        prev = _last_run().get("project")
+        if not isinstance(prev, str):
+            # `{"project": 123}` в файле роняло окно на Path(PROJECT)
+            # ещё до старта сервера (нашёл ревьюер дифа).
+            prev = ""
+        if prev:
+            PROJECT = prev
+            print(f"продолжаю с каталогом прошлого запуска: {PROJECT}")
+        else:
+            print("нечего продолжать: прошлый запуск не записан — "
+                  f"беру текущий каталог {PROJECT}", file=sys.stderr)
+    # Проверку делаем ТОЛЬКО для умолчания: явный --project — решение
+    # человека, и запрещать его нельзя (он может и правда хотеть отдать
+    # столу свой каталог). Умолчание же человек не выбирал.
+    if PROJECT and not (a.project or a.cont):
+        risk = project_risk(PROJECT)
+        if risk:
+            print(f"⚠ каталог запуска подставлен НЕ БУДЕТ: {risk}.\n"
+                  f"  Голоса получают --project на чтение; отдать его "
+                  f"можно только явно:\n"
+                  f"    roundtable --project {PROJECT}", file=sys.stderr)
+            PROJECT = ""
+    if PROJECT and not Path(PROJECT).is_dir():
+        # Не отказ: окно полезно и без проекта. Но сказать обязаны —
+        # молча подставленный несуществующий путь вернулся бы 400-кой на
+        # первой же реплике, и виноватой выглядела бы кнопка.
+        print(f"⚠ каталога {PROJECT} нет — поле проекта оставлено пустым",
+              file=sys.stderr)
+        PROJECT = ""
+    if PROJECT:
+        _remember_run(PROJECT)
+        try:
+            scaffold_project(Path(PROJECT), force=bool(getattr(a, "init_project", False)))
+        except OSError as e:
+            print(f"каркас проекта не создан: {e}", file=sys.stderr)
+    # Комната окна (feed_append → live.post) штампует события проектом,
+    # а фильтры ленты/цели/актов читают live.PROJECT: без этой строки
+    # события самого окна были бы «без проекта» и не показывались бы в
+    # его же ленте.
+    live.PROJECT = Path(PROJECT) if PROJECT else None
+    # токен кресла — ПОСЛЕ разбора --project: файл токена свой у проекта, и на
+    # импорте (PROJECT = каталог запуска) он считался бы не для того проекта
+    SEC_TOKEN = _sec_token()
+
+    if not FEED.exists():
+        print(f"нет ленты {FEED} — сначала python3 live.py ask …",
+              file=sys.stderr)
+        return 1
+    discovery = os.environ.get("CHOIR_RT_NO_DISCOVERY") != "1"
+    if discovery:
+        # Кэши CLI codex/grok — СИНХРОННО и до чтения настроек: это
+        # два локальных файла (миллисекунды), а сохранённое усилие
+        # сверяется с их лестницами — на запасном каталоге xhigh/max
+        # выпадали (нашли claude и субагент).
+        try:
+            catalog.refresh(["codex", "grok"], timeout=5)
+        except Exception as e:                  # noqa: BLE001
+            print(f"каталог codex/grok при старте: {e}", file=sys.stderr)
+    _load_voice_cfg()
+    _sync_exec_overrides()               # кресла — из того же кэша
+    # Остальной каталог — В ФОНЕ (около секунды, без единого модельного
+    # вызова), чтобы селекторы не жили вчерашним кэшем; по завершении
+    # пересчёт разрешённых умолчаний кресел. CHOIR_RT_NO_DISCOVERY=1 —
+    # тесты и машины без сети.
+    if discovery:
+        threading.Thread(
+            target=lambda: (catalog.refresh(), _sync_exec_overrides()),
+            daemon=True, name="catalog-refresh").start()
+    with CFG_LOCK:
+        restored = sum(1 for v in VOICE_CFG.values()
+                       if any(v.get(sc) for sc in SCOPES))
+    if restored:
+        print(f"настройки голосов восстановлены: {restored} "
+              f"(последнее установленное — умолчание; файл {CFG_FILE.name})")
+    stale = sweep_orphan_acts()
+    if stale:
+        print(f"закрыто незавершённых действий прошлого запуска: {stale}")
+    # SIGTERM/SIGHUP → тот же путь, что Ctrl-C. Без этого весь блок
+    # уборки ниже — мёртвый код: окно запускают через `nohup … &` и гасят
+    # `kill <pid>`, а дефолтный SIGTERM убивает интерпретатор мимо
+    # finally. Дети уведены в свою сессию, значит терминальный SIGHUP до
+    # них тоже не дойдёт — сироты остаются ровно в том случае, ради
+    # которого правка и писалась (нашёл ревьюер дифа).
+    # srv.shutdown() из обработчика нельзя: main-нить внутри
+    # serve_forever, будет дедлок.
+    def _bye(signum, _frame):
+        raise KeyboardInterrupt(f"сигнал {signum}")
+    for _sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(_sig, _bye)
+
+    try:
+        srv = _Server(("127.0.0.1", PORT), Handler)
+        PORT = srv.server_address[1]          # --port 0 → фактический порт (карточка окна, реестр)
+    except OSError as e:
+        # Трейсбек на «порт занят» — грубость: чаще всего это ВТОРОЕ окно
+        # или окно, забытое работать в фоне. Человеку нужно не место в
+        # socketserver.py, а что делать (поймано на живом запуске Автора).
+        if e.errno != 98:
+            raise
+        print(f"порт {PORT} уже занят — вероятно, окно уже работает.\n"
+              f"  открыть:     http://127.0.0.1:{PORT}\n"
+              f"  кто держит:  ss -tlnp | grep {PORT}\n"
+              f"  закрыть:     pkill -f roundtable.py\n"
+              f"  другой порт: roundtable --port {PORT + 1}",
+              file=sys.stderr)
+        return 1
+    print(f"RoundTable: http://127.0.0.1:{PORT}  (лента: {FEED.name}, "
+          f"голосов: {len(VOICES)})\n"
+          f"  проект: {PROJECT or '— (без проекта)'}")
+    if jail.disabled():
+        # Вслух, а не молча: с этим флагом POST /access не сторожится
+        # живыми bwrap (голоса и так вне клетки) — ревизия 22.09.
+        print("  клетки нет (CHOIR_RT_NO_BWRAP=1): сторож записи доступа выключен")
+    # Первый замер лимитов — сразу и в фоне: он читает десятки мегабайт
+    # логов и ходит за балансом в сеть, и делать это на первом же
+    # открытии страницы значит показать Автору сплошное «unknown».
+    # Дальше сбор ленивый — только по запросу /voices и не чаще раза в
+    # 30 секунд: если окно никто не открыл, диск никто и не трогает.
+    with _LIM_LOCK:
+        _LIM["busy"] = True
+    threading.Thread(target=_refresh, daemon=True).start()
+
+    def _edit_recover():
+        # Акты, которых окно не сторожит: рестарт между интентом и
+        # вердиктом иначе оставлял вечный edit_open — главная дыра
+        # первой редакции, её нашли все пять ревьюеров. Замок держится
+        # → перевзводим наблюдателя; пал → выносим вердикт сейчас.
+        try:
+            n = edits.recover_edits(
+                lambda a, e, w, v: _arm_edit_watch(a, e, w, v))
+            if n:
+                print(f"восстановлено наблюдателей/вердиктов: {n}")
+        except Exception as e:                  # noqa: BLE001
+            print(f"edit-recover: {e}", file=sys.stderr)
+
+    def _edit_sweep():
+        # Уборка закрытых актов и репост осиротевших маркеров — каждые
+        # 60 с. Осиротевший маркер = исполнитель закрылся честно, но
+        # окна рядом не было (рестарт): без этого прохода такой close
+        # не попадал бы в ленту никогда, и разбор читал бы акт как
+        # вылет — ровно та дыра «читателя маркеров нет», которую
+        # ревизия ядра называла главной (codex).
+        _edit_recover()                         # первый раз — при старте
+        while True:
+            try:
+                with RUN_LOCK:
+                    active = {t.get("edit") for t in RUNNING.values()
+                              if t.get("edit")}
+                    live_acts = set(RUNNING)      # акты окна: их логи не трогать
+                edits.sweep(active)
+                # Стенограммы окна хранятся бессрочно, уборка по возрасту —
+                # только явной CHOIR_RT_ACTS_KEEP_DAYS (см. _sweep_act_logs).
+                _sweep_act_logs(live_acts)
+                # приманки актов без reap — сверить и убрать (ревизия)
+                with RUN_LOCK:
+                    live_keys = {t.get("canary") for t in RUNNING.values()
+                                 if t.get("canary")}
+                _canary_sweep(live_keys)
+            except Exception as e:              # noqa: BLE001
+                print(f"edit-sweep: {e}", file=sys.stderr)
+            time.sleep(60)
+    threading.Thread(target=_edit_sweep, daemon=True).start()
+    # токен — только в терминал: stdout окна, перенаправленный в файл (nohup.out
+    # в каталоге проекта), прочла бы клетка голосов (ревизия: grok)
+    print(f"кресло секретаря: токен {_sec_token_current() if sys.stdout.isatty() else '(в файле реестра — stdout не терминал)'} (ввести во вкладке «📜 секретарь» один раз; "
+          f"постоянный, свой у проекта — {_sec_token_file()}; сменить — кнопкой во вкладке)", flush=True)
+    # РЕЗЕРВНЫЕ СНИМКИ (chamber/backup.py, наказ Автора 2026-10-08): при
+    # старте и раз в BACKUP_EVERY, в фоне; отказ — строкой в stderr и
+    # заметкой в ленту один раз на процесс
+    def _backup_loop():
+        warned = False
+        time.sleep(20)
+        while not _STOPPING:
+            try:
+                _acts_size_watch()
+            except Exception as e:                      # noqa: BLE001
+                print(f"объём стенограмм: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+            if os.environ.get("CHOIR_RT_NO_BACKUP") != "1":
+                try:
+                    # каденс — у хранилища: снимок, только если последний целый
+                    # старше BACKUP_EVERY (три окна — не три снимка); замок там же
+                    r = backup.run(min_age=backup.BACKUP_EVERY)
+                    if r.get("skipped_reason"):
+                        pass
+                    else:
+                        print(f"резерв: снимок {r['snapshot']} — {', '.join(r['copied'])}"
+                              + (f"; ошибки: {'; '.join(r['errors'])}" if r["errors"] else ""), file=sys.stderr, flush=True)
+                    if r["errors"] and not warned:
+                        warned = True
+                        feed_append("note", f"⚠ резервный снимок с ошибками: {'; '.join(r['errors'])[:300]}")
+                except Exception as e:                  # noqa: BLE001
+                    print(f"резерв: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+                    if not warned:
+                        warned = True
+                        try:
+                            feed_append("note", f"⚠ резервный снимок не снят: {type(e).__name__}: {str(e)[:200]}")
+                        except Exception:               # noqa: BLE001
+                            pass
+            for _ in range(3600):                       # проверка раз в час; снимок — по возрасту последнего
+                if _STOPPING:
+                    return
+                time.sleep(1)
+    threading.Thread(target=_backup_loop, daemon=True).start()
+    # Прокси Jev (jev-v2): поднять, если есть ключ TypeSafe; без ключа —
+    # тихо нет, голоса получат пакет без строки про Jev
+    try:
+        if os.environ.get("CHOIR_JEV", "1") != "0":
+            print("jev: прокси " + ("отвечает" if jevproxy.ensure() else "не поднят (нет ключа или порт занят)"),
+                  flush=True)
+    except Exception as e:                           # noqa: BLE001
+        print(f"jev: прокси не поднят: {e}", flush=True)
+    register_window()
+    try:
+        early.sweep_stale()               # флаги «снять сейчас» без дирижёра
+        _canary_sweep(set())          # приманки прошлого окна: сверить, убрать
+    except Exception as e:                                  # noqa: BLE001
+        print(f"уборка канареек при старте: {e}", file=sys.stderr)
+    # Scope живут в app.slice, не в сессии терминала: акты переживают и
+    # вкладку konsole, и падение окна (автопрогон — по замыслу, прочее —
+    # сироты, которых reap уже не увидит). Прежние — назвать в ленте.
+    try:
+        _orph = _scope_orphans() if _scope_available() else []
+    except Exception:                                   # noqa: BLE001
+        _orph = []
+    if _orph:
+        print(f"живые акты прежних окон: {', '.join(_orph)} — "
+              f"смотрите systemctl --user status <unit>", file=sys.stderr)
+        try:
+            feed_append("note", f"при старте окна найдены живые акты прежних "
+                        f"окон (scope): {', '.join(_orph[:8])} — автопрогон "
+                        f"продолжается по замыслу, остальное снимите "
+                        f"`systemctl --user kill --signal=SIGKILL <unit>`",
+                        units=_orph[:20])
+        except Exception as e:                          # noqa: BLE001
+            print(f"заметка о прежних актах не легла: {e}", file=sys.stderr)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print("\nостановлен")
+    finally:
+        # Снять всё дерево: каждый ход запущен в своей группе
+        # (start_new_session), поэтому killpg достаёт и внуков — сами
+        # CLI голосов. Без этого закрытое окно оставляло их доживать и
+        # жечь квоту (codex, «упустили все», раунд переезд-v1).
+        # SIGTERM, не KILL: голос успеет закрыть свою сессию.
+        global _STOPPING
+        unregister_window()
+        with RUN_LOCK:
+            # Забираем записи СЕБЕ: reap-нить, проснувшись, увидит пустоту
+            # и промолчит — итог у действия ровно один. Флаг — чтобы reap
+            # закрывшегося кресла не породил новый акт ревизии уже после
+            # этого снимка (ревьюер дифа).
+            _STOPPING = True
+            unfinished = list(RUNNING.items())
+            RUNNING.clear()
+        # Незавершённые действия обязаны получить ИТОГ в ленте: иначе они
+        # навсегда остаются в статусе `accepted`, и через месяц никто не
+        # скажет, ответил голос или окно закрыли (нашёл смок 2026-08-25:
+        # `WARN act_status неполные`; предсказал codex — «статус лишь в
+        # RUNNING»). Пишем ДО killpg: после него daemon-нити reap уже не
+        # проснутся, процесс выходит.
+        for aid, t in unfinished:
+            try:
+                # ПЛОСКО, как кладёт spawn и как читает /state. Раньше
+                # здесь было t.get("meta").get(...) — ключа "meta" в
+                # записи нет вовсе, значит detach автопрогона не работал
+                # никогда: такт уходил в interrupted и killpg, стирая
+                # оплаченные ответы (нашли grok и kimi в живой ленте).
+                # detach — ручной шаг раунда (rebut/summarize): не убивать,
+                # дописать оплаченный вызов, как и автопрогон.
+                auto_round = (t.get("auto") or t.get("detach")) and t.get("round")
+                if auto_round:
+                    feed_append(
+                        "act_status",
+                        f"act {aid}: окно закрыто, но автопрогон "
+                        f"«{auto_round}» продолжается — выставлен "
+                        f"флаг-стоп, дирижёр закончит текущий шаг",
+                        act_id=aid, status="detached", **_act_fields(t))
+                else:
+                    # Спросить процесс, прежде чем объявлять ход
+                    # несостоявшимся: он мог успеть завершиться, и
+                    # реплика голоса уже лежит в ленте. Писать над ней
+                    # «прерван» значит врать журналу — через месяц это
+                    # прочтётся как «стол не ответил» (нашли grok и
+                    # kimi на живом «ОК» от deepseek).
+                    rc = t["proc"].poll()
+                    if rc == 0:
+                        feed_append("act_status",
+                                    f"act {aid} done (успел до закрытия "
+                                    f"окна): {t['label']}",
+                                    act_id=aid, status="done", rc=0,
+                                    **_act_fields(t))
+                    elif rc is not None:
+                        feed_append("act_status",
+                                    f"act {aid} error (rc={rc}, окно "
+                                    f"закрыто): {t['label']}",
+                                    act_id=aid, status="error", rc=rc,
+                                    **_act_fields(t))
+                    else:
+                        # Ход действительно не завершился. Но частичные
+                        # результаты могли попасть в ленту (голос успел
+                        # ответить, live.py дописывал карту покрытия) —
+                        # статус говорит об оборванной работе, а не об
+                        # отсутствии ответов (уточнение codex).
+                        feed_append(
+                            "act_status",
+                            f"act {aid} прерван: окно закрыто во время "
+                            f"хода — {t['label']}; частичные результаты "
+                            f"могли попасть в ленту выше",
+                            act_id=aid, status="interrupted",
+                            **_act_fields(t))
+            except Exception as e:                  # noqa: BLE001
+                print(f"act {aid}: статус не записан: {e}", file=sys.stderr)
+        for aid, t in unfinished:
+            if t.get("canary") and t["proc"].poll() is not None:
+                # успел завершиться — вердикт настоящим событием (второй круг)
+                try:
+                    _canary_check(t["canary"], t.get("edit") or "", t.get("label", ""))
+                except Exception:                   # noqa: BLE001
+                    pass
+        for aid, t in unfinished:
+            # Три проверки, и каждая оплачена: живость (poll) — чтобы не
+            # целиться в освобождённый pid; сохранённый pgid — чтобы не
+            # спрашивать его у ядра задним числом; сверка со своей
+            # группой — последний предохранитель от самоубийства окна
+            # вместе с оболочкой Автора.
+            try:
+                if t["proc"].poll() is not None:
+                    continue
+                if t["pgid"] == os.getpgrp():
+                    print(f"act {aid}: своя группа — не трогаю",
+                          file=sys.stderr)
+                    continue
+                # АВТОПРОГОН НЕ УБИВАЕМ. Ответы слепой фазы по правилу 8.5
+                # живут только в памяти дирижёра и попадают на диск лишь
+                # при закрытии фазы — убить такт на середине значит стереть
+                # уже оплаченные вызовы бесследно, без ответов и без
+                # долгов. У такта своя сессия (start_new_session), он
+                # переживёт окно; вместо сигнала ставим флаг-стоп, и
+                # дирижёр закончит текущий шаг, а следующий не начнёт
+                # (нашёл ревьюер автопрогона: раньше экспозиция была одна
+                # фаза, с галочкой стала весь раунд).
+                rnd = t.get("round")
+                if (t.get("auto") or t.get("detach")) and rnd:
+                    # detach — ручной шаг раунда: статус выше уже сказал
+                    # «продолжается», убивать его нельзя (второй круг)
+                    stop_file(rnd).write_text("окно закрыто\n",
+                                              encoding="utf-8")
+                    print(f"act {aid}: автопрогон «{rnd}» продолжается, "
+                          f"выставлен флаг-стоп")
+                    continue
+                if t.get("unit"):
+                    _scope_kill(t["unit"], "SIGTERM")   # до killpg: лидер мог выйти
+                os.killpg(t["pgid"], signal.SIGTERM)
+                print(f"снята группа хода {aid} (pgid {t['pgid']}"
+                      + (f", scope {t['unit']}" if t.get("unit") else "") + ")")
+            except (ProcessLookupError, PermissionError, OSError):
+                pass            # уже умер сам — это норма, не ошибка
+        for _aid, t in unfinished:
+            if t.get("canary") and t["proc"].poll() is None:
+                # ещё жив и получил сигнал: вердикта нет по праву, но
+                # приманки не должны остаться в HOME навсегда
+                try:
+                    canary.check(t["canary"], ACT_DIR)
+                except Exception:                   # noqa: BLE001
+                    pass
+        # Упрямые внуки: секунда на SIGTERM, затем SIGKILL всему cgroup
+        # (окно уходит — ждать некому)
+        units = [t["unit"] for _a, t in unfinished
+                 if t.get("unit") and not ((t.get("auto") or t.get("detach"))
+                                           and t.get("round"))]
+        if units:
+            time.sleep(1.0)
+            for u in units:
+                if _scope_procs(u):
+                    _scope_kill(u, "SIGKILL")
+                    print(f"scope {u}: SIGKILL упрямым внукам")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
